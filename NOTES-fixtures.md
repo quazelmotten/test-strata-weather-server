@@ -1,0 +1,35 @@
+# Fixture generation notes (wgrib2 v3.1.3, built locally)
+
+Reference binary: `/home/frankzappa/dylantest2/tools/wgrib2` (system PATH wgrib2 is broken — always use this absolute path).
+
+## Surprises found while reverse-engineering GRIB2 byte layouts
+
+1. **Section 0 magic is `GRIB`, not `GRID`.** `rd_seq_grib.c` compares G,R,I,B (71,82,73,66) and requires octet 8 == 2 (edition). A file with `GRID` magic is silently skipped by this reader.
+2. **Signed integers in sections 3 and 5 are SIGN-MAGNITUDE, not two's complement.** wgrib2 `int8.c::int4()`/`int2()`: bit 31 (bit 15 for int2) is the sign, remaining bits are the magnitude. Writing standard two's-complement negatives (e.g. any negative latitude) makes wgrib2 read them as `INT_MIN + |value|` → "BAD grid definition lat". This bit it is critical for our Rust GRIB decoder too: when *reading* real files, section-3 signed fields must be decoded sign-magnitude.
+3. **Isobaric levels are stored in Pascals** in section 4 (1000 mb → 100000); display divides by 100. Levels are Code Table 4.5 *fixed surfaces* at sec4 octets 22–28, not coordinate-list entries.
+4. **Section 6 is mandatory for this build**: the CHECK path calls `code_table_6_0` unconditionally and segfaults if sec6 is absent. Always emit sec6 (indicator 255 = no bitmap). Real NCEP files always include it.
+5. **Exact ±90° latitudes are rejected** by a float range check in `geo.c` (`90000000 * 1e-6 > 90.0`). Perf grids use lat1 = 89.875 (ny = 720 at 0.25°).
+6. **No `-dir` and no `-ll` options in v3.1.3.** The lat/lon → (i,j) option is **`-ll2ij LON LAT`** (returns 1-based i,j; j counts from the south edge for our Lambert grid). Negative coordinates on the CLI parse fine only when the *file argument comes first*: `wgrib2 FILE -lon LON LAT`.
+7. **Wind grid-relative flag** = bit 0x08 of flag table 3.3 (`res & 8` in FlagTable.c → `winds(grid)` in `-vector_dir`). Verified on hrrr_small.grib2.
+8. **ct 4.3 gen-process values:** 0 = anl (analysis; shown for f000), 1 = init, 2 = fcst. ct 4.4 unit 1 = hour.
+9. **Packing templates present in fixtures: only simple packing 5.0.** Complex packing 5.3, JPEG2000 5.40 and PNG 5.41 are NOT yet exercised by these fixtures (real GFS/HRRR use 5.0 mostly; 5.3 appears in some products — decoder decision deferred).
+10. PDT 4.8 (statistically processed, template 4.8) is not yet generated; APCP accumulation guard work deferred to later milestones.
+
+## Fixture inventory
+
+### tests/fixtures/gfs_small.grib2 (regular lat/lon, template 3.0)
+- Grid 41 × 21, lon 350 → 10 (0.5°, wraps across 0), lat 10 → 0 (0.5°), scan N→S.
+- Messages: TMP @ {1000, 850, 700} mb + TMP @ 2 m AGL + UGRD/VGRD @ 10 m AGL, forecast hours 0/6/12 (39 records).
+- Bitmap masking applied to TMP@850mb f006 (masked points decode to `val=9.999e+20` = UNDEFINED).
+- Values analytic: `base + incr * 2^E`, exact in f32.
+
+### tests/fixtures/hrrr_small.grib2 (Lambert conformal, template 3.30)
+- Grid 61 × 41, La1 = 21.11389, Lo1 = 233.44, LoV = 229.53, LaD = 26.5, Latin1 = 26.5, Latin2 = 35.0, Dx = Dy = 3000 m, projflag = 1 (normal), scan +i +j.
+- Messages: TMP @ 2 m AGL, UGRD/VGRD @ 10 m AGL (UGRD/VGRD carry flag 3.3 bit 0x08 = grid-relative winds), f000/f003 (6 records).
+
+### tests/perfdata/gfs_perf_f000.grib2 (gitignored)
+- Full GFS geometry: 1440 × 720, 0.25°, lat 89.875 → −89.875, lon 0 → 359.75, single TMP@1000mb f000 message, value = 250 + row_index. ~1.3 MB.
+
+## Regeneration
+- `scripts/gen_fixtures.sh` regenerates all fixtures idempotently (wraps `scripts/gen_grib2.py`).
+- `scripts/regen_expected.sh` re-probes wgrib2 and rewrites `tests/fixtures/expected.json`.

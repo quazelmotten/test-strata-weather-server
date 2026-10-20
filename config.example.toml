@@ -1,0 +1,40 @@
+# wx-point point-query weather model server — example configuration (spec §3).
+
+[server]
+bind = "0.0.0.0:8080"
+data_dir = "/var/lib/wxpoint"
+
+[ingest]
+scan_interval_secs = 30
+retention_runs = 4
+
+[[models]]
+name = "gfs"
+ingest_dir = "/data/incoming/gfs"
+file_glob = "gfs.t*z.pgrb2.0p25.f*"
+
+  [[models.params]]
+  name = "HGT"
+  levels = ["isobaric:1000", "isobaric:925", "isobaric:850", "isobaric:700",
+            "isobaric:500", "isobaric:300", "isobaric:250", "isobaric:200"]
+
+  [[models.params]]
+  name = "TMP"
+  levels = ["height_above_ground:2", "isobaric:*"]
+
+  [[models.params]]
+  name = "UGRD"
+  levels = ["height_above_ground:10", "isobaric:*"]
+
+  [[models.params]]
+  name = "VGRD"
+  levels = ["height_above_ground:10", "isobaric:*"]
+
+[[models]]
+name = "hrrr"
+ingest_dir = "/data/incoming/hrrr"
+file_glob = "hrrr.t*z.wrf*f*.grib2"
+
+  [[models.params]]
+  name = "TMP"
+  levels = ["height_above_ground:2", "isobaric:*"]

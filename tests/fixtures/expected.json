@@ -1,0 +1,678 @@
+{
+ "note": "reference values probed from the locally built wgrib2",
+ "fixtures": {
+  "gfs_small.grib2": {
+   "point_checks": [
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 250.0,
+     "masked": false,
+     "raw": "1:0:lon=350.000000,lat=10.000000,val=250"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 310.0,
+     "masked": false,
+     "raw": "2:942:lon=350.000000,lat=10.000000,val=310"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": null,
+     "masked": true,
+     "raw": "5:3768:lon=350.000000,lat=10.000000,val=9.999e+20"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 570.0,
+     "masked": false,
+     "raw": "9:7636:lon=350.000000,lat=10.000000,val=570"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 550.0,
+     "masked": false,
+     "raw": "10:8578:lon=350.000000,lat=10.000000,val=550"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 10.0,
+     "req_lat": 10.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 10.0,
+     "value": 290.0,
+     "masked": false,
+     "raw": "1:0:lon=10.000000,lat=10.000000,val=290"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 10.0,
+     "req_lat": 10.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 10.0,
+     "value": 350.0,
+     "masked": false,
+     "raw": "2:942:lon=10.000000,lat=10.000000,val=350"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 10.0,
+     "req_lat": 10.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 10.0,
+     "value": 450.0,
+     "masked": false,
+     "raw": "5:3768:lon=10.000000,lat=10.000000,val=450"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 10.0,
+     "req_lat": 10.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 10.0,
+     "value": 610.0,
+     "masked": false,
+     "raw": "9:7636:lon=10.000000,lat=10.000000,val=610"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 10.0,
+     "req_lat": 10.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 10.0,
+     "value": 590.0,
+     "masked": false,
+     "raw": "10:8578:lon=10.000000,lat=10.000000,val=590"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 350.0,
+     "req_lat": 0.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 0.0,
+     "value": 330.0,
+     "masked": false,
+     "raw": "1:0:lon=350.000000,lat=0.000000,val=330"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 350.0,
+     "req_lat": 0.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 0.0,
+     "value": 390.0,
+     "masked": false,
+     "raw": "2:942:lon=350.000000,lat=0.000000,val=390"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 350.0,
+     "req_lat": 0.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 0.0,
+     "value": 490.0,
+     "masked": false,
+     "raw": "5:3768:lon=350.000000,lat=0.000000,val=490"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 350.0,
+     "req_lat": 0.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 0.0,
+     "value": 650.0,
+     "masked": false,
+     "raw": "9:7636:lon=350.000000,lat=0.000000,val=650"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 350.0,
+     "req_lat": 0.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 0.0,
+     "value": 630.0,
+     "masked": false,
+     "raw": "10:8578:lon=350.000000,lat=0.000000,val=630"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 10.0,
+     "req_lat": 0.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 0.0,
+     "value": 370.0,
+     "masked": false,
+     "raw": "1:0:lon=10.000000,lat=0.000000,val=370"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 10.0,
+     "req_lat": 0.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 0.0,
+     "value": 430.0,
+     "masked": false,
+     "raw": "2:942:lon=10.000000,lat=0.000000,val=430"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 10.0,
+     "req_lat": 0.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 0.0,
+     "value": 530.0,
+     "masked": false,
+     "raw": "5:3768:lon=10.000000,lat=0.000000,val=530"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 10.0,
+     "req_lat": 0.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 0.0,
+     "value": 690.0,
+     "masked": false,
+     "raw": "9:7636:lon=10.000000,lat=0.000000,val=690"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 10.0,
+     "req_lat": 0.0,
+     "snapped_lon": 10.0,
+     "snapped_lat": 0.0,
+     "value": 670.0,
+     "masked": false,
+     "raw": "10:8578:lon=10.000000,lat=0.000000,val=670"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 0.0,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 310.0,
+     "masked": false,
+     "raw": "1:0:lon=0.000000,lat=5.000000,val=310"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 0.0,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 370.0,
+     "masked": false,
+     "raw": "2:942:lon=0.000000,lat=5.000000,val=370"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 0.0,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 470.0,
+     "masked": false,
+     "raw": "5:3768:lon=0.000000,lat=5.000000,val=470"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 0.0,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 630.0,
+     "masked": false,
+     "raw": "9:7636:lon=0.000000,lat=5.000000,val=630"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 0.0,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 610.0,
+     "masked": false,
+     "raw": "10:8578:lon=0.000000,lat=5.000000,val=610"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 359.9,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 310.0,
+     "masked": false,
+     "raw": "1:0:lon=0.000000,lat=5.000000,val=310"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 359.9,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 370.0,
+     "masked": false,
+     "raw": "2:942:lon=0.000000,lat=5.000000,val=370"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 359.9,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 470.0,
+     "masked": false,
+     "raw": "5:3768:lon=0.000000,lat=5.000000,val=470"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 359.9,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 630.0,
+     "masked": false,
+     "raw": "9:7636:lon=0.000000,lat=5.000000,val=630"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 359.9,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 610.0,
+     "masked": false,
+     "raw": "10:8578:lon=0.000000,lat=5.000000,val=610"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": -0.1,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 310.0,
+     "masked": false,
+     "raw": "1:0:lon=0.000000,lat=5.000000,val=310"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": -0.1,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 370.0,
+     "masked": false,
+     "raw": "2:942:lon=0.000000,lat=5.000000,val=370"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": -0.1,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 470.0,
+     "masked": false,
+     "raw": "5:3768:lon=0.000000,lat=5.000000,val=470"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": -0.1,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 630.0,
+     "masked": false,
+     "raw": "9:7636:lon=0.000000,lat=5.000000,val=630"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": -0.1,
+     "req_lat": 5.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 5.0,
+     "value": 610.0,
+     "masked": false,
+     "raw": "10:8578:lon=0.000000,lat=5.000000,val=610"
+    },
+    {
+     "record": "TMP_1000mb_f000",
+     "record_index": 1,
+     "req_lon": 0.0,
+     "req_lat": 0.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 0.0,
+     "value": 350.0,
+     "masked": false,
+     "raw": "1:0:lon=0.000000,lat=0.000000,val=350"
+    },
+    {
+     "record": "TMP_1000mb_f006",
+     "record_index": 2,
+     "req_lon": 0.0,
+     "req_lat": 0.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 0.0,
+     "value": 410.0,
+     "masked": false,
+     "raw": "2:942:lon=0.000000,lat=0.000000,val=410"
+    },
+    {
+     "record": "TMP_850mb_f006_masked",
+     "record_index": 5,
+     "req_lon": 0.0,
+     "req_lat": 0.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 0.0,
+     "value": 510.0,
+     "masked": false,
+     "raw": "5:3768:lon=0.000000,lat=0.000000,val=510"
+    },
+    {
+     "record": "TMP_700mb_f012",
+     "record_index": 9,
+     "req_lon": 0.0,
+     "req_lat": 0.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 0.0,
+     "value": 670.0,
+     "masked": false,
+     "raw": "9:7636:lon=0.000000,lat=0.000000,val=670"
+    },
+    {
+     "record": "TMP_agl2m_f000",
+     "record_index": 10,
+     "req_lon": 0.0,
+     "req_lat": 0.0,
+     "snapped_lon": 0.0,
+     "snapped_lat": 0.0,
+     "value": 650.0,
+     "masked": false,
+     "raw": "10:8578:lon=0.000000,lat=0.000000,val=650"
+    }
+   ]
+  },
+  "hrrr_small.grib2": {
+   "ij_checks": [
+    {
+     "lon": 233.44,
+     "lat": 21.11389,
+     "i": 1.0,
+     "j": 41.0,
+     "nearest_value_TMP_f000": 260.0,
+     "raw_ij": "1:0:233.440000 21.113890 -> (1.000000,41.000000)",
+     "raw_val": "1:0:lon=233.440000,lat=21.113890,val=260"
+    },
+    {
+     "lon": 235.06482,
+     "lat": 20.18942,
+     "i": 59.473405,
+     "j": 8.741953,
+     "nearest_value_TMP_f000": 638.0,
+     "raw_ij": "1:0:235.064820 20.189420 -> (59.473405,8.741953)",
+     "raw_val": "1:0:lon=235.051776,lat=20.196900,val=638"
+    },
+    {
+     "lon": 235.01145,
+     "lat": 20.41774,
+     "i": 57.173318,
+     "j": 17.21701,
+     "nearest_value_TMP_f000": 556.0,
+     "raw_ij": "1:0:235.011450 20.417740 -> (57.173318,17.217010)",
+     "raw_val": "1:0:lon=235.006230,lat=20.412194,val=556"
+    },
+    {
+     "lon": 234.92958,
+     "lat": 20.30334,
+     "i": 54.502304,
+     "j": 12.784808,
+     "nearest_value_TMP_f000": 594.0,
+     "raw_ij": "1:0:234.929580 20.303340 -> (54.502304,12.784808)",
+     "raw_val": "1:0:lon=234.943984,lat=20.308422,val=594"
+    },
+    {
+     "lon": 235.02099,
+     "lat": 20.55194,
+     "i": 57.261651,
+     "j": 22.266474,
+     "nearest_value_TMP_f000": 506.0,
+     "raw_ij": "1:0:235.020990 20.551940 -> (57.261651,22.266474)",
+     "raw_val": "1:0:lon=235.013184,lat=20.545192,val=506"
+    },
+    {
+     "lon": 233.96171,
+     "lat": 20.34052,
+     "i": 20.376653,
+     "j": 12.68361,
+     "nearest_value_TMP_f000": 559.0,
+     "raw_ij": "1:0:233.961710 20.340520 -> (20.376653,12.683610)",
+     "raw_val": "1:0:lon=233.951380,lat=20.349332,val=559"
+    },
+    {
+     "lon": 235.02181,
+     "lat": 20.59183,
+     "i": 57.217017,
+     "j": 23.763524,
+     "nearest_value_TMP_f000": 486.0,
+     "raw_ij": "1:0:235.021810 20.591830 -> (57.217017,23.763524)",
+     "raw_val": "1:0:lon=235.015971,lat=20.598406,val=486"
+    },
+    {
+     "lon": 234.95561,
+     "lat": 20.66455,
+     "i": 54.761382,
+     "j": 26.376338,
+     "nearest_value_TMP_f000": 464.0,
+     "raw_ij": "1:0:234.955610 20.664550 -> (54.761382,26.376338)",
+     "raw_val": "1:0:lon=234.961878,lat=20.654226,val=464"
+    },
+    {
+     "lon": 234.3042,
+     "lat": 20.84503,
+     "i": 31.622658,
+     "j": 32.099996,
+     "nearest_value_TMP_f000": 381.0,
+     "raw_ij": "1:0:234.304200 20.845030 -> (31.622658,32.099996)",
+     "raw_val": "1:0:lon=234.314833,lat=20.841937,val=381"
+    },
+    {
+     "lon": 234.71288,
+     "lat": 20.62123,
+     "i": 46.322888,
+     "j": 24.348567,
+     "nearest_value_TMP_f000": 475.0,
+     "raw_ij": "1:0:234.712880 20.621230 -> (46.322888,24.348567)",
+     "raw_val": "1:0:lon=234.703240,lat=20.612351,val=475"
+    },
+    {
+     "lon": 233.81003,
+     "lat": 20.22308,
+     "i": 15.206717,
+     "j": 8.066544,
+     "nearest_value_TMP_f000": 604.0,
+     "raw_ij": "1:0:233.810030 20.223080 -> (15.206717,8.066544)",
+     "raw_val": "1:0:lon=233.804100,lat=20.221521,val=604"
+    },
+    {
+     "lon": 234.50302,
+     "lat": 20.50693,
+     "i": 39.148863,
+     "j": 19.727714,
+     "nearest_value_TMP_f000": 508.0,
+     "raw_ij": "1:0:234.503020 20.506930 -> (39.148863,19.727714)",
+     "raw_val": "1:0:lon=234.499135,lat=20.514351,val=508"
+    },
+    {
+     "lon": 234.73049,
+     "lat": 20.55858,
+     "i": 47.05004,
+     "j": 22.028077,
+     "nearest_value_TMP_f000": 496.0,
+     "raw_ij": "1:0:234.730490 20.558580 -> (47.050040,22.028077)",
+     "raw_val": "1:0:lon=234.729031,lat=20.557895,val=496"
+    },
+    {
+     "lon": 233.81602,
+     "lat": 20.36537,
+     "i": 15.213178,
+     "j": 13.416652,
+     "nearest_value_TMP_f000": 554.0,
+     "raw_ij": "1:0:233.816020 20.365370 -> (15.213178,13.416652)",
+     "raw_val": "1:0:lon=233.809519,lat=20.354503,val=554"
+    },
+    {
+     "lon": 234.65169,
+     "lat": 20.78152,
+     "i": 43.900567,
+     "j": 30.258231,
+     "nearest_value_TMP_f000": 413.0,
+     "raw_ij": "1:0:234.651690 20.781520 -> (43.900567,30.258231)",
+     "raw_val": "1:0:lon=234.654185,lat=20.774523,val=413"
+    },
+    {
+     "lon": 233.73757,
+     "lat": 20.25009,
+     "i": 12.615304,
+     "j": 8.983964,
+     "nearest_value_TMP_f000": 592.0,
+     "raw_ij": "1:0:233.737570 20.250090 -> (12.615304,8.983964)",
+     "raw_val": "1:0:lon=233.748492,lat=20.250131,val=592"
+    },
+    {
+     "lon": 234.81088,
+     "lat": 20.90601,
+     "i": 49.257977,
+     "j": 35.18185,
+     "nearest_value_TMP_f000": 368.0,
+     "raw_ij": "1:0:234.810880 20.906010 -> (49.257977,35.181850)",
+     "raw_val": "1:0:lon=234.803280,lat=20.901490,val=368"
+    },
+    {
+     "lon": 233.94419,
+     "lat": 21.04412,
+     "i": 18.719287,
+     "j": 39.041991,
+     "nearest_value_TMP_f000": 298.0,
+     "raw_ij": "1:0:233.944190 21.044120 -> (18.719287,39.041991)",
+     "raw_val": "1:0:lon=233.952160,lat=21.042705,val=298"
+    },
+    {
+     "lon": 233.77916,
+     "lat": 20.86,
+     "i": 13.211645,
+     "j": 31.919616,
+     "nearest_value_TMP_f000": 362.0,
+     "raw_ij": "1:0:233.779160 20.860000 -> (13.211645,31.919616)",
+     "raw_val": "1:0:lon=233.773213,lat=20.862356,val=362"
+    },
+    {
+     "lon": 234.69375,
+     "lat": 20.69421,
+     "i": 45.52531,
+     "j": 27.053523,
+     "nearest_value_TMP_f000": 445.0,
+     "raw_ij": "1:0:234.693750 20.694210 -> (45.525310,27.053523)",
+     "raw_val": "1:0:lon=234.707187,lat=20.692201,val=445"
+    },
+    {
+     "lon": 233.56766,
+     "lat": 20.36906,
+     "i": 6.468314,
+     "j": 13.230127,
+     "nearest_value_TMP_f000": 545.0,
+     "raw_ij": "1:0:233.567660 20.369060 -> (6.468314,13.230127)",
+     "raw_val": "1:0:lon=233.554134,lat=20.363386,val=545"
+    },
+    {
+     "lon": 235.06624,
+     "lat": 19.98888,
+     "i": 59.896091,
+     "j": 1.21441,
+     "nearest_value_TMP_f000": 719.0,
+     "raw_ij": "1:0:235.066240 19.988880 -> (59.896091,1.214410)",
+     "raw_val": "1:0:lon=235.068877,lat=19.983049,val=719"
+    },
+    {
+     "lon": 233.72581,
+     "lat": 20.75259,
+     "i": 11.494089,
+     "j": 27.82265,
+     "nearest_value_TMP_f000": 400.0,
+     "raw_ij": "1:0:233.725810 20.752590 -> (11.494089,27.822650)",
+     "raw_val": "1:0:lon=233.711926,lat=20.757806,val=400"
+    },
+    {
+     "lon": 234.17816,
+     "lat": 20.40144,
+     "i": 27.899425,
+     "j": 15.278985,
+     "nearest_value_TMP_f000": 547.0,
+     "raw_ij": "1:0:234.178160 20.401440 -> (27.899425,15.278985)",
+     "raw_val": "1:0:lon=234.180685,lat=20.393907,val=547"
+    },
+    {
+     "lon": 233.47298,
+     "lat": 20.15648,
+     "i": 3.417678,
+     "j": 5.128706,
+     "nearest_value_TMP_f000": 622.0,
+     "raw_ij": "1:0:233.472980 20.156480 -> (3.417678,5.128706)",
+     "raw_val": "1:0:lon=233.461022,lat=20.153449,val=622"
+    }
+   ]
+  }
+ }
+}

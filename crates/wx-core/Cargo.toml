@@ -1,0 +1,12 @@
+[package]
+name = "wx-core"
+version = "0.1.0"
+edition = "2021"
+description = "Grid definitions, projections, interpolation, storage format (no async, no HTTP)"
+
+# wx-core must stay free of async/HTTP dependencies (spec §10).
+[dependencies]
+smallvec = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }

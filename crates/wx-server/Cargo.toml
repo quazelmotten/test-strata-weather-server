@@ -1,0 +1,22 @@
+[package]
+name = "wx-server"
+version = "0.1.0"
+edition = "2021"
+description = "axum HTTP server, in-memory index, metrics"
+
+[dependencies]
+wx-core = { path = "../wx-core" }
+wx-ingest = { path = "../wx-ingest" }
+axum = { workspace = true }
+tokio = { workspace = true }
+arc-swap = { workspace = true }
+memmap2 = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+name = "wx-point"
+path = "src/main.rs"
