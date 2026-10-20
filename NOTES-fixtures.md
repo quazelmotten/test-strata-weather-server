@@ -12,8 +12,8 @@ Reference binary: `/home/frankzappa/dylantest2/tools/wgrib2` (system PATH wgrib2
 6. **No `-dir` and no `-ll` options in v3.1.3.** The lat/lon → (i,j) option is **`-ll2ij LON LAT`** (returns 1-based i,j; j counts from the south edge for our Lambert grid). Negative coordinates on the CLI parse fine only when the *file argument comes first*: `wgrib2 FILE -lon LON LAT`.
 7. **Wind grid-relative flag** = bit 0x08 of flag table 3.3 (`res & 8` in FlagTable.c → `winds(grid)` in `-vector_dir`). Verified on hrrr_small.grib2.
 8. **ct 4.3 gen-process values:** 0 = anl (analysis; shown for f000), 1 = init, 2 = fcst. ct 4.4 unit 1 = hour.
-9. **Packing templates present in fixtures: only simple packing 5.0.** Complex packing 5.3, JPEG2000 5.40 and PNG 5.41 are NOT yet exercised by these fixtures (real GFS/HRRR use 5.0 mostly; 5.3 appears in some products — decoder decision deferred).
-10. PDT 4.8 (statistically processed, template 4.8) is not yet generated; APCP accumulation guard work deferred to later milestones.
+9. **Packing templates:** fixtures now cover BOTH simple packing 5.0 (gfs_small, hrrr_small) and complex packing + spatial differencing 5.3 via wgrib2 `-set_grib_type c3` twins (gfs_small_c3, hrrr_small_c3 — verified by `-code_table_5.0` showing `code table 5.0=3` for every record). JPEG2000 5.40/PNG 5.41 remain unexercised (nolib wgrib2 cannot encode them); `unsupported_j2k.grib2` guards only the header-rejection path.
+10. PDT 4.8 is now generated (`stat_small.grib2`) and validated against wgrib2 readback; see docs/DECISIONS.md for the byte layout.
 
 ## Fixture inventory
 
@@ -23,9 +23,20 @@ Reference binary: `/home/frankzappa/dylantest2/tools/wgrib2` (system PATH wgrib2
 - Bitmap masking applied to TMP@850mb f006 (masked points decode to `val=9.999e+20` = UNDEFINED).
 - Values analytic: `base + incr * 2^E`, exact in f32.
 
+### tests/fixtures/gfs_small_c3.grib2 / hrrr_small_c3.grib2
+- Byte-identical CONTENT twins of gfs_small / hrrr_small re-encoded by wgrib2
+  with DRT 5.3 complex packing + spatial differencing (`-set_grib_type c3`),
+  bare `7777` terminators. Decoded values must equal the 5.0 versions exactly.
+
 ### tests/fixtures/hrrr_small.grib2 (Lambert conformal, template 3.30)
 - Grid 61 × 41, La1 = 21.11389, Lo1 = 233.44, LoV = 229.53, LaD = 26.5, Latin1 = 26.5, Latin2 = 35.0, Dx = Dy = 3000 m, projflag = 1 (normal), scan +i +j.
 - Messages: TMP @ 2 m AGL, UGRD/VGRD @ 10 m AGL (UGRD/VGRD carry flag 3.3 bit 0x08 = grid-relative winds), f000/f003 (6 records).
+
+### tests/fixtures/stat_small.grib2 (PDT 4.8, regular 11 × 7)
+- APCP surface accumulations 0-6 h (fcst hour 0) and 6-12 h (fcst hour 6); TMP 2 m AGL 3-6 h average (fcst hour 3). Values analytic (base 10/250 + j*11+i). wgrib2 displays the acc/ave ranges on readback (checked in gen_fixtures.sh).
+
+### tests/fixtures/unsupported_j2k.grib2
+- Single message declaring DRT 5.40 (JPEG2000); decoder must return typed `UnsupportedData(40)`. Never decoded by wgrib2 nolib (no jpeg support).
 
 ### tests/perfdata/gfs_perf_f000.grib2 (gitignored)
 - Full GFS geometry: 1440 × 720, 0.25°, lat 89.875 → −89.875, lon 0 → 359.75, single TMP@1000mb f000 message, value = 250 + row_index. ~1.3 MB.

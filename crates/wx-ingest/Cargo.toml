@@ -7,6 +7,7 @@ description = "File discovery, GRIB2 decode, wind rotation, storage writing"
 [dependencies]
 wx-core = { path = "../wx-core" }
 rayon = { workspace = true }
+memmap2 = { workspace = true }
 notify = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }

@@ -241,6 +241,46 @@ def sec4(cat, num, level_type, level_value, fcst_hour):
     return section(4, bytes(p))
 
 
+def sec4_pdt48(cat, num, period_flag, stat_proc, range_unit, range_len,
+               step_unit, step_len, fcst_hour, level_type, scale, level_value,
+               genproc=2, stat_year=2026, stat_mon=10, stat_day=19,
+               stat_hr=12, stat_min=0, stat_sec=0):
+    """PDT template 4.8 (statistically processed), byte layout validated
+    EMPIRICALLY against tools/wgrib2 v3.1.3 readback (see docs/DECISIONS.md):
+    prefix identical to PDT 4.0 through the fixed surfaces, then
+      [29..35] valid-fmtd-time for stat processing (7 bytes)
+      [36]     number of time-range specifications (we emit 1)
+      [37..40] four opaque bytes (wgrib2 requires the space; writes zeros)
+      block(12): CT4.6 period flag, CT4.11 interval code, range unit,
+                 u4 range length, step unit, u4 step length
+    wgrib2 displays the accumulation/average label from the CT 4.6 period
+    flag (0=ave, 1=acc, 2=max, 3=min) and the range as
+    "<fcst>-<fcst+len> hour ..." so step_len=0 keeps the classic display."""
+    p = bytearray()
+    p += u2(0)            # coordinate values after template
+    p += u2(8)            # PDT template 4.8
+    p += bytes([cat])
+    p += bytes([num])
+    p += bytes([genproc]) # ct 4.3
+    p += bytes([0])       # background proc id
+    p += bytes([0])       # an/fcst proc id
+    p += u2(0)            # obs cutoff hours
+    p += bytes([0])       # obs cutoff minutes
+    p += bytes([1])       # ct 4.4 unit of time period: hour
+    p += u4(fcst_hour)
+    p += bytes([level_type])
+    p += bytes([scale])
+    p += i4(level_value)
+    p += bytes([255, 255, 255, 255, 255, 255])   # second surface: missing
+    assert len(p) == 29
+    p += u2(stat_year) + bytes([stat_mon, stat_day, stat_hr, stat_min, stat_sec])
+    p += bytes([1])                              # n time ranges
+    p += bytes([0, 0, 0, 0])                     # opaque 4 bytes
+    p += bytes([period_flag, stat_proc, range_unit]) + u4(range_len)
+    p += bytes([step_unit]) + u4(step_len)
+    return section(4, bytes(p))
+
+
 def pack_bits(vals, nbits):
     out = bytearray((len(vals) * nbits + 7) // 8)
     pos = 0
@@ -405,6 +445,45 @@ def main():
     with open(os.path.join(a.out, "hrrr_small.grib2"), "wb") as f:
         for r in hrecs:
             f.write(r)
+
+    # ------------- PDT 4.8 statistically-processed fixture -------------------
+    # APCP accumulations + TMP average on a tiny regular grid. Values analytic
+    # like everywhere else. wgrib2 must print "accumulation"/"average" + the
+    # time range when it reads this file back (checked by gen_fixtures.sh).
+    snx, sny = 11, 7
+    sgrid = sec3_latlon(snx, sny, 240.0, 20.0, -0.5, -0.5)
+    sth = sec1(2026, 10, 19, 12, 0, 0)
+    srecs = []
+    def sincr(k):
+        return k % 60
+    for (pname, ltype, lval, fh, plen, pflag, sp) in (
+            ("APCP", LEVEL_SURFACE, 0, 0, 6, 1, 1),     # 0-6 h accumulation
+            ("APCP", LEVEL_SURFACE, 0, 6, 6, 1, 1),     # 6-12 h accumulation
+            ("TMP", LEVEL_AGL, 2, 3, 3, 0, 2)):         # 3-6 h average
+        pcat, pnum = PARAMS[pname]
+        base = 250.0 if pname == "TMP" else 10.0
+        incs = [j * snx + i for j in range(sny) for i in range(snx)]
+        s5b, s7b, s6b, _ = encode_field(incs, base, 0, None)
+        s4 = sec4_pdt48(pcat, pnum, pflag, sp, 1, plen, 1, 0, fh,
+                        ltype, 0, lval, genproc=2)
+        srecs.append(build_record(sth, sgrid, s4, s5b, s7b, None))
+    with open(os.path.join(a.out, "stat_small.grib2"), "wb") as f:
+        for r in srecs:
+            f.write(r)
+
+    # ------- unsupported representation guard (JPEG2000 5.40) --------------
+    # Structurally valid message whose section 5 declares DRT 5.40; our
+    # decoder must fail with the typed UnsupportedData error, never garbage.
+    u5 = bytearray()
+    u5 += u4(snx * sny)
+    u5 += u2(40)          # template 5.40 JPEG2000
+    u5 += f4be(0.0) + i2sm(0) + i2sm(0) + bytes([8, 0])
+    u5 += u4(16) + bytes([0, 0, 0, 0, 0, 0, 0])
+    urec = build_record(sth, sgrid, sec4(PARAMS["APCP"][0], PARAMS["APCP"][1],
+                                         LEVEL_SURFACE, 0, 6), section(5, bytes(u5)),
+                        sec7(bytes(range(16))), None)
+    with open(os.path.join(a.out, "unsupported_j2k.grib2"), "wb") as f:
+        f.write(urec)
 
     # ---------------- full-size perf fixture (gitignored dir) ----------------
     if a.perf_out:

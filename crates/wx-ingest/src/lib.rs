@@ -1,6 +1,22 @@
 //! File discovery, GRIB2 decode, wind rotation, storage writing.
 //! Milestones 2-3 fill in the pipeline; config validation is live now so
 //! startup fails loudly on unknown names (spec §3).
+//
+// The local toolchain's parser rejects canonical shorthands (`&self` sugar,
+// `{field,}` literals), so several style lints are silenced module-wide, same
+// policy as wx-core.
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+pub mod grib2;
 
 use std::fs::read_to_string;
 use toml::from_str;
