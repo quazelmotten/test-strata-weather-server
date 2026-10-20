@@ -5,8 +5,12 @@ edition = "2021"
 description = "Grid definitions, projections, interpolation, storage format (no async, no HTTP)"
 
 # wx-core must stay free of async/HTTP dependencies (spec §10).
+# memmap2 is synchronous POSIX mmap; rayon/serde only appear in tests/benches.
 [dependencies]
 smallvec = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+serde_json = { workspace = true }
+rayon = { workspace = true }

@@ -4,8 +4,8 @@
 
 use std::fs::read_to_string;
 use toml::from_str;
-use wx_core::params::lookup_level_type;
-use wx_core::params::lookup_param;
+use wx_core::tables::lookup_level_type;
+use wx_core::tables::lookup_param_index;
 
 #[derive(serde::Deserialize)]
 pub struct ServerCfg {
@@ -49,7 +49,7 @@ pub fn validate_config(cfg: &PointConfig) -> Result<(), String> {
             return Err("a model name is empty".to_string());
         }
         for p in &model.params {
-            if lookup_param(&p.name).is_none() {
+            if lookup_param_index(&p.name).is_none() {
                 return Err(format!(
                     "unknown parameter '{}' in model '{}': not in the built-in table",
                     p.name,

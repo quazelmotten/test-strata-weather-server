@@ -1423,6 +1423,9 @@ name = "wx-core"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "memmap2",
+ "rayon",
+ "serde_json",
  "smallvec",
 ]
 
