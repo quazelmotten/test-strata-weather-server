@@ -22,6 +22,13 @@ tower-service = "^0.3"
 bytes = "^1"
 http-body-util = "^0.1"
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "handler"
+harness = false
+
 [[bin]]
 name = "wxpoint"
 path = "src/main.rs"

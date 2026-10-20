@@ -135,7 +135,11 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
             return Ok(GridDef::Regular(g));
         }
         1 => {
-            if b.len() < 12 + 1 + 8 + 72 + 4 {
+            // layout: magic(8)+ver(4)+kind(1)+nx/ny(8)+8 f64 params(64)+4 flag
+            // bytes = 89. NOTE: earlier guard said 72 for the f64 block (9
+            // slots); encode_grid writes 8 (la1,lo1,lov,lad,latin1,latin2,
+            // dx,dy) -> warm-boot rebuild silently dropped every LCC run.
+            if b.len() < 12 + 1 + 8 + 64 + 4 {
                 return Err("truncated lambert grid".to_string());
             }
             let nx = le_u32_at(b, 13);

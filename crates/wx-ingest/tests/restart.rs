@@ -8,6 +8,7 @@ use wx_ingest::pipeline::Pipeline;
 use wx_ingest::index::{PointQueryContext, evaluate_point};
 use wx_core::interp::{TimeInterpMode, HorizMethod};
 use wx_core::tables::{lookup_level_type};
+use wx_core::grid::{GridDef};
 use wx_ingest::state::{join_path};
 use wx_ingest::discovery::{path_to_str};
 use memmap2::Mmap;
@@ -88,7 +89,9 @@ fn e2e_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n\n[[models]]\nname = \"stat\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"stat_*.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
+    let t = t + "\"\nfile_glob = \"stat_*.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
+    let t = format!("{0}{1}", t, ing);
+    let t = t + "\"\nfile_glob = \"hrrr_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n";
     return t;
 }
 
@@ -102,6 +105,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
 
     write_bytes(&join_path(&ing, "gfs_small.grib2"), &read_bytes(&fixture("gfs_small.grib2")));
     write_bytes(&join_path(&ing, "stat_small.grib2"), &read_bytes(&fixture("stat_small.grib2")));
+    write_bytes(&join_path(&ing, "hrrr_small.grib2"), &read_bytes(&fixture("hrrr_small.grib2")));
 
     let cfg_path = join_path(&root, "config.toml");
     write_bytes(&cfg_path, e2e_cfg(&data, &ing).as_bytes());
@@ -114,7 +118,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
     };
     let _ = p1.scan_round();
     let n = p1.scan_round();
-    assert!(n == 2);
+    assert!(n == 3);
     assert!(p1.counters.errors == 0);
 
     // ---- simulated restart ---------------------------------------------
@@ -180,6 +184,56 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 }
             }
             assert!(found);
+        }
+    }
+
+    // LCC warm-boot regression (bug fixed at milestone 5): decode_grid's
+    // lambert length guard previously demanded 97 bytes while encode_grid
+    // writes 89 -> EVERY LCC run was silently dropped from a warm-start
+    // index. hrrr must now be present with its Lambert grid and answer an
+    // exact-node probe at La1/Lo1.
+    let hm = sref.find_model("hrrr");
+    match hm {
+        None => { assert!(false); return; }
+        Some(m) => {
+            assert!(m.runs.len() == 1);
+            assert!(m.runs[0].fields.len() == 3);
+            match &*m.runs[0].grid {
+                GridDef::Lambert(g) => {
+                    assert!(g.nx == 61);
+                    assert!(g.ny == 41);
+                }
+                GridDef::Regular(_) => { assert!(false); }
+            }
+            let seed = PointQueryContext {
+                grid: m.runs[0].grid.clone(),
+                units: "".to_string(),
+                run_epoch_secs: 0,
+                stat_processed: false,
+                want_level: 0.0,
+                want_fh_hours: 0.0,
+                fh_hours: (0.0, 0.0),
+                slots: [None, None],
+            };
+            match lookup_level_type("height_above_ground") {
+                None => { assert!(false); return; }
+                Some(hgt) => {
+                    let c_r = seed.build(sref, "hrrr", None, "TMP", hgt,
+                                         2.0, 0.0, TimeInterpMode::Linear);
+                    match c_r {
+                        Err(_) => { assert!(false); return; }
+                        Ok(c) => {
+                            let v = evaluate_point(&c, 21.11389, 233.44);
+                            match v {
+                                Err(_) => { assert!(false); return; }
+                                Ok(pv) => {
+                                    assert!(pv.info.horizontal == HorizMethod::Exact);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

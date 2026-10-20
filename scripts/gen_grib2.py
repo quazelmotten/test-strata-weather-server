@@ -155,7 +155,7 @@ def sec3_latlon(nx, ny, lon1_deg, lat1_deg, dlon_deg, dlat_deg, wind_grid=False)
 
 
 def sec3_lambert(nx, ny, la1, lo1, lov, lad, latin1, latin2, dx_m, dy_m,
-                 wind_grid=False):
+                 wind_grid=False, scan_mode=0):
     g = bytearray(81)
     g[0:4] = u4(81)
     g[4] = 3
@@ -185,7 +185,7 @@ def sec3_lambert(nx, ny, la1, lo1, lov, lad, latin1, latin2, dx_m, dy_m,
     g[55:59] = i4sm(int(round(dx_m * 1000.0)))   # Dx in millimeters
     g[59:63] = i4sm(int(round(dy_m * 1000.0)))
     g[63] = 1                                  # projection flag: normal
-    g[64] = 0                                  # scanning mode (+i +j)
+    g[64] = scan_mode                          # scanning mode byte (bit 0x40: rows go north)
     g[65:69] = i4sm(int(math.floor(latin1 * E6 + 0.5)))
     g[69:73] = i4sm(int(math.floor(latin2 * E6 + 0.5)))
     g[73:77] = i4sm(-90 * E6)                  # "south pole" lat (negative!)
@@ -290,6 +290,33 @@ def pack_bits(vals, nbits):
                 out[pos >> 3] |= 0x80 >> (pos & 7)
             pos += 1
     return bytes(out)
+
+
+def pack_bits_np(a, nbits):
+    """numpy-vectorized twin of pack_bits (identical bytes, MSB-first, zero
+    tail padding). Used only by the full-size perf fixtures where the pure-
+    python loop would take tens of minutes."""
+    import numpy as np
+    bits = ((a[:, None] >> np.arange(nbits - 1, -1, -1)) & 1).astype(np.uint8)
+    flat = bits.reshape(-1)
+    pad = ((flat.size + 7) // 8) * 8 - flat.size
+    if pad:
+        flat = np.concatenate([flat, np.zeros(pad, dtype=np.uint8)])
+    return np.packbits(flat).tobytes()
+
+
+def encode_field_np(incs, base, e_exp):
+    """encode_field twin for numpy int arrays (no bitmap path needed at perf
+    size). Returns (sec5, sec7)."""
+    import numpy as np
+    mininc = int(incs.min())
+    maxinc = int(incs.max())
+    span = maxinc - mininc
+    nbits = max(1, span.bit_length())
+    shifted = incs - mininc
+    ref = base + mininc * (2.0 ** e_exp)
+    return (sec5_simple(len(shifted), ref, e_exp, 0, nbits),
+            sec7(pack_bits_np(shifted, nbits)))
 
 
 def sec5_simple(nvals, ref, e_exp, s_stored, nbits):
@@ -485,24 +512,93 @@ def main():
     with open(os.path.join(a.out, "unsupported_j2k.grib2"), "wb") as f:
         f.write(urec)
 
-    # ---------------- full-size perf fixture (gitignored dir) ----------------
+    # ------- full-size realistic perf DATASET (gitignored dir) ---------------
+    # Spec §8 milestone-5 perf run: GFS-like 1440x720 with ~10 configured
+    # param/level groups at f000+f006, plus HRRR-like full 1799x1059 LCC at
+    # f000+f003. Values stay analytic (exact in f32/simple packing):
+    #   GFS TMP@1000mb : value = 250 + row_j + fh*10      (compat with the
+    #                                                     single-message twin
+    #                                                     used by tests/perf_fixture.rs)
+    #   other GFS      : value = BASE + ((row*1440+col) % 4096) + fh*10
+    #   HRRR (affine)  : value = BASE + col + row + fh*10 (affine so bilinear
+    #                                                     probes land on-node
+    #                                                     within float noise)
     if a.perf_out:
+        import numpy as np
         os.makedirs(a.perf_out, exist_ok=True)
+
+        # ---- GFS-like regular lat/lon, N->S, winds earth-relative ----
         pnx, pny = 1440, 720
-        # NOTE: lat1 = +-90 exactly trips wgrib2's float check (90000000 * 1e-6 > 90),
-        # so the perf grid uses 89.875 .. -89.875 (720 rows at 0.25 deg).
-        pgrid = sec3_latlon(pnx, pny, 0.0, 89.875, 0.25, -0.25)
+        pgrid_w = sec3_latlon(pnx, pny, 0.0, 89.875, 0.25, -0.25, wind_grid=False)
         pt1 = sec1(2026, 10, 19, 12, 0, 0)
-        pcat, pnum = PARAMS["TMP"]
-        # value = 250 + j  (j = row index N->S); step 1 -> E=0, 10 bits
-        incs = []
-        for j in range(pny):
-            for i in range(pnx):
-                incs.append(j)
-        s5b, s7b, s6b, _ = encode_field(incs, 250.0, 0, None)
-        s4 = sec4(pcat, pnum, LEVEL_ISOBARIC, 1000 * 100, 0)
-        with open(os.path.join(a.perf_out, "gfs_perf_f000.grib2"), "wb") as f:
-            f.write(build_record(pt1, pgrid, s4, s5b, s7b, None))
+        jj = np.repeat(np.arange(pny, dtype=np.int64), pnx)
+        ii = np.tile(np.arange(pnx, dtype=np.int64), pny)
+        mod_inc = (jj * pnx + ii) % 4096
+
+        gfs_fields = []  # (param, level_type, level_value_native, base)
+        for lv in (1000, 925, 850, 700, 500, 300, 250, 200):
+            gfs_fields.append(("HGT", LEVEL_ISOBARIC, lv * 100, {
+                1000: 480, 925: 1020, 850: 1560, 700: 3000,
+                500: 5700, 300: 9400, 250: 10500, 200: 11800}[lv]))
+        for lv in (1000, 925, 850, 700, 500, 300, 250, 200):
+            gfs_fields.append(("TMP", LEVEL_ISOBARIC, lv * 100, {
+                1000: 250, 925: 255, 850: 260, 700: 265,
+                500: 270, 300: 275, 250: 280, 200: 285}[lv]))
+        gfs_fields.append(("TMP", LEVEL_AGL, 2, 260))
+        gfs_fields.append(("UGRD", LEVEL_AGL, 10, -5))
+        gfs_fields.append(("VGRD", LEVEL_AGL, 10, -3))
+        gfs_fields.append(("RH", LEVEL_AGL, 2, 40))
+        gfs_fields.append(("PRMSL", LEVEL_SURFACE, 0, 101000))
+        gfs_fields.append(("GUST", LEVEL_AGL, 10, 5))
+
+        for fh in (0, 6):
+            recs = []
+            for (pname, ltype, lval, base) in gfs_fields:
+                if pname == "TMP" and ltype == LEVEL_ISOBARIC and lval == 100000:
+                    incs = jj + fh * 10          # legacy formula (perf_fixture.rs)
+                else:
+                    incs = mod_inc + fh * 10
+                s5b, s7b = encode_field_np(incs, float(base), 0)
+                s4 = sec4(PARAMS[pname][0], PARAMS[pname][1], ltype, lval, fh)
+                recs.append(build_record(pt1, pgrid_w, s4, s5b, s7b, None))
+            with open(os.path.join(a.perf_out, "gfs_perf_f%03d.grib2" % fh), "wb") as f:
+                for r in recs:
+                    f.write(r)
+
+        # ---- HRRR-like LCC CONUS geometry, grid-relative winds ----
+        hnx, hny = 1799, 1059
+        hjj = np.repeat(np.arange(hny, dtype=np.int64), hnx)
+        hii = np.tile(np.arange(hnx, dtype=np.int64), hny)
+        affine = hii + hjj                       # affine in (i,j): bilinear-safe probes
+        hgrid_s = sec3_lambert(hnx, hny, 21.11389, 233.44, 229.53, 26.5,
+                               26.5, 35.0, 3000.0, 3000.0, wind_grid=False,
+                               scan_mode=0x40)  # rows go NORTH from La1 (real HRRR)
+        hgrid_w = sec3_lambert(hnx, hny, 21.11389, 233.44, 229.53, 26.5,
+                               26.5, 35.0, 3000.0, 3000.0, wind_grid=True,
+                               scan_mode=0x40)
+        th1 = sec1(2026, 10, 19, 12, 0, 0)
+        hrrr_fields = [("TMP", LEVEL_AGL, 2, 255, False)]
+        for lv in (925, 850, 700, 500):
+            hrrr_fields.append(("TMP", LEVEL_ISOBARIC, lv * 100,
+                                {925: 258, 850: 262, 700: 268, 500: 275}[lv], False))
+        for lv in (1000, 925, 850, 700, 500):
+            hrrr_fields.append(("HGT", LEVEL_ISOBARIC, lv * 100,
+                                {1000: 10, 925: 750, 850: 1550, 700: 3000,
+                                 500: 5700}[lv], False))
+        hrrr_fields.append(("UGRD", LEVEL_AGL, 10, -5, True))
+        hrrr_fields.append(("VGRD", LEVEL_AGL, 10, -3, True))
+        hrrr_fields.append(("RH", LEVEL_AGL, 2, 40, False))
+        for fh in (0, 3):
+            recs = []
+            for (pname, ltype, lval, base, wgrid) in hrrr_fields:
+                incs = affine + fh * 10
+                s5b, s7b = encode_field_np(incs, float(base), 0)
+                s4 = sec4(PARAMS[pname][0], PARAMS[pname][1], ltype, lval, fh)
+                recs.append(build_record(th1, hgrid_w if wgrid else hgrid_s,
+                                         s4, s5b, s7b, None))
+            with open(os.path.join(a.perf_out, "hrrr_perf_f%03d.grib2" % fh), "wb") as f:
+                for r in recs:
+                    f.write(r)
 
     print("fixtures written")
 

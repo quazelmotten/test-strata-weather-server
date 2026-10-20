@@ -14,3 +14,7 @@ memmap2 = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
 rayon = { workspace = true }
+
+[[bench]]
+name = "kernels"
+harness = false

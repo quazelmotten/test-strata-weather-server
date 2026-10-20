@@ -38,8 +38,21 @@ Reference binary: `/home/frankzappa/dylantest2/tools/wgrib2` (system PATH wgrib2
 ### tests/fixtures/unsupported_j2k.grib2
 - Single message declaring DRT 5.40 (JPEG2000); decoder must return typed `UnsupportedData(40)`. Never decoded by wgrib2 nolib (no jpeg support).
 
-### tests/perfdata/gfs_perf_f000.grib2 (gitignored)
-- Full GFS geometry: 1440 × 720, 0.25°, lat 89.875 → −89.875, lon 0 → 359.75, single TMP@1000mb f000 message, value = 250 + row_index. ~1.3 MB.
+### tests/perfdata/* (gitignored; regenerate: scripts/gen_perfdata.sh + scripts/validate_perf.py)
+- `gfs_perf_f000.grib2` / `gfs_perf_f006.grib2`: full GFS geometry 1440 × 720
+  (0.25°, lat 89.875 → −89.875 N→S, lon 0 → 359.75), 22 messages each
+  (~33.9 MB): TMP@{2m AGL, 1000..200 mb}, HGT@{8 isobarics}, UGRD/VGRD@10m,
+  RH@2m, PRMSL@surface, GUST@10m; DRT 5.0. Values analytic & exact-in-f32:
+  TMP@1000 = 250 + j + fh·10 (back-compat with the old single-message file and
+  tests/perf_fixture.rs), other GFS params = base + ((j·1440+i) mod 4096) + fh·10.
+- `hrrr_perf_f000.grib2` / `hrrr_perf_f003.grib2`: HRRR-like LCC 1799 × 1059
+  (La1 21.11389, Lo1 233.44, LoV 226.25, LaD 26.5, Latin1/2 26.5/35.0, Dx=Dy
+  3000 m, scan byte 0x40 = rows go NORTH from La1 — real-HRRR convention,
+  validated vs wgrib2 `-ll2ij`), 13 msgs each (~37.2 MB), grid-relative winds
+  rotated at ingest. Affine fields base + i + j + fh·10 so OFF-node bilinear
+  probes reproduce within ~1e-3.
+- `probes.tsv`: 17 ground-truth probes (url/mode/expected; grep|near|status)
+  replayed by scripts/smoke.sh against both models.
 
 ## Regeneration
 - `scripts/gen_fixtures.sh` regenerates all fixtures idempotently (wraps `scripts/gen_grib2.py`).

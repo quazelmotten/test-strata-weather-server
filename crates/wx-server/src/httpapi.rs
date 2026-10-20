@@ -94,7 +94,7 @@ pub async fn point_handler(st: State<ServerState>, req: Request) -> Response {
 /// Per-parameter selection over the shared point/level/time. Decision (spec
 /// ambiguous for multi-param errors): the FIRST failing parameter decides the
 /// error status; masked points are not errors. Returns (status, body).
-fn answer_all(snap: Arc<IndexSnapshot>, pa: &ParsedArgs) -> (u16, String) {
+pub fn answer_all(snap: Arc<IndexSnapshot>, pa: &ParsedArgs) -> (u16, String) {
     let mut entries: Vec<QueryEntry> = Vec::<QueryEntry>::new();
     let sref = &*snap;
     for key in &pa.params {
@@ -136,7 +136,7 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
             out = format!("{0}{1}", out, ",");
         }
         let m = &cfg[k];
-        out = format!("{0},\"name\":\"{1}\"", out, m.name);
+        out = format!("{0}{{\"name\":\"{1}\"", out, m.name);
         // grid info from the newest indexed run of this model, else null.
         let gm = sref.find_model(&m.name);
         match gm {
@@ -157,7 +157,7 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
                 out = format!("{0}{1}", out, ",");
             }
             let rp = &m.params[pk];
-            out = format!("{0},\"name\":\"{1}\",\"units\":\"{2}\",\"levels\":[", out, rp.key, rp.units);
+            out = format!("{0}{{\"name\":\"{1}\",\"units\":\"{2}\",\"levels\":[", out, rp.key, rp.units);
             for lk in 0 .. rp.level_specs.len() {
                 if lk > 0 {
                     out = format!("{0}{1}", out, ",");
@@ -244,6 +244,9 @@ pub async fn inventory_handler(st: State<ServerState>, req: Request) -> Response
             Some(_) => {}
         }
     }
+    // NOTE (bug fixed this milestone): each object item carries its own
+    // leading separator comma AND must open with '{'; earlier code emitted
+    // neither consistently (invalid JSON like [,"model" ... },,"param").
     let mut out = "{\"inventory\":[".to_string();
     let mut first_model = true;
     for mi in 0 .. sref.models.len() {
@@ -255,21 +258,21 @@ pub async fn inventory_handler(st: State<ServerState>, req: Request) -> Response
             out = format!("{0}{1}", out, ",");
         }
         first_model = false;
-        out = format!("{0},\"model\":\"{1}\",\"runs\":[", out, mm.name);
+        out = format!("{0}{{\"model\":\"{1}\",\"runs\":[", out, mm.name);
         for ri in 0 .. mm.runs.len() {
             if ri > 0 {
                 out = format!("{0}{1}", out, ",");
             }
             let rr = &mm.runs[ri];
             let run_s = format_iso_z(rr.epoch_secs);
-            out = format!("{0},\"run\":\"{1}\",\"dir\":\"{2}\",\"fields\":[", out, run_s, rr.dir_name);
+            out = format!("{0}{{\"run\":\"{1}\",\"dir\":\"{2}\",\"fields\":[", out, run_s, rr.dir_name);
             for fi in 0 .. rr.fields.len() {
                 if fi > 0 {
                     out = format!("{0}{1}", out, ",");
                 }
                 let fe = &rr.fields[fi];
                 let lvl_dir = level_dir_name(fe.level_code);
-                out = format!("{0},\"param\":\"{1}\",\"level_type\":\"{2}\",\"units\":\"{3}\",\"stat_processed\":{4},\"stat_kind\":\"{5}\"", out, fe.param_key, lvl_dir, fe.fd.units, fe.fd.stat_processed, fe.fd.stat_kind);
+                out = format!("{0}{{\"param\":\"{1}\",\"level_type\":\"{2}\",\"units\":\"{3}\",\"stat_processed\":{4},\"stat_kind\":\"{5}\"", out, fe.param_key, lvl_dir, fe.fd.units, fe.fd.stat_processed, fe.fd.stat_kind);
                 out = format!("{0},\"forecast_hours\":[", out);
                 for kh in 0 .. fe.fd.fhs.len() {
                     if kh > 0 {

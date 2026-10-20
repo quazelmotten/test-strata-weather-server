@@ -1434,6 +1434,7 @@ name = "wx-ingest"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "criterion",
  "memmap2",
  "notify",
  "rayon",
@@ -1452,6 +1453,7 @@ dependencies = [
  "axum",
  "bytes 1.12.1",
  "clap",
+ "criterion",
  "http",
  "http-body-util",
  "libc",

@@ -334,7 +334,105 @@ final deterministic query answers 341.
 negative lon), error tokens (404/422), meta endpoints, then compute the
 release average latency from `/metrics`. Prints SMOKE PASS/FAIL.
 
-## Deferred (milestone 5)
+---
 
-criterion benches + oha/wrk load test + profiling pass + README measured
-numbers; storage-layout interning experiments.
+# Milestone 5 decisions (benchmarks, load test, profiling, README)
+
+## Benchmark profile quirk (this toolchain)
+
+Criterion needs unwinding, so `[profile.bench]` mirrors release minus panic
+handling. This cargo (a) silently IGNORES `panic` in the bench profile (bench
+always unwinds — which is exactly what criterion wants; shipped release keeps
+`panic = "abort"`), and (b) rejects both `inherit` on built-in profiles and a
+bare `optimize`/`optimization-level` key. The explicit quoted-key form
+`"opt-level" = 3` is used and documented in Cargo.toml.
+
+## Load-test tool: oha 1.16.0
+
+Downloaded once into gitignored `tools/` (same policy as the local wgrib2
+build tree). oha quirks recorded: `-t` is TIMEOUT (threads are
+`--worker-threads`), and multiple URLs require `--urls-from-file`. 8 worker
+threads per spec §8. ab/wrk would also work; oha chosen for its server-side
+friendly keep-alive mix + stable RPS reporting.
+
+## §8 targets met on first measurement -> NO bounded optimizations attempted
+
+Decision recorded deliberately: portable build already hits p50<=20us / p99<=50us
+server-side and ~287k req/s (>=50k target x5.7), so no bit-risky micro-
+optimizations were attempted at all; nothing needs a bit-exactness test beyond
+the pre-existing suite. The interning/chunked-layout experiment was NOT done
+because there was no measured gap to close.
+
+## target-cpu=native verdict
+
+NATIVE=1 path in loadtest.sh rebuilds with `-C target-cpu=native` into
+target-native/: 275,293 req/s vs 286,868 req/s portable (native is WORSE,
+EPYC scheduling/NUMA noise likely). Shipped build stays portable; native is
+documented only.
+
+## Profiling pass: hardware profilers unavailable on this machine
+
+perf_event_paranoid=4 AND yama ptrace_scope=1 (no passwordless sudo): perf
+stat/record fail outright, gdb attach refused (attach-only-child rule), strace
+ATTACH impossible. Fallback implemented: scripts/profshim.c LD_PRELOADs a
+per-thread ITIMER_PROF SIGPROF sampler (pthread_create interposition enables
+the itimer on tokio/rayon threads; ucontext RIP leaf samples; periodic atomic
+dump survives any kill), symbolized offline against .symtab via nm plus
+/proc/pid/maps for libc regions. strace LAUNCH mode (not attach) still works
+for syscall accounting. Top cost centers under the load mix (12 s, 8 threads):
+libc writev 27.1% (response socket writes dominate), recv 4.8%, our point_handler
+closure 4.7%, free 3.2%, syscall 3.1%; ingest-side frames (rayon decode bridge,
+store::write_field) appear because the window includes the initial dataset
+ingest. Syscall counts (strace -c, 3 s window): futex 48,407 / epoll_wait
+13,160 / writev 45,528 — one writev per response dominates.
+
+## Metrics rendering bug fixed
+
+Bucket lines emitted `}count` without whitespace between the closing brace and
+the value (invalid Prometheus); fixed to `} <count>` before the load test read
+percentiles off /metrics.
+
+## Two real bugs found while validating milestone-5 deliverables (fixed + tested)
+
+1. **Warm-boot LCC drop**: decode_grid's Lambert length guard demanded 97
+   bytes while encode_grid correctly writes 89 (8 f64 params, not 9) -> EVERY
+   LCC run was silently dropped from a warm-start index (HRRR never became
+   ready after restart; cold boot masked it because GridDef lived in memory).
+   Fixed guard to 89; regression test: restart.rs extended with an hrrr model
+   + exact-node probe through the rebuilt index.
+2. **Invalid JSON on /v1/models and /v1/inventory**: object items lacked '{'
+   and loops double-pushed separator commas (`[,"model" ... },,"param"`).
+   Fixed braces/separators; regression test meta_json.rs parses both endpoints
+   end-to-end through the real router with serde_json.
+
+## Perf-dataset generation decisions
+
+* gen_perfdata.sh extends scripts/gen_grib2.py (numpy fast packing) to full
+  GFS geometry (1440x720, 22 msgs/file ~33.9 MB) and HRRR-like LCC
+  (1799x1059, 13 msgs/file ~37.2 MB); validate_perf.py re-probes every record
+  with wgrib2 (DRT 5.0 everywhere; node values match formulas within 0.51).
+* LCC scan byte 0x40 (rows go NORTH from La1 = real-HRRR convention),
+  empirically validated against wgrib2 -ll2ij (SW probe ~= (6.5, 4.4)).
+* Analytic fields kept EXACT in f32: GFS TMP@1000 = 250+j+fh*10 (back-compat
+  with tests/perf_fixture.rs), other GFS = base+((j*1440+i)%4096)+fh*10, HRRR
+  affine = base+i+j+fh*10 (affine so OFF-node bilinear probes reproduce within
+  ~1e-3; probes.tsv near-mode tolerance 0.01).
+* probes.tsv (17 probes, gitignored, regenerable) replayed by smoke.sh in
+  grep/near/status modes against BOTH models.
+
+## smoke.sh extension
+
+Full perf dataset served end-to-end (gfs+hrrr, 12 param groups); inventory
+polled until BOTH forecast hours of BOTH models are queryable before probing
+(per-fh publication race), then probes.tsv replayed; SMOKE PASS requires all
+probes green. Release avg latency from /metrics: ~24 us/query over 422
+sequential curls (includes HTTP client overhead per request).
+
+## Measured numbers (this machine: AMD EPYC 7402, rustc 1.99.1, kernel 7.0.0-31)
+
+See README tables: criterion medians (regular_ll project 20.6 ns, lamcc
+project 84.7 ns, bilinear heap 30.7 ns, mmap h_at 32.5 ns, full vertical+time
+query 364.5 ns, handler parse+lookup+render 879.2 ns); load test portable
+286,868 req/s, server p50<=20us p99<=50us mean 12.9us; ingest->queryable
+/ready 3.9 s, gfs f000 4.1 s / f006 4.2 s, hrrr f000 4.3 s / f003 5.1 s; peak
+RSS 372 MB; workspace cargo test 57 green; clippy -D warnings clean.

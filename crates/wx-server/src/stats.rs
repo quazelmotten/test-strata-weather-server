@@ -94,7 +94,7 @@ impl QueryStats {
             cum = cum + self.buckets[k].load(Ordering::Relaxed);
             out = format!("{0}{1}", out, "wxpoint_query_latency_us_bucket{le=\"");
             out = format!("{0}{1}", out, BUCKET_US[k]);
-            out = format!("{0}{1}", out, "\"}");
+            out = format!("{0}{1}", out, "\"} ");
             out = format!("{0}{1}", out, cum);
             out = format!("{0}{1}", out, "\n");
         }
