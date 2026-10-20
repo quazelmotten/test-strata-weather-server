@@ -7,6 +7,13 @@ data_dir = "/var/lib/wxpoint"
 [ingest]
 scan_interval_secs = 30
 retention_runs = 4
+# File-stability window: a candidate is eligible once its (size,mtime) has
+# stayed unchanged for >= stable_window_secs (default 10). Set 0 to require
+# only one re-observation on the next scan round.
+#stable_window_secs = 10
+# Dedicated rayon decode pool size for ingest work (default 4); kept separate
+# from the HTTP runtime so ingest never starves the query path.
+#ingest_threads = 4
 
 [[models]]
 name = "gfs"
@@ -34,6 +41,10 @@ file_glob = "gfs.t*z.pgrb2.0p25.f*"
 name = "hrrr"
 ingest_dir = "/data/incoming/hrrr"
 file_glob = "hrrr.t*z.wrf*f*.grib2"
+# Optional per-model sidecar stability strategy: when present, a candidate
+# <file> becomes eligible as soon as <file><suffix> exists (upstream writes
+# it after closing the GRIB). Overrides the window strategy for this model.
+#sidecar_suffix = ".done"
 
   [[models.params]]
   name = "TMP"

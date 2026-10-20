@@ -9,6 +9,7 @@ wx-core = { path = "../wx-core" }
 rayon = { workspace = true }
 memmap2 = { workspace = true }
 notify = { workspace = true }
+arc-swap = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

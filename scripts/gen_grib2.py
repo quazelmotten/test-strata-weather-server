@@ -500,7 +500,7 @@ def main():
             for i in range(pnx):
                 incs.append(j)
         s5b, s7b, s6b, _ = encode_field(incs, 250.0, 0, None)
-        s4 = sec4(pcat, pnum, LEVEL_ISOBARIC, 1000, 0)
+        s4 = sec4(pcat, pnum, LEVEL_ISOBARIC, 1000 * 100, 0)
         with open(os.path.join(a.perf_out, "gfs_perf_f000.grib2"), "wb") as f:
             f.write(build_record(pt1, pgrid, s4, s5b, s7b, None))
 

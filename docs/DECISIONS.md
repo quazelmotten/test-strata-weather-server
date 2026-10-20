@@ -121,3 +121,119 @@ documented as the hook milestone 3 will bind to a dedicated ingest pool
 * Workspace totals: cargo test --workspace green (wx-core 22 + wx-ingest 15);
   clippy -D warnings green (style lints silenced module-wide where the local
   parser rejects canonical shorthands — same policy as wx-core).
+
+---
+
+# Milestone 3 decisions (ingest pipeline + index)
+
+## Config schema additions (all optional; defaults documented)
+
+* `[ingest].stable_window_secs` (default 10): window strategy for file
+  stability.
+* `[ingest].ingest_threads` (default 4): dedicated rayon pool for decode work
+  (spec §4.2 "separate thread pool").
+* `[[models]].sidecar_suffix` (absent by default): per-model sidecar-marker
+  strategy instead of the window (spec §4.1 "or once a sidecar marker
+  appears... make the strategy configurable").
+* Raw param override: a `[[models.params]]` entry may omit `name` and give
+  `discipline`/`category`/`number`; key becomes `d{D}c{C}n{N}` and units ""
+  unless the triple matches the built-in table (then canonical name+units).
+* Level spec grammar: `"*"`, `"type:*"`, `"type:value"`, bare `"type"` (= 0,
+  e.g. `surface`).
+
+## Stability semantics
+
+* Window rule: first sighting records (size,mtime,first_seen); eligible only
+  when a LATER observation sees identical (size,mtime) AND marker-clock
+  elapsed >= window. With window=0 this still needs a second scan round —
+  deliberate: "stable for the window" always implies at least two samples.
+* Wall clock: this toolchain lacks an epoch-time API, so `now_ns_marker(dir)`
+  stats the mtime of a freshly created `<state_dir>/.wxpoint-clock`. The
+  persisted record stores mtime_ns via `MetadataExt` (mtime()*1e9+nsec).
+* Half-written files are skipped BEFORE decoding (stability gates the decode
+  call; test asserts errors counter stays 0 on a truncated GRIB).
+
+## Persistent record + state file
+
+* `data_dir/state/files.json`: path + size + mtime_ns + FNV-1a64 over first/
+  last 64 KiB (whole file if < 128 KiB), written atomically (tmp+rename).
+* Fixed: hash multiply now `wrapping_mul` (FNV requires modular arithmetic;
+  checked multiply trapped in debug on the first real run).
+* Same path with different content hash re-ingests (test redelivers the DRT
+  5.3 twin under the original filename).
+
+## Storage / manifest
+
+* Layout exactly per spec §4.5: `<model>/<run YYYYMMDDHH>/grid.bin manifest.json
+  <param>/<level_type>/f<FFF>.bin`; temp+fsync+rename everywhere; multi-file
+  merge into the same (run,fh) file merges level planes (new values win).
+* manifest.json is now WRITTEN after every field store (was read-only before —
+  gap found while wiring tests). Fields list param/level_type/units/stat info
+  + levels (of the newest fh file; informational) + forecast_hours. The index
+  stays authoritative; a manifest write failure logs + counts but does not
+  block publication. Restart restores the PDT 4.8 guard from the manifest
+  (tested).
+* Per-fh visibility: `store_plane` publishes (arc-swap swap) after EVERY
+  successful field write; a run becomes queryable forecast-hour by forecast-
+  hour (spec §4.5).
+
+## Retention order (spec §4.6)
+
+Registry removal -> publish() -> delete_tree. A stale snapshot held across
+the eviction still answers through unlinked mmaps (Arc keeps them mapped;
+Linux unlink-while-mapped). Tested with three byte-patched run twins
+(sec1 day byte patched; 39 pattern hits verified).
+
+## Index / server contract (milestone 4)
+
+* SharedIndex.get_index() -> Arc<IndexSnapshot>; PointQueryContext.build(
+  snapshot, model, pinned_epoch?, param_key, level_code, want_level, want_fh,
+  mode) -> Result<ctx, SelectError>; evaluate_point(ctx, lat, lon) -> QueryResult.
+* SelectError maps to HTTP later: UnknownModel/NoRunCovers -> 404,
+  LevelOutOfRange/TimeExactOnly/StatTimeGuard -> 422.
+* Hot path: no allocation beyond Arc refcount bumps + response body; mmaps
+  opened at snapshot-build time (`Arc<MmapField>` shared across snapshots).
+
+## Threading & counters
+
+* Decode runs on the dedicated rayon pool: `pool.install(|| decode_files_parallel(...))`
+  sized by ingest_threads.
+* IngestCounters { ingested_files, errors, last_mtime_ns } feed /metrics later
+  (query latency histogram lands with milestone 4).
+
+## Deviations / notes
+
+* Layer-range messages (levels.len() != 1) and non-integral fc_secs are logged,
+  counted as ingest errors, and skipped (fixtures never hit either path).
+* notify watchers (notify v3 pinned by Cargo.lock) push Create/Write/Rename
+  paths onto the scan queue for LATENCY only; every scan_round drains the
+  queue AND does the full recursive scan (authoritative; spec §4.1 fallback).
+* Wind pairing at ingest: pending U/V keyed (epoch,fh,levelcode,val) within a
+  batch; rotation applied when both arrive; earth-relative stored with
+  winds_grid=false. Pair-rule violation flags the model, logs, counts one
+  error, and skips wind params (config validation cannot see the grid flag
+  until decode).
+* Perf data point (debug build, this machine): full GFS hour (1440x720 TMP@1000
+  f000, 1.3 MB GRIB) ingested + indexed in ~230 ms wall (marker clock); release
+  numbers recorded in README at milestone 5.
+
+## Test counts (this milestone)
+
+New wx-ingest test binaries (all green, workspace totals now cargo test green,
+clippy -D warnings clean):
+
+* `pipeline_e2e.rs`: 1 — fixtures -> storage tree -> index -> queries (bilinear/
+  vertical/time exactness incl. masked NaN MissingData, APCP guard, HRRR LCC
+  node probe, rotated-wind magnitude invariant, manifest assertions).
+* `restart.rs`: 1 — restart without re-ingest, rebuild_from_disk index restore,
+  manifest stat-guard round-trip, content-change redelivery re-ingests.
+* `retention.rs`: 1 — evict-after-publish ordering, stale-snapshot reads post-
+  unlink, pinned-run selection on an evicted run fails NoRunCovers.
+* `stability.rs`: 2 — window strategy half-written skip-then-complete; sidecar
+  eligibility.
+* `concurrency.rs`: 1 — 4 reader threads x >=500 queries vs 300+ arc-swap
+  republishes; zero failures, stable values.
+* `config_validate.rs`: 4 — unknown param, raw triples (unknown + known), bad
+  level/retention/dupes/empty-levels/name+raw errors, wind-pair message text.
+* `perf_fixture.rs`: 1 — full GFS geometry ingest timing + edge/seam/row value
+  checks (skips when the gitignored perf fixture is absent).

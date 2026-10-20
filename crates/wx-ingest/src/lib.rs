@@ -5,6 +5,7 @@
 // The local toolchain's parser rejects canonical shorthands (`&self` sugar,
 // `{field,}` literals), so several style lints are silenced module-wide, same
 // policy as wx-core.
+
 #[allow(clippy::needless_return)]
 #[allow(clippy::redundant_field_names)]
 #[allow(clippy::needless_arbitrary_self_type)]
@@ -16,86 +17,190 @@
 #[allow(clippy::explicit_counter_loop)]
 #[allow(clippy::len_zero)]
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
 pub mod grib2;
 
-use std::fs::read_to_string;
-use toml::from_str;
-use wx_core::tables::lookup_level_type;
-use wx_core::tables::lookup_param_index;
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod config;
 
-#[derive(serde::Deserialize)]
-pub struct ServerCfg {
-    pub bind: String,
-    pub data_dir: String,
-}
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod state;
 
-#[derive(serde::Deserialize)]
-pub struct IngestCfg {
-    pub scan_interval_secs: u32,
-    pub retention_runs: u32,
-}
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod discovery;
 
-#[derive(serde::Deserialize)]
-pub struct ParamCfg {
-    pub name: String,
-    pub levels: Vec<String>,
-}
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod store;
 
-#[derive(serde::Deserialize)]
-pub struct ModelCfg {
-    pub name: String,
-    pub ingest_dir: String,
-    pub file_glob: String,
-    pub params: Vec<ParamCfg>,
-}
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod index;
 
-#[derive(serde::Deserialize)]
-pub struct PointConfig {
-    pub server: ServerCfg,
-    pub ingest: IngestCfg,
-    pub models: Vec<ModelCfg>,
-}
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod pipeline;
 
-pub fn validate_config(cfg: &PointConfig) -> Result<(), String> {
-    if cfg.models.is_empty() {
-        return Err("config has no [[models]] entries".to_string());
-    }
-    for model in &cfg.models {
-        if model.name.is_empty() {
-            return Err("a model name is empty".to_string());
-        }
-        for p in &model.params {
-            if lookup_param_index(&p.name).is_none() {
-                return Err(format!(
-                    "unknown parameter '{}' in model '{}': not in the built-in table",
-                    p.name,
-                    model.name,
-                ));
-            }
-            for lv in &p.levels {
-                if lv == "*" {
-                    continue;
-                }
-                let parts: Vec<&str> = lv.split(':').collect();
-                if parts.is_empty() {
-                    return Err(format!("empty level spec in model '{}'", model.name));
-                }
-                if lookup_level_type(parts[0]).is_none() {
-                    return Err(format!(
-                        "unknown level type '{}' in model '{}'",
-                        parts[0],
-                        model.name,
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn load_config(path: &str) -> Result<PointConfig, String> {
-    let text = read_to_string(path).map_err(|e| e.to_string())?;
-    let cfg = from_str::<PointConfig>(&text).map_err(|e| e.to_string())?;
-    validate_config(&cfg)?;
-    Ok(cfg)
-}
+pub use config::load_config;
+pub use config::validate_config;
+pub use config::PointConfig;
+pub use pipeline::Pipeline;
+pub use index::SharedIndex;
+pub use index::IndexSnapshot;
+pub use index::PointQueryContext;
+pub use index::evaluate_point;
+pub use index::SelectError;

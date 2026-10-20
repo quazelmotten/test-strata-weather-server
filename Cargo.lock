@@ -1433,6 +1433,7 @@ dependencies = [
 name = "wx-ingest"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "memmap2",
  "notify",
  "rayon",
