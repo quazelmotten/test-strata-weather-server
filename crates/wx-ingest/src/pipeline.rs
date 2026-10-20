@@ -197,7 +197,9 @@ pub struct Pipeline {
     pub state: StateStore,
     pub stability: StabilityTracker,
     pub registry: Vec<RegModel>,
-    pub shared: SharedIndex,
+    // Arc-wrapped so milestone 4's HTTP handlers can hold a clone of the SAME
+    // ArcSwap while the Pipeline itself lives on the ingest thread.
+    pub shared: Arc<SharedIndex>,
     pub counters: IngestCounters,
     pub wind_violation: bool,
     pub queue: WatchQueue,
@@ -396,7 +398,7 @@ impl Pipeline {
             state: st.unwrap(),
             stability: StabilityTracker { obs: Vec::<(String, u64, i64, i64)>::new() },
             registry: Vec::<RegModel>::new(),
-            shared: SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) },
+            shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
             counters: IngestCounters { ingested_files: 0, errors: 0, last_mtime_ns: 0 },
             wind_violation: false,
             queue: q,

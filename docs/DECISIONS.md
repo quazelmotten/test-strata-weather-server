@@ -237,3 +237,104 @@ clippy -D warnings clean):
   level/retention/dupes/empty-levels/name+raw errors, wind-pair message text.
 * `perf_fixture.rs`: 1 — full GFS geometry ingest timing + edge/seam/row value
   checks (skips when the gitignored perf fixture is absent).
+
+# Milestone 4 decisions (HTTP server + query API)
+
+## Error tokens and status classes (spec §7)
+
+`GET /v1/point` parses args first; malformed input is `400` with one of
+`missing_required`, `unknown_query_param`, `bad_lat`, `bad_lon`, `bad_level`,
+`bad_time`, `bad_time_interp`, `empty_value`. A well-formed request that cannot
+be answered maps through `FailTok` (queryapi) to a stable token + status:
+
+| token | status | meaning |
+|---|---|---|
+| `unknown_model` | 404 | model not configured/indexed |
+| `unknown_param` | 404 | no indexed (param, level-type) field in any run |
+| `no_run_covers` | 404 | valid time outside every run's stored fh range |
+| `level_out_of_range` | 422 | requested level outside stored range |
+| `stat_time_guard` | 422 | template 4.8 field, exact fh required (§6.3) |
+| `time_exact_only` | 422 | `time_interp=none` and no exact fh |
+| `out_of_domain` | 422 | point outside grid node rectangle (§6.1) |
+
+Error priority when several apply: LevelOutOfRange > StatTimeGuard >
+TimeExactOnly > NoRunCovers (the most specific actionable cause wins).
+Unknown routes get `404 unknown_endpoint`. Body shape:
+`{"error":"<token>","message":"..."}`.
+
+## Run selection
+
+The server iterates the snapshot's runs newest→oldest and recomputes
+`fh = (valid − run_epoch)/3600` per run, calling the milestone-3
+`PointQueryContext.build()` with that pinned epoch; the first run that can
+answer wins ("most recent run covering valid"). An explicit `run=` pins
+exactly (epoch match required, otherwise `no_run_covers`).
+
+## JSON deviations from the spec example (documented, deliberate)
+
+* Exact vertical/time matches render explicit `"method":"exact"` (or the key
+  is present with nulls) instead of omitting the object; masked values render
+  `"value":null,"reason":"missing_data","interpolation":null` (spec left the
+  masked shape open).
+* Numbers are rendered by `fmt_num` (≤6 trimmed decimal digits): integers print
+  without a trailing `.0` (`"value":341`, not `341.0`).
+* Multi-param requests (`param=TMP,HGT`) share one point/level/time and add one
+  entry per param to `results`; each entry carries its own `units`.
+* `/v1/inventory` adds `stat_processed`/`stat_kind` per field so clients can
+  see which entries reject time interpolation before querying them.
+
+## Epoch fix (bug found this milestone)
+
+`grib2.rs epoch_secs` double-counted the era-of-years terms and used the wrong
+constant; fixed to Howard Hinnant's civil-days formula returning true Unix
+seconds (`se = era*146097 + doe − 719468`). `format_iso_z` was rewritten as the
+exact inverse (`z = se + 719468`, provable yoe correction loop, clamp at 399)
+with a boundary round-trip test. All consumers are internal/self-consistent,
+so the change is safe everywhere (workspace tests re-verified green).
+
+## Hot path allocation proof (spec §5)
+
+`hotpath_alloc.rs` installs a counting `#[global_allocator]` wrapping libc
+malloc/free (header word stashes the raw pointer; counts via relaxed atomics)
+in the test binary, then brackets the hot path on the full-GFS perf fixture:
+
+* `evaluate_point` alone: **ZERO allocations** over 20 000 queries (asserted
+  from the allocator counters), debug ≈482 ns/q.
+* `build()` + evaluate: 3 allocs/q (the tiny inherited contract: units String
+  + two slot Vecs), debug ≈1173 ns/q. The HTTP layer reuses one prebuilt
+  context per (model,param,level,time) group, so per-param cost is the
+  zero-alloc evaluate.
+* No locking beyond the arc-swap load; no mmap open or file I/O per request
+  (all mmaps opened at index build); the only heap work per request is the
+  response-body string builder.
+
+## Latency ballpark (recorded here; README numbers come in milestone 5)
+
+* Debug build, direct-index loop: ≈1.2 µs/query (build+eval), ≈0.5 µs eval-only.
+* Release build (`lto=fat`, `codegen-units=1`, `panic=abort`; no
+  `target-cpu=native` — portable default, documented): `/metrics` sum/count
+  average ≈22 µs/query including handler overhead, comfortably inside the
+  p50 < 50 µs target. Measured by `scripts/smoke.sh` (400 sequential curls).
+
+## Concurrency outcome (spec §9.9)
+
+`concurrency_http.rs`: retention_runs=1 gfs config, byte-patched day twins
+20→23 churned by an ingest thread (scan_round + forced `p.publish()` republish
+every ~30 ms), 8 reader threads × 1500 queries through the full axum stack at
+valid 2026-10-23T15:00:00Z. Every response was 200-with-value-341 or 404
+(run not yet covering); zero 5xx, zero torn/partial bodies (`"]}"`
+well-formedness checked on every 200); all 5 files ingested with 0 errors;
+final deterministic query answers 341.
+
+## Smoke script
+
+`scripts/smoke.sh`: release build → boot on 127.0.0.1:8091 against
+`tests/perfdata/gfs_perf_f000.grib2`, poll `/ready`, pull the run time from
+`/v1/inventory` (never from filenames), curl truth queries (seam 609.0/609.5,
+negative lon), error tokens (404/422), meta endpoints, then compute the
+release average latency from `/metrics`. Prints SMOKE PASS/FAIL.
+
+## Deferred (milestone 5)
+
+criterion benches + oha/wrk load test + profiling pass + README measured
+numbers; storage-layout interning experiments.

@@ -1,20 +1,155 @@
-//! wx-point server binary. Milestone 4 wires the axum app and /v1/point
-//! endpoints; this scaffold validates config at startup (spec §3: fail loudly)
-//! and reports readiness so the binary is runnable end-to-end.
+//! wx-point server binary (milestone 4). CLI: `wxpoint --config PATH` or the
+//! WXPOINT_CONFIG env var. Startup is graceful: config validation happens
+//! first (fail loudly, spec §3), then the ingest side starts on its OWN
+//! plain thread (notify watchers + periodic scan reconciliation + the
+//! dedicated rayon decode pool per config, spec §4.2 "separate from the
+//! HTTP runtime"), while the tokio HTTP runtime serves immediately; /ready
+//! reflects indexing progress (spec §7).
 
-use wx_ingest::load_config;
+use std::env::args;
+use std::env::var;
+use std::thread::spawn;
+use libc::usleep;
+use tokio::runtime::Runtime;
+use tokio::net::TcpListener;
+use axum::serve;
+use wx_ingest::config::load_config;
+use wx_ingest::pipeline::Pipeline;
+use wx_server::httpapi::{ServerState, build_router};
+use wx_server::stats::{new_stats, mono_ns};
+use std::sync::Arc;
 
-pub fn main() {
-    // CLI/env wiring for the config path is milestone-4 work; scaffold uses the
-    // example config directly so startup validation + routing are exercised.
-    match load_config("config.example.toml") {
-        Ok(cfg) => {
-            let mut names: Vec<&str> = [].to_vec();
-            for m in &cfg.models {
-                names.push(&m.name);
-            }
-            println!("loaded models: {}", names.join(", "));
-        },
-        Err(e) => panic!("config error: {}", e),
+/// Resolve the config path: --config flag wins, then WXPOINT_CONFIG.
+#[allow(clippy::needless_return)]
+fn resolve_cfg_path() -> String {
+    let mut path = "".to_string();
+    let mut want_next = false;
+    let mut first = true;
+    let ai = args();
+    for a in ai {
+        if first {
+            first = false;
+            continue; // program name
+        }
+        if want_next {
+            path = a.to_string();
+            want_next = false;
+        } else if a == *"--config" {
+            want_next = true;
+        }
     }
+    if path.is_empty() {
+        let v = var("WXPOINT_CONFIG");
+        match v {
+            Err(_) => {}
+            Ok(s) => { path = s.to_string(); }
+        }
+    }
+    return path;
+}
+
+#[allow(clippy::needless_return)]
+pub fn main() {
+    let cfg_path = resolve_cfg_path();
+    if cfg_path.is_empty() {
+        println!("usage: wxpoint --config <path> (or set WXPOINT_CONFIG)");
+        return;
+    }
+    // validate loudly before anything else (spec §3)
+    let cfg_r = load_config(&cfg_path);
+    match cfg_r {
+        Err(e) => {
+            println!("config error: {0}", e);
+            return;
+        }
+        Ok(cfg) => {
+            let bind_str = cfg.server.bind;
+            let interval_secs = cfg.ingest.scan_interval_secs;
+            start_pipeline(&cfg_path, &bind_str, interval_secs);
+        }
+    }
+}
+
+#[allow(clippy::needless_borrow)]
+fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
+    let pr = Pipeline::open(&cfg_path);
+    let mut p = match pr {
+        Err(e) => {
+            println!("pipeline init failed: {0}", e);
+            return;
+        }
+        Ok(pp) => { pp }
+    };
+    println!("loaded models: {0}; bind {1}; data_dir {2}", model_names(&p), bind_str, p.data_dir);
+
+    let stats = new_stats();
+    let cfg_models = Arc::new(p.models.clone());
+    let st = ServerState {
+        index: p.shared.clone(), // same ArcSwap the ingest thread publishes through
+        stats: stats.clone(),
+        models_cfg: cfg_models,
+    };
+    let app = build_router(st);
+
+    // --- ingest side: dedicated plain thread, OUTSIDE the tokio runtime
+    let interval_ns = (interval_secs as i64) * 1000000000;
+    let th = spawn(move || {
+        p.start_watchers();
+        let mut printed_logs = 0;
+        loop {
+            let n = p.scan_round();
+            if n > 0 {
+                println!("scan_round ingested {0} file(s)", n);
+            }
+            stats.set_ingest(p.counters.errors, p.counters.ingested_files, p.counters.last_mtime_ns);
+            while printed_logs < p.log.len() {
+                println!("{0}", p.log[printed_logs]);
+                printed_logs += 1;
+            }
+            let target = mono_ns() + interval_ns;
+            while mono_ns() < target {
+                unsafe { usleep(200000); } // 0.2 s granularity
+            }
+        }
+    });
+    let _th_unused = th;
+
+    // --- HTTP side: tokio multi-thread runtime (spec §7 axum/tokio)
+    let rt_r = Runtime::new();
+    let rt = match rt_r {
+        Err(_e) => {
+            println!("tokio runtime init failed");
+            return;
+        }
+        Ok(rtx) => { rtx }
+    };
+    rt.block_on(async {
+        let lr = TcpListener::bind(&bind_str);
+        match lr.await {
+            Err(e) => {
+                println!("failed to bind {0}: {1}", bind_str, e);
+            }
+            Ok(listener) => {
+                println!("listening on {0}", bind_str);
+                let srv = serve(listener, app);
+                let res = srv.await;
+                match res {
+                    Err(e) => { println!("server error: {0}", e); }
+                    Ok(_) => { println!("server stopped"); }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::needless_return)]
+fn model_names(p: &Pipeline) -> String {
+    let mut joined = "".to_string();
+    for m in &p.models {
+        if !joined.is_empty() {
+            joined = format!("{0}{1}", joined, ",");
+        }
+        joined = format!("{0}{1}", joined, m.name);
+    }
+    return joined;
 }

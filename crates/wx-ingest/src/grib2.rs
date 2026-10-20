@@ -259,9 +259,9 @@ pub fn epoch_secs(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u
     let era: i64 = if y < 0 { (y / 400) - 1 } else { y / 400 };
     let yoe: i64 = y - era * 400;
     let mp: i64 = (if month > 2 { month - 3 } else { month + 9 }) as i64;
-    let doy: i64 = ((153 * mp + 2) / 5 + (day as i64) - 1 + 365 * yoe + yoe / 4 - yoe / 100) as i64;
-    let doe: i64 = doy + yoe * 365 + yoe / 4 - yoe / 100;
-    let se: i64 = era * 146097 + doe - 100000; // days since 1970-01-01
+    let doy: i64 = ((153 * mp + 2) / 5 + (day as i64) - 1) as i64;
+    let doe: i64 = (yoe * 365 + yoe / 4 - yoe / 100 + doy) as i64;
+    let se: i64 = era * 146097 + doe - 719468; // days since 1970-01-01
     ((((se * 24) + (hour as i64)) * 60 + (minute as i64)) * 60) + (second as i64)
 }
 

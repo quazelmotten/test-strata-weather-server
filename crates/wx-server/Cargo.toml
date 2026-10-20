@@ -16,7 +16,12 @@ clap = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+libc = "^0.2"
+http = "^1"
+tower-service = "^0.3"
+bytes = "^1"
+http-body-util = "^0.1"
 
 [[bin]]
-name = "wx-point"
+name = "wxpoint"
 path = "src/main.rs"
