@@ -436,3 +436,103 @@ query 364.5 ns, handler parse+lookup+render 879.2 ns); load test portable
 286,868 req/s, server p50<=20us p99<=50us mean 12.9us; ingest->queryable
 /ready 3.9 s, gfs f000 4.1 s / f006 4.2 s, hrrr f000 4.3 s / f003 5.1 s; peak
 RSS 372 MB; workspace cargo test 57 green; clippy -D warnings clean.
+
+---
+
+# V1.1 phase 1 decisions (full wgrib2 toolchain)
+
+## What built, and how
+
+Full source tree extracted fresh into `tools/wgrib2-full-src/grib2` (classic v3.1.3
+**makefile**, not CMake - the task's `-DUSE_JASPER=ON` guess does not apply to this
+release). Binary installed as `tools/wgrib2-full`; the existing nolib `tools/wgrib2`
+is untouched and still works (both report v3.1.3 10/2023).
+
+```
+cd tools/wgrib2-full-src/grib2
+CC=gcc CMAKE_POLICY_VERSION_MINIMUM=3.5 \
+make -f makefile -j8 USE_NETCDF3=0 USE_NETCDF4=0 USE_HDF5=0 \
+  USE_IPOLATES=0 USE_SPECTRAL=0 MAKE_FTN_API=0 USE_PROJ4=0 USE_G2CLIB=0 \
+  MAKE_SHARED_LIB=0 USE_REGEX=1 USE_TIGGE=1 USE_OPENMP=1 \
+  USE_PNG=1 USE_JASPER=1 USE_OPENJPEG=0 USE_AEC=1 \
+  'BUILD_COMMENTS=full build gcc jasper png aec' wgrib2/wgrib2
+```
+
+* JASPER and OPENJPEG are mutually exclusive (makefile errors if both are 1); chose
+  Jasper 1.900.1 (bundled debian tgz), which compiles clean under gcc 13.3 (gcc 14
+  would break it: implicit int / implicit function declaration become hard errors).
+* cmake here is 4.4.2, which refuses `cmake_minimum_required(VERSION < 3.5)`; libaec-1.0.6
+  needs `CMAKE_POLICY_VERSION_MINIMUM=3.5` in the environment.
+* netcdf/proj4/g2clib/ftn-api/shared-lib disabled: not needed for validation work,
+  and the netcdf4/hdf5 tarballs are absent from the tgz anyway (the `all` target
+  errors out on them). gctpc (pure C) is always linked (-lgeo).
+* `-config` of the new binary confirms: `Jasper 1.900.1 is installed`,
+  `libaec-1.0.6.tar.gz is installed`, `Supported decoding: simple, complex, rle,
+  ieee, png, jpeg2000, CCSDS AEC`, `Supported encoding: simple, complex, ieee,
+  jpeg2000, CCSDS AEC`.
+
+## Capability matrix (measured, not assumed)
+
+| capability | status |
+|---|---|
+| write DRT 5.0 / 5.3 (c3) / 5.40 (jpeg) / 5.42 (aec) | OK, verified by `-code_table_5.0` |
+| read 5.0 / 5.3 / 5.40 / 5.42 | OK |
+| **write PNG 5.41** | **IMPOSSIBLE in wgrib2**: `-set_grib_type png` -> `FATAL ERROR: set_grib_type: bad type png`. Accepted names are only s/simple, c1..c3 (+b), ieee, jpeg/j, aec/a, same. PNG support is decode-only (`dec_png_clone.c`); the encoder lives in g2clib |
+| `-new_grid` / `-new_grid_winds earth` | unavailable: prints `IPOLATES package is not installed`, rc=8 |
+| `-level 0` | option does not exist in v3.1.3 (use `-code_table_5.0` for DRT, `-ll2ij` for projection probes) |
+
+PNG twins therefore need an external writer: `scripts/make_png_twin.py` (added this
+phase) re-packs a simple-packed file into 5.41 itself. Fixtures and `gen_fixtures.sh`
+were left untouched - Phase 2 owns wiring them in.
+
+## Cross-DRT value consistency (the Phase 2 validation backbone)
+
+`tools/wgrib2-full FILE -lon LON LAT` output is byte-identical across the original
+5.0 file and its jpeg / aec / c3 / s / png twins for every message at 6 probe points
+x 39 messages (gfs_small) and 2 x 12 (hrrr_small, including grid-relative wind values
+passing through unchanged), including seam probes (lon 350.0 / -0.25 / 0.0) and masked
+nodes (UNDEFINED 9.999e+20 preserved by all four codecs). Stronger global proof on
+the full-size perf file: `-checksum data` CRC32 over the decoded float array matches
+for ALL 22 records of `gfs_perf_f000.grib2` vs its jpeg twin (33.9 MB -> 1.0 MB) =>
+the jasper round trip is LOSSLESS for these products.
+
+## IPLIB verdict: cannot be built here
+
+`iplib.v3.0.0` = 33 `.f90/.F90` module files, `ip2lib_d` likewise, `iplib_hwrf` = 55
+`.f` files: pure Fortran, no C fallback (the "maybe gctpc-derived C" hope is false;
+gctpc is separate and already linked). Evidence chain:
+
+* `make USE_IPOLATES=1` aborts at makefile line 324 with `FC=? compile directions: ...`
+  (make's built-in default `FC=f77` trips the guard).
+* Compiling a source directly: `gcc -c ijkgds0.f90` -> `gcc: fatal error: cannot execute
+  'f951': execvp: No such file or directory` (no Fortran frontend in gcc 13.3).
+* No gfortran/g95/ifort/ifx/flang/f2c anywhere on PATH; `sudo -n` requires a password
+  so apt is out; libgfortran runtime exists but a runtime without a compiler is useless.
+
+Consequence: golden `wgrib2 -new_grid_winds earth` rotation truth is NOT obtainable
+on this machine. Keep the existing three-way rotation validation (pyproj forward
+transform + Snyder closed form + magnitude/involution invariants); real ipolates truth
+would require a machine with a Fortran toolchain.
+
+## Layout facts learned while building the PNG twin (Phase 2 must know)
+
+* The data representation template number lives in **section 5 octets 10-11**
+  (wgrib2 `code_table_5_0(sec) == uint2(sec[5]+9)`); section 7 has NO template byte.
+  Our Rust `decode_sec7` already reads `be_u16(s5, 4)` from the section-5 payload, i.e.
+  the same place, so adding 5.40/5.41/5.42 decoders is just extending that match.
+* Section framing is identical in our fixtures and in wgrib2-written files:
+  `[u32 length-including-itself][section number][payload...]`; the end section's declared
+  length excludes the ASCII `7777` terminator, which is still counted inside the u64
+  message length.
+* PNG path specifics: bit depth comes from Sec5 bits-per-value (octet 20 = `sec[5][19]`)
+  and must equal the PNG IHDR depth, else `dec_png_clone` emits a DELAYED ERROR
+  ("Sec 5 octet 20 is X, png lib value (Y) is used") and silently uses Y; the PNG stream
+  starts at `sec[7]+5` (no PSV field); grayscale covers depths 8/16 only (24/32 require
+  RGB/RGBA color types); `width*height` must equal nvals (plus the missing-point count
+  when a bitmap is present); libpng is compiled with `-DPNG_USER_WIDTH_MAX=200000000L`,
+  so width = nvals (~1M) is legal.
+* Fixture quirk found on the way: our simple-packed section 7 bitstreams are truncated
+  to `floor(nvals*nbits/8)` bytes (861 x 7 = 6027 bits stored in 753 bytes), so re-packers
+  must zero-pad before reading the final value.
+* jpeg twins carry per-message metadata `Creator: JasPer Version 1.900.1` -> compare
+  decoded VALUES (or `-checksum data`), never bytes.
