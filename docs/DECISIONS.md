@@ -79,26 +79,61 @@ CT 4.11 code is kept in `StatInfo.ct4_11`. CT 4.4 units map minute/hour/day/
 
 * Grid-relative detection: flag table 3.3 bit 0x08 (verified vs NOTES item 7).
 * Formula: with β = bearing of grid +i from true north (wx-core
-  `rot_angle_deg`, inverse-projection based):
+  `rot_angle_deg`):
   `u_e = u_g·sinβ + v_g·cosβ`, `v_e = u_g·cosβ − v_g·sinβ`. For N→S-scanning
   LCC grids (+j ~ south) this is the symmetric orthogonal matrix
   [[sinβ, cosβ], [cosβ, −sinβ]] — an involution, magnitude-preserving.
-* Validated three ways (wgrib2 nolib lacks `-new_grid_winds`):
-  1. `scripts/validate_rotation.py` compares the rotated axes against pyproj
-     3.8 `+proj=lcc` forward transforms at 8 nodes (axes agree < 5e-4);
-  2. the Rust test checks β against Snyder's closed form β = 90 + n·(λ−LoV)
-     (agreement ≤ 0.05°, pyproj-vs-Snyder spread 0.006° due to sphere vs
-     ellipsoid radius);
-  3. invariants: magnitude preserved (rel 1e-4), double application identity.
+* **Angle derivation (V1.1 phase 4 — changed).** β is now derived from the
+  projection's OWN cone geometry instead of differencing two inverse transforms:
+  `for_point` places a point at apex + rh1·(sin θ, cos θ) with θ = n·(λ−LoV),
+  so meridians are exact radial rays of the cone and, because the map is
+  CONFORMAL, true north maps to that radial direction. Hence
+  β = 90° + θ, with θ recovered by `cone_polar(x, y)` — the very helper
+  `inverse()` uses, so projection and rotation share one truth. The earth model
+  enters only through n/rh (built from the Code Table 3.2 axes, including the
+  INLINE radii of codes 1/3/7), so spherical and oblate grids are both exact.
+  Measured against pyproj with the shape matched exactly: **4.8e-11 deg** worst
+  delta over 42 nodes (was up to **2.4e-2 deg** with the old method — see the
+  phase-4 section below for the root-cause numbers).
+* Validated four ways (wgrib2 nolib lacks `-new_grid_winds`):
+  1. `scripts/validate_rotation.py` measures the conformal angle independently
+     with pyproj (`+proj=lcc`, earth shape taken FROM the fixture's CT 3.2 byte,
+     incl. inline code-3 axes) at 21 nodes per fixture and writes
+     `tests/fixtures/rotation_expected.csv`;
+  2. `crates/wx-ingest/tests/rotation_vs_pyproj.rs` compares our angles with
+     **≤ 1e-6 deg** tolerance (observed 4.8e-11) and asserts the identity
+     β = 90 + n·(λ−LoV) at ≤ 1e-12 deg;
+  3. invariants on real decoded data: magnitude preserved (rel 1e-4), double
+     application identity, LoV meridian lands exactly on due east;
+  4. `scripts/validate_rotation_wgrib2.sh`: the real `wgrib2 -new_grid_winds
+     earth` golden, enabled automatically on any machine whose wgrib2 links
+     IPOLATES (see IPLIB verdict above: not buildable here).
 * Regular lat/lon grids: components treated as already earth-relative
   (identity), matching wgrib2 behavior for those grids.
-* Config rule enforced via `check_wind_pair`: grid-relative model configuring
-  only one of UGRD/VGRD -> validation error (test covers it).
+* Config rule, spec §4.4 wording ("fail config validation"): enforced TWICE.
+  * STARTUP preflight `config::startup_wind_preflight` (called from `main`
+    before ingest/serving): for a model configuring EXACTLY ONE of UGRD/VGRD
+    (by table name OR raw triple category 2 / number 2 or 3), it probes the
+    FIRST STABLE file matching the model glob (read-only, sections 1/3/4 only,
+    never section 7) and fails if THAT file's WIND messages declare grid-relative
+    components. Message names model, file, template, flag byte and the missing
+    parameter.
+  * DECODE time `check_wind_pair` (pipeline) stays as the second line of defense
+    for directories that are empty/unstable at boot; it also blocks storing the
+    affected wind fields rather than emitting nonsense rotations.
 
 ## Earth shape
 
-Code Table 3.2 byte honored via wx-core `earth_axes_m` (sphere 6371226.6 m;
-spheroid major/minor constants). Fixtures use flag 6 (sphere).
+Code Table 3.2 byte honored via wx-core `earth_axes_m` (sphere 6371229 m for
+code 6, International spheroid 6378160/6356775 m for code 2 — values follow
+wgrib2 `Earth.c::axes_earth` so our numbers match `wgrib2 -ll2ij`). Codes
+**1/3/7 declare the axes INLINE in section 3**; the reader now parses them
+(`scaled_val` slots: shape+1/+2 sphere radius, +6/+7 major, +11/+12 minor;
+code 3 in km, code 7 in meters) and calls `GridLambert::set_user_axes`, so a
+user-defined spheroid projects with the axes the FILE declares. grid.bin
+carries them (GRID_VERSION 2). Fixtures: `hrrr_small.grib2` uses code 6 (sphere
+R=6371229 m); `hrrr_ellip_small.grib2` uses code 3 with WGS 84 (6378.137 /
+6356.75231 km) so BOTH shapes are exercised end to end.
 
 ## Parallelism
 
@@ -867,3 +902,145 @@ at lon 351.5 lat 9.0 for frac; 300 + j*21 + i for robust).
 warnings`: rc=0. Two pre-existing `format!`-in-`format!` lints in `store.fmt_hours`
 had to be fixed to keep that gate clean. `--all-targets` still reports lints in
 older wx-core test/bench files (pre-existing, untouched by this phase).
+
+
+# V1.1 phase 4 decisions (rotation earth-model alignment + startup wind-pair rule)
+
+## Root cause of the residual rotation error (audit question answered)
+
+The audit suspected the residual was a SPHERE-vs-ELLIPSOID mismatch between our
+grid (fixtures declare CT 3.2 = 6, a sphere R = 6371229 m) and the pyproj check
+(which defaulted to the WGS84 ellipsoid). Measured on this machine, that was
+**only a secondary effect**; the dominant error was the ANGLE DERIVATION itself.
+Re-implementing the previous Rust algorithm (`rot_angle_deg` = finite difference
+of two `inverse()` calls, then a planar `dλ·cos φ` metric) and comparing it with
+an independent pyproj measurement whose earth shape EXACTLY matches each fixture:
+
+| quantity | worst angular error (deg) |
+|---|---|
+| old method vs matched-shape pyproj, **sphere** fixture (CT 3.2 = 6) | 7.3e-3 |
+| old method vs matched-shape pyproj, **oblate** grid (International spheroid) | 2.4e-2 |
+| new analytic angle vs matched-shape pyproj, sphere | 1.6e-13 |
+| new analytic angle vs matched-shape pyproj, oblate (WGS84 axes) | 1.0e-11 |
+| Rust `rot_angle_deg` vs pyproj table, both fixtures (42 nodes) | **4.8e-11** |
+
+So even with the shapes aligned, the old method was off by ~1e-2 deg: differencing
+the inverse transform over a FULL 3 km cell and then treating latitude/longitude
+as a locally planar `Δφ, Δλ·cos φ` pair is a spherical approximation that does not
+reproduce the CONFORMAL angle on any earth model, let alone an oblate one. With
+shapes aligned AND the analytic derivation, agreement is at float-noise level.
+Conclusion: root cause = derivation, not (only) the comparison harness. The audit's
+hypothesis was refuted as the primary cause but confirmed as a real secondary one:
+shape mismatch DOES matter, because n (and therefore β) depends on the eccentricity
+— comparing CT-2 International-spheroid axes against pyproj WGS84 injects ~3e-4 deg,
+which is why the checks below pin the axes from the FILE.
+
+## Measurement method (why no geodesy library)
+
+The quantity wgrib2/IPOLATES rotates by is the CONFORMAL angle: the bearing of the
+grid +i axis from TRUE north. In a Lambert conformal conic map meridians are
+exactly straight radial lines, so the chord between two points on the meridian
+through P IS the meridian tangent — zero curvature error. `scripts/validate_rotation.py`
+therefore measures β purely in pyproj's projected plane (forward transforms only,
+earth shape read out of the fixture's section 3), which also sidesteps a local
+pyproj limitation: `Geod(a=..., b=...)` returns NaN for custom ellipsoids here.
+
+## Angle derivation now used (one sentence)
+
+β = 90° + θ where θ is the cone-apex polar angle returned by `GridLambert::cone_polar`
+— the same θ that `for_point` computes as n·(λ−LoV) and that `inverse()` consumes —
+so the projection and the wind rotation are driven by one piece of math, and the
+earth model enters only through n/rh built from the Code Table 3.2 axes.
+
+## Inline user-defined axes (Code Table 3.2 codes 1/3/7)
+
+wgrib2 `Earth.c::axes_earth` reads them from section 3 relative to the shape byte
+(+1/+2 sphere radius, +6/+7 major axis, +11/+12 minor axis; code 3 in km, code 7
+in meters, GRIB "scaled value" = INT1 factor + sign-magnitude INT4, value·10^-f).
+Our reader now parses the same slots and calls `GridLambert::set_user_axes`, which
+recomputes every projection constant. Before this, code 3/7 silently fell back to
+a nearest-constant guess — a real correctness gap for any file declaring its own
+spheroid, and fatal for rotation precision. `grid.bin` gained the two f64 axes plus
+an inline flag (`GRID_VERSION` 1 → 2); warm-boot rebuilds restore them.
+
+Note on the task text: it described CT 3.2 = 2 as "6378.137 / 6356.7523 km". wgrib2
+(and the GRIB2 tables) define code 2 as the International spheroid 6378.160 /
+6356.775 km; the WGS 84 numbers belong to a user-defined spheroid. We follow wgrib2
+and therefore emit the ellipsoid fixture with **code 3 + inline WGS 84 radii**, which
+is what lets it be validated against pyproj's DEFAULT WGS84 ellipsoid exactly.
+
+## Fixtures exercising BOTH earth shapes
+
+* `tests/fixtures/hrrr_small.grib2` — unchanged: CT 3.2 = 6 sphere R = 6371229 m.
+* `tests/fixtures/hrrr_ellip_small.grib2` — NEW: LCC 41×31 @ 12 km, La1 40 N
+  scanning south, Lo1 250 E, LoV 235 E, standard parallels 30/40, CT 3.2 = 3 with
+  inline WGS 84 axes; UGRD/VGRD on the grid-relative grid (first messages), TMP on
+  the earth-relative grid. Corroborated by wgrib2: `-radius` reports
+  `code3.2=3 radius_maj=6378137.000000 radiusmin=6356752.310000 is_spherical=0`
+  (asserted in `scripts/gen_fixtures.sh`) and 16 `-ll2ij` probes land in
+  `expected.json` (asserted by `oblate_projection_matches_wgrib2_ll2ij`).
+
+## Startup wind-pair rule (spec §4.4 wording)
+
+`config::startup_wind_preflight(models, stable_window_secs, now_ns)` runs from
+`main` after config validation, BEFORE ingest and before the port is bound.
+Behavior matrix (all covered by `crates/wx-ingest/tests/preflight_windpair.rs`):
+
+| configured components | first stable matching file | outcome |
+|---|---|---|
+| both, or neither | any | no check, no probe |
+| exactly one | file whose WIND messages carry flag bit 0x08 | **hard startup failure** naming model, file, template 3.x, flag byte, counts, missing param |
+| exactly one | file whose WIND messages are earth-relative | accepted, logged note |
+| exactly one | dir empty / no matching file | deferred, logged note |
+| exactly one | matching files exist but inside the stability window | deferred ("not stable yet") |
+| exactly one | matching file unreadable / not GRIB | deferred ("could not probe") |
+| exactly one | matching file has NO wind message | deferred ("cannot decide") |
+
+Decisions worth recording:
+* The probe classifies the FIRST message that IS a wind component (section 4
+  category 2, number 2 or 3) rather than "the first grid in the file": HRRR-style
+  files mix an earth-relative scalar grid with a grid-relative vector grid, so the
+  naive reading would have answered "earth-relative" for `hrrr_small.grib2`.
+* Stability at startup means "size > 0 and mtime at least `stable_window_secs`
+  old" — a single boot-time probe cannot observe size/mtime over time the way a
+  scan round does. `now_ns` is injected so tests control the clock.
+* Only sections 1/3/4 are interpreted; section 7 is stepped over by its declared
+  length, so probing a full-size GFS file costs microseconds.
+* Everything short of a definitive answer DEFERS to the existing decode-time
+  `check_wind_pair` rule, which stays in place (second line of defense) and still
+  refuses to store half-rotated winds.
+
+## Tests added (names)
+
+* `crates/wx-ingest/tests/rotation_vs_pyproj.rs`: `rotation_matches_pyproj_within_1e_6_deg`
+  (42 nodes, ≤1e-6 deg), `rotation_equals_convergence_relation_of_own_projection`
+  (β = 90 + n·(λ−LoV) at ≤1e-12 deg), `rotation_shape_axes_are_distinct_earths`.
+* `crates/wx-ingest/tests/hrrr_ellip_decode.rs`: `ellipsoid_axes_come_from_the_file`,
+  `oblate_projection_matches_wgrib2_ll2ij`, `oblate_rotation_and_inverse_roundtrip_at_nodes`.
+* `crates/wx-ingest/tests/preflight_windpair.rs`: `preflight_rejects_single_component_on_grid_relative_grid`,
+  `preflight_accepts_pair_and_earth_relative_single`,
+  `preflight_defers_when_nothing_stable_or_readable`,
+  `wind_pair_gap_recognizes_raw_code_triples`, `probe_reports_wind_message_flags`.
+* Tightened in place: `hrrr_decode.rs::hrrr_rotation_invariants` now asserts the
+  Snyder relation at ≤1e-9 deg (was 5e-2). No expected VALUES changed: the rotation
+  application itself is behaviorally identical apart from angles shifting by ≤2.4e-2
+  deg toward exactness, and every stored-value test either uses regular grids or
+  compares against analytic values recomputed with the same code path.
+
+## Remaining §9.3 deviation (verbatim-short)
+
+> The spec's golden `wgrib2 -new_grid_winds earth` comparison is NOT run: IPOLATES
+> is Fortran-only (33 .f90 modules), this machine has no Fortran compiler (no
+> gfortran/f95/ifort/flang/f2c; `sudo -n` needs a password), and both built
+> binaries print "IPOLATES package is not installed". In place of it: the rotation
+> angle is derived from our own validated LCC transform, cross-checked against
+> pyproj with the earth shape matched EXACTLY per fixture (sphere CT 3.2 = 6 and
+> inline WGS 84 CT 3.2 = 3) at 42 nodes to ≤1e-6 deg (observed 4.8e-11), plus
+> magnitude-preservation and double-application involution on real decoded data,
+> plus wgrib2 `-ll2ij` agreement for both grids. `scripts/validate_rotation_wgrib2.sh`
+> enables the true golden automatically wherever wgrib2 links IPOLATES.
+
+## Gate
+
+`cargo test --workspace`: green (10 new tests over phase 3's count).
+`cargo clippy --workspace -- -D warnings`: rc=0.

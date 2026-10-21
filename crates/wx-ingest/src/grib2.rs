@@ -340,6 +340,47 @@ pub fn parse_sec1(p: &[u8]) -> Result<(RunTime, bool), GribErr> {
     Ok((rt, eof))
 }
 
+/// GRIB "scaled value" pair: INT1 scale factor then SIGN-MAGNITUDE INT4
+/// value, decoded as value * 10^(-factor) (wgrib2 `int8.c::scaled2dbl`).
+/// None when the slot is absent or marked undefined (factor 255).
+fn scaled_val(p: &[u8], off: usize) -> Option<f64> {
+    if off + 5 > p.len() {
+        return None;
+    }
+    let fac = p[off];
+    if fac == 255 || fac > 20 {
+        return None;
+    }
+    let v = sm_i4(p, off + 1);
+    let mut d = v as f64;
+    let mut k = 0;
+    while k < fac as usize {
+        d = d / 10.0;
+        k += 1;
+    }
+    return Some(d);
+}
+
+/// Raw Code Table 3.3 byte of a section-3 payload plus its grid template,
+/// for diagnostics only (the parsed meaning lives in `GridDef.winds_grid`).
+pub fn flag33_byte(p: &[u8]) -> (u16, u8) {
+    if p.len() < 10 {
+        return (0xFFFF, 0);
+    }
+    let tmpl = be_u16(p, 7);
+    match tmpl {
+        0 => {
+            if p.len() >= 50 { return (0, p[49]); }
+            return (0, 0);
+        }
+        30 => {
+            if p.len() >= 42 { return (30, p[41]); }
+            return (30, 0);
+        }
+        _ => { return (tmpl, 0); }
+    }
+}
+
 /// Section 3 -> wx-core GridDef. Templates 3.0 and 3.30 only. Offsets follow
 /// the NCEP spec layout as written by the bootstrap writer (which wgrib2
 /// reads correctly); wgrib2's own Sec3 accessors are one byte off on the
@@ -405,9 +446,42 @@ fn parse_grid_lambert(p: &[u8]) -> Result<GridDef, GribErr> {
         return Err(GribErr::BadField("non-positive Lambert dx/dy or size"));
     }
     // earth shape byte (Code Table 3.2) at payload offset 9
-    let g = GridLambert::new(nx, ny, la1, lo1, lov, lad, latin1, latin2,
-                             dx_mm as f64 / 1000.0, dy_mm as f64 / 1000.0,
-                             proj_flag, scan, p[9], (flag33 & 0x08) != 0);
+    let mut g = GridLambert::new(nx, ny, la1, lo1, lov, lad, latin1, latin2,
+                                 dx_mm as f64 / 1000.0, dy_mm as f64 / 1000.0,
+                                 proj_flag, scan, p[9], (flag33 & 0x08) != 0);
+    // Codes 1/3/7 declare the axes INLINE in section 3 (see wx-core
+    // grid.rs docs): code 1 a user sphere, codes 3/7 a user spheroid.
+    // wgrib2 reads them from exactly these slots (`Earth.c::axes_earth`,
+    // offsets relative to the shape byte: +1/+2 sphere radius, +6/+7 major,
+    // +11/+12 minor), code 3 in km and code 7 in meters.
+    match p[9] {
+        1 => {
+            let r = scaled_val(p, 10);
+            match r {
+                Some(rr) => {
+                    if rr > 1000000.0 { g.set_user_axes(rr, rr); }
+                }
+                None => {}
+            }
+        }
+        3 => {
+            let maj = scaled_val(p, 15);
+            let min = scaled_val(p, 20);
+            match (maj, min) {
+                (Some(a), Some(b)) => { g.set_user_axes(a * 1000.0, b * 1000.0); }
+                _ => {}
+            }
+        }
+        7 => {
+            let maj = scaled_val(p, 15);
+            let min = scaled_val(p, 20);
+            match (maj, min) {
+                (Some(a), Some(b)) => { g.set_user_axes(a, b); }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
     Ok(GridDef::Lambert(g))
 }
 
@@ -1236,6 +1310,173 @@ pub fn grid_winds(g: &GridDef) -> bool {
         GridDef::Lambert(r) => { return r.winds_grid; }
     }
 }
+
+// ---------------------------------------------------------------------------
+// startup grid probe (spec §4.4 wind-pair preflight)
+// ---------------------------------------------------------------------------
+
+/// Result of the cheap startup probe: the FIRST grid definition in a file, how
+/// many grids carried which component flag, and -- decisively -- what the FIRST
+/// message that actually IS a wind component (section 4 category/number 2/2 or
+/// 2/3) declared for ITS grid.
+#[derive(Clone, Debug)]
+pub struct GridProbe {
+    pub grid: GridDef,        // section 3 of the first message that has one
+    pub flag33: u8,           // raw Code Table 3.3 byte behind that grid
+    pub tmpl: u16,            // section 3 template number (0 or 30)
+    pub messages: u32,        // messages walked
+    pub winds_true: u32,      // grids with flag bit 0x08 set
+    pub winds_false: u32,     // grids without it
+    pub wind_msg: u8,         // 0 = no wind message in the file, 1 = wind
+    //   message on an EARTH-relative grid, 2 = wind message on a GRID-relative
+    //   grid (this is the answer the spec §4.4 rule needs)
+    pub wind_flag33: u8,      // flag byte of that wind message's grid
+}
+
+/// Cheap read-only probe of ONE file: walk the message framing and interpret
+/// ONLY sections 1 and 3. Sections 4/5/6/7 are stepped over by their declared
+/// lengths and NEVER unpacked, so this costs microseconds even on a full-size
+/// GFS file. Used by the spec §4.4 startup wind-pair rule to learn whether a
+/// model's grid declares grid-relative vector components BEFORE any data is
+/// ingested. Stops after the first grid-bearing message unless later messages
+/// disagree about the flag (then the counts expose the mix).
+pub fn probe_first_grid(path: String) -> Result<GridProbe, GribErr> {
+    let f = std::fs::File::open(path);
+    match f {
+        Err(_) => { return Err(GribErr::Io); }
+        Ok(h) => {
+            let m = unsafe { Mmap::map(&h) };
+            match m {
+                Err(_) => { return Err(GribErr::Io); }
+                Ok(region) => { return probe_stream(&region[0..region.len()]); }
+            }
+        }
+    }
+}
+
+fn probe_stream(bytes: &[u8]) -> Result<GridProbe, GribErr> {
+    let n = bytes.len();
+    let mut pos = 0;
+    let mut first: Option<GridProbe> = None;
+    let mut walked: u32 = 0;
+    let mut t_true: u32 = 0;
+    let mut t_false: u32 = 0;
+    let mut wind_msg: u8 = 0;
+    let mut wind_flag: u8 = 0;
+    while pos < n {
+        if n - pos < 16 {
+            break; // trailing junk: whatever was seen so far stands
+        }
+        if !(bytes[pos] == 0x47 && bytes[pos + 1] == 0x52 &&
+             bytes[pos + 2] == 0x49 && bytes[pos + 3] == 0x42) {
+            return Err(GribErr::BadMagic);
+        }
+        if bytes[pos + 7] != 2 {
+            return Err(GribErr::BadEdition);
+        }
+        let msglen = be_u64(bytes, pos + 8);
+        if msglen < 16 || (pos as u64) + msglen > (n as u64) {
+            return Err(GribErr::Truncated);
+        }
+        let body_end = pos + (msglen as usize);
+        // per-message state: the grid this message declares, plus whether the
+        // message IS a wind component (section 4 category/number 2/2 or 2/3).
+        let mut msg_grid: Option<GridDef> = None;
+        let mut msg_flag: u8 = 0;
+        let mut msg_wg = false;
+        let mut msg_is_wind = false;
+        let mut q = pos + 16;
+        while q < body_end {
+            if q + 4 <= body_end && bytes[q] == 0x37 && bytes[q + 1] == 0x37 &&
+               bytes[q + 2] == 0x37 && bytes[q + 3] == 0x37 {
+                break;
+            }
+            if q + 5 > body_end {
+                return Err(GribErr::Truncated);
+            }
+            let ln = be_u32(bytes, q) as usize;
+            let num = bytes[q + 4];
+            if ln < 6 || q + ln > body_end {
+                return Err(GribErr::Truncated);
+            }
+            if num == 3 {
+                let payload = &bytes[q + 5..q + ln];
+                let pg = parse_sec3(payload);
+                match pg {
+                    Ok(gd) => {
+                        let (tm, fb) = flag33_byte(payload);
+                        msg_flag = fb;
+                        msg_wg = grid_winds(&gd);
+                        msg_grid = Some(gd.clone());
+                        if msg_wg { t_true += 1 } else { t_false += 1 }
+                        match first {
+                            None => {
+                                first = Some(GridProbe {
+                                    grid: gd,
+                                    flag33: fb,
+                                    tmpl: tm,
+                                    messages: 1,
+                                    winds_true: t_true,
+                                    winds_false: t_false,
+                                    wind_msg: 0,
+                                    wind_flag33: 0,
+                                });
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                    Err(e) => {
+                        match e {
+                            // an unsupported grid template in a later message
+                            // never invalidates what was already learned
+                            GribErr::UnsupportedGrid(_) => {}
+                            _ => { return Err(e); }
+                        }
+                    }
+                }
+            }
+            if num == 4 {
+                let payload = &bytes[q + 5..q + ln];
+                let pp = parse_sec4(payload);
+                match pp {
+                    Ok(pi) => {
+                        msg_is_wind = pi.category == 2 &&
+                                      (pi.number == 2 || pi.number == 3);
+                    }
+                    Err(_e) => {} // coordinate lists etc: unclassifiable message
+                }
+            }
+            q += ln;
+        }
+        match msg_grid {
+            Some(_) => {
+                if msg_is_wind && wind_msg == 0 {
+                    wind_msg = if msg_wg { 2 } else { 1 };
+                    wind_flag = msg_flag;
+                }
+            }
+            None => {}
+        }
+        walked += 1;
+        pos = body_end;
+    }
+    match first {
+        None => { return Err(GribErr::BadSectionOrder); } // no section 3 at all
+        Some(pp) => {
+            return Ok(GridProbe {
+                grid: pp.grid,
+                flag33: pp.flag33,
+                tmpl: pp.tmpl,
+                messages: walked,
+                winds_true: t_true,
+                winds_false: t_false,
+                wind_msg: wind_msg,
+                wind_flag33: wind_flag,
+            });
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // public file-level API

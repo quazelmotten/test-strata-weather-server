@@ -58,10 +58,16 @@ Isobaric levels arrive in Pa in section 4 and are normalized to hPa internally
 so config/API strings match (`isobaric:850`).
 
 Wind rule (§4.4): if a model's grid carries grid-relative wind flags (flag
-table 3.3 bit 0x08) and only ONE of UGRD/VGRD is configured, config validation
-fails with a clear message; when both are configured, U/V are rotated to
-earth-relative AT INGEST (LCC rotation angle per grid point) and stored earth-
-relative, so queries are uniform across models.
+table 3.3 bit 0x08) and only ONE of UGRD/VGRD is configured, STARTUP FAILS
+before ingest or serving: `config::startup_wind_preflight` probes the FIRST
+STABLE file matching the model glob (read-only, sections 1/3/4 only — never
+section 7), looks at what the file's WIND messages declare, and errors out
+naming the model, file, template and flag byte. If nothing decisive exists yet
+(empty dir, unstable file, no wind message), startup logs a note and the
+decode-time check in the pipeline catches it as soon as data lands. When both
+components are configured, U/V are rotated to earth-relative AT INGEST (conformal
+LCC angle per grid point, derived from the projection's own cone geometry) and
+stored earth-relative, so queries are uniform across models.
 
 ## 3. HTTP API
 
@@ -163,11 +169,13 @@ data_dir/
   then nlevels × f32 level values (pressure-sorted), then raw little-endian
   f32 planes laid out `[level][y][x]`. f32 because GRIB packing precision is
   already below f32; bitmap-masked points (§ sec 6) are stored as NaN.
-* `grid.bin`: magic `WXPTGRID`, u32 version, kind byte (0 regular lat/lon,
-  1 Lambert Conformal Conic) + template fields (regular: nx,ny,lon1,lat1,dlon,
-  dlat,scan,winds; LCC: nx,ny,la1,lo1,lov,lad,latin1,latin2,dx_m,dy_m,proj_flag,
-  scan,earth_shape,winds). Precomputed projection constants are rebuilt at read
-  time, not stored.
+* `grid.bin`: magic `WXPTGRID`, u32 version (**2**; version-1 files are rejected,
+  not mis-restored), kind byte (0 regular lat/lon, 1 Lambert Conformal Conic) +
+  template fields (regular: nx,ny,lon1,lat1,dlon,dlat,scan,winds; LCC: nx,ny,la1,
+  lo1,lov,lad,latin1,latin2,dx_m,dy_m,proj_flag,scan,earth_shape,winds, then two
+  f64 major/minor axes in metres + an inline-axes flag so Code Table 3.2 user-
+  defined spheroids survive a warm boot). Precomputed projection constants are
+  rebuilt at read time, not stored.
 * Atomicity and durability: every write is temp-file → `flush` → **fsync of the
   file inode** → atomic rename → **fsync of the parent directory**, so a query
   never sees a partial file and a crash cannot resurrect a renamed-but-unlinked
@@ -350,9 +358,18 @@ materially; the §8 margin (≤20 µs vs 50 µs target) stands without any.
    decode tests + perf probes within f32 rounding).
 2. LCC projection vs wgrib2 `-ll2ij` at corners/center/20+ random points
    (within 1e-4 grid units).
-3. Wind rotation vs pyproj axes + Snyder closed form + magnitude/double-apply
-   invariants (nolib wgrib2 lacks `-new_grid_winds`; three-way validation
-   documented).
+3. Wind rotation: the angle is derived from our own validated LCC cone geometry
+      and cross-checked against an INDEPENDENT pyproj measurement of the conformal
+      angle with the earth shape matched EXACTLY per fixture (sphere CT 3.2 = 6 for
+      hrrr_small, inline WGS 84 axes CT 3.2 = 3 for hrrr_ellip_small) at 42 nodes to
+      **<=1e-6 deg** (observed worst 4.8e-11), plus the identity beta = 90 + n*(lambda-LoV)
+      at <=1e-12 deg, plus magnitude-preservation and double-application involution
+      on decoded data. The spec's golden `wgrib2 -new_grid_winds earth` cannot run
+      here (IPOLATES is Fortran-only; no Fortran compiler on this machine -- see
+      docs/DECISIONS.md); `scripts/validate_rotation_wgrib2.sh` enables it
+      automatically on machines whose wgrib2 links IPOLATES. Regenerate the
+      expected-angle table with `python3 scripts/validate_rotation.py` ->
+      `tests/fixtures/rotation_expected.csv`.
 4. Bilinear/vertical/time analytic-grid unit tests (affine fields reproduced
    exactly at arbitrary points; `exact_node_bitexact`, `seam_blend_values`,
    `vertical_gap_bracket`, `time_guard_stat_and_none`, …).
@@ -410,6 +427,36 @@ Full log: `docs/DECISIONS.md` (per milestone). Highlights:
   unit is second); a negative offset is treated as corrupt input and skipped, not
   stored.
 * Isobaric levels normalized Pa→hPa internally (config/API strings match).
+* Wind-pair startup preflight (V1.1 phase 4, spec §4.4): a model configuring EXACTLY
+  ONE of UGRD/VGRD (by name OR raw code triple) fails at STARTUP only when the
+  decision is DECISIVE — the first stable matching file whose first WIND message
+  carries grid-relative flag bit 0x08. Every non-decisive case DEFERS with a log
+  note (empty dir / no matching file, matching files inside the stability window,
+  unreadable or non-GRIB file, file containing no wind message) and falls back to
+  the decode-time `check_wind_pair` rule, which remains in force as the second
+  line of defense. Startup "stable" = size > 0 AND mtime at least
+  `stable_window_secs` old (one boot-time probe cannot watch size/mtime drift the
+  way a scan round does).
+* Earth shape: Code Table 3.2 user-defined codes 1/3/7 now honor their INLINE
+  axes from section 3 (sphere radius / major / minor, GRIB scaled values; code 3
+  in km, code 7 in meters) instead of guessing a nearest constant, so a file
+  declaring its own spheroid projects and rotates on THAT spheroid. Note the task
+  text's "code 2 = 6378.137/6356.7523" is wrong per wgrib2 `Earth.c` (code 2 =
+  International spheroid 6378.160/6356.775 km); the WGS 84 numbers belong to a
+  user-defined spheroid, which is why the ellipsoid fixture uses code 3 + inline
+  WGS 84 radii and validates against pyproj's DEFAULT WGS84 exactly.
+* Storage format bump: `grid.bin` `GRID_VERSION` 1 → 2 (Lambert block gained two
+  f64 axes + an inline-axes flag). Version-1 files are rejected on read rather
+  than silently mis-restored; regenerate the data dir or let ingest rewrite the
+  run. Both earth shapes are exercised by fixtures (`hrrr_small.grib2` CT 3.2 = 6
+  sphere, `hrrr_ellip_small.grib2` CT 3.2 = 3 inline WGS 84).
+* §9.3 wind-rotation golden vs `wgrib2 -new_grid_winds earth` could NOT be run
+  here: this wgrib2 build refuses ("IPOLATES package is not installed") and no
+  Fortran/transpiler toolchain exists to rebuild it with IPOLATES. Replaced by a
+  dual-shape pyproj check (`scripts/validate_rotation.py` →
+  `tests/fixtures/rotation_expected.csv`, worst delta 4.8e-11 deg over 42 nodes)
+  plus `scripts/validate_rotation_wgrib2.sh`, a stub that prints how to run the
+  golden where IPOLATES is available.
 * Out of scope per §13: slant paths, bounding boxes, soundings, grid
   subsetting, unit conversion, derived quantities, auth, NOAA downloads.
 * Perf dataset is synthetic-but-real-geometry (generated by gen_perfdata.sh,

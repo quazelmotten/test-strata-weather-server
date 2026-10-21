@@ -13,8 +13,9 @@ use libc::usleep;
 use tokio::runtime::Runtime;
 use tokio::net::TcpListener;
 use axum::serve;
-use wx_ingest::config::load_config;
+use wx_ingest::config::{load_config, startup_wind_preflight};
 use wx_ingest::pipeline::Pipeline;
+use wx_ingest::state::now_ns_marker;
 use wx_server::httpapi::{ServerState, build_router};
 use wx_server::stats::{new_stats, mono_ns};
 use std::sync::Arc;
@@ -81,6 +82,26 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
         Ok(pp) => { pp }
     };
     println!("loaded models: {0}; bind {1}; data_dir {2}", model_names(&p), bind_str, p.data_dir);
+
+    // spec §4.4 wind-pair rule, checked at STARTUP against the first stable
+    // file of each model (read-only probe of sections 1/3 only). A grid-relative
+    // model that configures only one of UGRD/VGRD fails here, before any data
+    // is ingested or any port is bound; the decode-time check in the pipeline
+    // stays as the second line of defense for empty-at-boot directories.
+    let win_secs = (p.stable_window_ns / 1000000000) as u32;
+    let now_ns = now_ns_marker(&p.state.dir_path);
+    let pf = startup_wind_preflight(p.models.clone(), win_secs, now_ns);
+    match pf {
+        Err(msg) => {
+            println!("{0}", msg);
+            return;
+        }
+        Ok(notes) => {
+            for n in &notes {
+                println!("{0}", n);
+            }
+        }
+    }
 
     let stats = new_stats();
     let cfg_models = Arc::new(p.models.clone());

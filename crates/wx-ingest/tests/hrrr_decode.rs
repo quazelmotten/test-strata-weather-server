@@ -190,7 +190,12 @@ fn hrrr_rotation_invariants() {
                             Some((di, dj)) => {
                                 let gamma = n_c * (c[0] - 229.53);
                                 let beta_w = gl.rot_angle_deg(di, dj);
-                                assert!(abs_diff(beta_w, 90.0 + gamma) <= 0.05);
+                                // V1.1 phase 4: the angle is now derived from
+                                // the projection's own cone geometry, so it
+                                // reproduces Snyder's convergence relation to
+                                // floating-point noise (was a 5e-2 DEG slop under
+                                // the old finite-difference method).
+                                assert!(abs_diff(beta_w, 90.0 + gamma) <= 1e-9);
                                 // full rotation against the ANALYTIC beta at the
                                 // nearest node: catches formula/sign errors of any
                                 // kind (errors there are O(1e4), tolerance 5e-2 rel).

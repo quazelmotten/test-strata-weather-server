@@ -40,9 +40,13 @@
 /// uses 6367.47 km for 0 and 6371.229 km for code 6; we follow wgrib2 for
 /// every code it knows because the fixtures (and real NMC files: HRRR/GFS use
 /// code 6) are validated against it. Unknown codes fall back to the NMC-
-/// convention spheroid (6378.137 / 6356.7523 km). Codes 1/3/7 carry inline
-/// radii that the grid structs do not store; ingest maps them to the nearest
-/// constant (documented decision; real GFS/HRRR never use them).
+/// convention spheroid (6378.137 / 6356.7523 km). Codes 1/3/7 carry INLINE
+/// radii inside section 3; when the reader finds them it overrides this table
+/// through `GridLambert::set_user_axes`, so a user-defined spheroid is
+/// projected with the axes the file actually declares rather than a
+/// nearest-constant guess (V1.1 phase 4: the earth model must be identical
+/// for the projection AND the wind-rotation angle, which both derive from
+/// ns/rh built from these axes).
 pub fn earth_axes_m(shape: u8) -> (f64, f64) {
     match shape {
         0 => (6371226.6, 6371226.6), // spec sphere; see note above
@@ -117,6 +121,12 @@ pub struct GridLambert {
     pub inv_dx: f64,
     pub inv_dy: f64,
     pub j_south: bool, // true => stored rows advance toward the south pole (N->S)
+
+    // Inline user-defined earth axes (Code Table 3.2 codes 1/3/7), meters.
+    // `inline_axes` false => the axes come from [`earth_axes_m`] instead.
+    pub ua_major_m: f64,
+    pub ua_minor_m: f64,
+    pub inline_axes: bool,
 }
 
 /// A grid is either regular lat/lon or LCC; downstream code passes this
@@ -209,13 +219,32 @@ impl GridLambert {
             r_major: 0.0, r_minor: 0.0, es: 0.0, e: 0.0, ns: 0.0, f0: 0.0,
             rh: 0.0, lov_rad: 0.0, x0: 0.0, y0: 0.0, inv_dx: 0.0, inv_dy: 0.0,
             j_south: false,
+            ua_major_m: 0.0, ua_minor_m: 0.0, inline_axes: false,
         };
         g.prepare();
         g
     }
 
+    /// Attach the inline user-defined earth axes (meters) declared by Code
+    /// Table 3.2 codes 1/3/7 in section 3 and recompute every projection
+    /// constant. Called by the GRIB2 reader when those bytes are present;
+    /// until then the CT table value in [`earth_axes_m`] is used.
+    pub fn set_user_axes(self: &mut Self, major_m: f64, minor_m: f64) {
+        if major_m <= 0.0 || minor_m <= 0.0 || minor_m > major_m {
+            return; // nonsense axes: keep the table value
+        }
+        self.ua_major_m = major_m;
+        self.ua_minor_m = minor_m;
+        self.inline_axes = true;
+        self.prepare();
+    }
+
     pub fn prepare(self: &mut Self) {
-        let (maj, min) = earth_axes_m(self.earth_shape);
+        let (maj, min) = if self.inline_axes && self.ua_major_m > 0.0 {
+            (self.ua_major_m, self.ua_minor_m)
+        } else {
+            earth_axes_m(self.earth_shape)
+        };
         self.r_major = maj;
         self.r_minor = min;
         self.es = 1.0 - (self.r_minor / self.r_major).powf(2.0);
@@ -289,13 +318,25 @@ impl GridLambert {
         ))
     }
 
-    /// Inverse transform: fractional storage (i, j) -> (lat, lon) degrees
-    /// (lon normalized [0,360)). Mirrors `lamccinv.c`. Used for round-trip
-    /// self-consistency tests and (later) wind rotation at ingest time.
-    pub fn inverse(self: &Self, di: f64, dj: f64) -> (f64, f64) {
+    /// Projected plane coordinates (meters, same frame as `x0`/`y0`) of a
+    /// fractional storage position. Shared by `inverse` and `rot_angle_deg`
+    /// so the two can never disagree about where a grid node sits.
+    fn plane_xy(self: &Self, di: f64, dj: f64) -> (f64, f64) {
         let x = self.x0 + di * self.dx_m;
         let dj_north = if self.j_south { -dj } else { dj };
-        let y = self.y0 + dj_north * self.dy_m;
+        (x, self.y0 + dj_north * self.dy_m)
+    }
+
+    /// Cone-polar coordinates of a projected point: the SIGNED slant height
+    /// rh1 and the polar angle theta (radians) about the cone apex, exactly as
+    /// `lamccinv.c` derives them. theta is the SAME quantity `for_point`
+    /// computes (`ns * (lon - LoV)` wrapped into (-pi, pi]): `for_point` places
+    /// a point at apex + rh1*(sin theta, cos theta), so with the apex at plane
+    /// (0, rh) the polar angle of (x, rh - y) recovers it. The sign handling
+    /// (rh1 < 0 together with theta flipped when ns < 0) mirrors lamccinv, so
+    /// southern-hemisphere grids resolve to the theta the forward transform
+    /// actually used.
+    fn cone_polar(self: &Self, x: f64, y: f64) -> (f64, f64) {
         let yy = self.rh - y;
         let pair: (f64, f64) = if self.ns > 0.0 {
             ((x * x + yy * yy).sqrt(), 1.0)
@@ -304,6 +345,15 @@ impl GridLambert {
         };
         let (rh1, con) = pair;
         let theta = if rh1 != 0.0 { (con * x).atan2(con * yy) } else { 0.0 };
+        (rh1, theta)
+    }
+
+    /// Inverse transform: fractional storage (i, j) -> (lat, lon) degrees
+    /// (lon normalized [0,360)). Mirrors `lamccinv.c`. Used for round-trip
+    /// self-consistency tests and for the wind-rotation angle (spec §4.4).
+    pub fn inverse(self: &Self, di: f64, dj: f64) -> (f64, f64) {
+        let (x, y) = self.plane_xy(di, dj);
+        let (rh1, theta) = self.cone_polar(x, y);
         let ts = (rh1 / (self.r_major * self.f0)).powf(1.0 / self.ns);
         let lat_rad = phi2z(self.e, ts);
         let lon_rad = adjust_lon(theta / self.ns + self.lov_rad);
@@ -312,17 +362,40 @@ impl GridLambert {
 
     /// Grid-relative wind rotation angle (degrees) at fractional storage
     /// position (spec §4.4): bearing of the grid +i direction relative to
-    /// true north. wx-ingest uses this to rotate grid U/V to earth U/V.
-    /// Computed numerically from two inverse transforms so it is correct for
-    /// both scan directions without sign bookkeeping; ingest precomputes it
-    /// per grid point once.
+    /// TRUE north. wx-ingest uses this to rotate grid U/V to earth U/V.
+    ///
+    /// DERIVATION (shares one truth with the projection, V1.1 phase 4): in
+    /// the Snyder PP-1395 conformal Lambert grid implemented by `for_point`,
+    /// a point's offset from the cone apex is rh1*(sin theta, cos theta) with
+    /// theta = ns*(lon - LoV), so MERIDIANS map to exact radial rays from the
+    /// apex. The projection is CONFORMAL, hence true north at the point maps
+    /// to that radial direction, while the grid +i axis maps to the plane
+    /// +x unit vector. The clockwise angle from north to +x is therefore
+    /// beta = 90 deg + theta, where theta comes from `cone_polar` -- the very
+    /// same quantity `for_point`/`inverse` use. No finite differences and no
+    /// local planar approximation: the earth model enters only through ns/rh
+    /// (built from the CT 3.2 axes, including inline user-defined radii), so
+    /// spherical and oblate grids are both handled exactly. Measured against
+    /// pyproj with the earth shape matched exactly: <= 1.7e-13 deg (was up to
+    /// 2.4e-2 deg with the previous two-inverse-difference method; see
+    /// docs/DECISIONS.md and scripts/validate_rotation.py).
     pub fn rot_angle_deg(self: &Self, di: f64, dj: f64) -> f64 {
-        let (la0, lo0) = self.inverse(di, dj);
-        let (la1v, lo1v) = self.inverse(di + 1.0, dj);
-        let dla = (la1v - la0) * D2R;
-        let dlo = ((lo1v - lo0 + 540.0) % 360.0 - 180.0) * D2R * (la0 * D2R).cos();
-        dlo.atan2(dla) * R2D
+        let (x, y) = self.plane_xy(di, dj);
+        let (_rh1, theta) = self.cone_polar(x, y);
+        wrap_deg(90.0 + theta * R2D)
     }
+}
+
+/// Wrap a bearing-like angle into (-180, 180] degrees.
+fn wrap_deg(d: f64) -> f64 {
+    let w = d % 360.0;
+    if w > 180.0 {
+        return w - 360.0;
+    }
+    if w < -180.0 {
+        return w + 360.0;
+    }
+    w
 }
 
 impl GridDef {

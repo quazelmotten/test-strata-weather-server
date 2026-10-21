@@ -253,6 +253,132 @@ pub fn validate_text(text: &str) -> Result<Vec<ResolvedModel>, String> {
     }
 }
 
+/// Config-time half of the spec §4.4 wind rule: which single wind component
+/// (if any) a model's resolved parameters list. Recognizes BOTH the canonical
+/// table names and raw GRIB2 triples (category 2 / number 2 = UGRD, number 3
+/// = VGRD), because a config may name parameters by code. Returns Some((present,
+/// missing)) when EXACTLY ONE of the pair is configured, None otherwise.
+pub fn wind_pair_gap(params: &[ResolvedParam]) -> Option<(String, String)> {
+    let mut has_u = false;
+    let mut has_v = false;
+    for p in params {
+        let is_u = p.key == "UGRD" || (p.cat == 2 && p.num == 2);
+        let is_v = p.key == "VGRD" || (p.cat == 2 && p.num == 3);
+        if is_u { has_u = true; }
+        if is_v { has_v = true; }
+    }
+    if has_u && !has_v {
+        return Some(("UGRD".to_string(), "VGRD".to_string()));
+    }
+    if has_v && !has_u {
+        return Some(("VGRD".to_string(), "UGRD".to_string()));
+    }
+    return None;
+}
+
+// ---------------------------------------------------------------------------
+// startup wind-pair preflight (spec §4.4: "If only one component is configured
+// for a grid-relative model, fail config validation with a clear message.")
+// ---------------------------------------------------------------------------
+
+/// Fail-fast check performed at STARTUP, before any ingest, against the FIRST
+/// STABLE file matching the model's glob (read-only; sections 1/3 only):
+///
+/// * both components configured, or neither -> nothing to check;
+/// * exactly one component AND the probed grid declares grid-relative vector
+///   components (flag table 3.3 bit 0x08) -> HARD ERROR naming model, file,
+///   template, flag byte and the missing parameter;
+/// * exactly one component but the grid is earth-relative -> accepted (note);
+/// * no stable candidate file / unreadable file / unsupported grid template ->
+///   DEFERRED with a note: the decode-time rule (`check_wind_pair` in the
+///   pipeline, second line of defense) still fires as soon as data lands.
+///
+/// Stability here means "size > 0 and mtime at least `stable_window_secs` old":
+/// unlike a scan round, a single startup probe cannot observe size/mtime over
+/// time, so age is the practical equivalent (documented decision). Notes are
+/// returned for the caller to log; Err carries the fatal message.
+pub fn startup_wind_preflight(models: Vec<ResolvedModel>, stable_window_secs: u32,
+                              now_ns: i64) -> Result<Vec<String>, String> {
+    use crate::discovery::{glob_match, walk_files, base_name};
+    use crate::state::stat_size_mtime;
+    use crate::grib2::{probe_first_grid};
+
+    let mut notes: Vec<String> = Vec::<String>::new();
+    let window_ns = (stable_window_secs as i64) * 1000000000;
+    for mdl in &models {
+        let gap = wind_pair_gap(&mdl.params);
+        match gap {
+            None => { continue; }
+            Some(pair) => {
+                // first stable file matching the model's glob (walk_files sorts)
+                let cands = walk_files(&mdl.ingest_dir);
+                let mut chosen = "".to_string();
+                let mut unstable = 0;
+                for c in &cands {
+                    if !glob_match(&mdl.file_glob, base_name(c.to_string()).as_str()) {
+                        continue;
+                    }
+                    let st = stat_size_mtime(&c);
+                    match st {
+                        Err(_) => { continue; }
+                        Ok(sz_mt) => {
+                            if sz_mt.0 == 0 {
+                                continue;
+                            }
+                            if sz_mt.1 > now_ns - window_ns {
+                                unstable += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    chosen = c.to_string();
+                    break;
+                }
+                if chosen.is_empty() {
+                    let why = if unstable > 0 {
+                        format!("{0} matching file(s) not stable yet", unstable).to_string()
+                    } else {
+                        "no matching file present".to_string()
+                    };
+                    notes.push(format!("wind-pair preflight: model '{0}' configures only {1} of the UGRD/VGRD pair; deferring ({2}) under '{3}'",
+                               mdl.name, pair.0, why, mdl.ingest_dir));
+                    continue;
+                }
+                let pr = probe_first_grid(chosen.to_string());
+                match pr {
+                    Err(e) => {
+                        notes.push(format!("wind-pair preflight: model '{0}' could not probe '{1}' ({2:?}); deferring to the decode-time rule",
+                                   mdl.name, chosen, e));
+                        continue;
+                    }
+                    Ok(pp) => {
+                        // Decisive answer: what the FIRST message that IS a
+                        // wind component declared for ITS grid. A real file
+                        // mixes scalar grids (flag bit clear) and vector grids
+                        // (bit set) -- exactly what HRRR files do -- so only
+                        // the wind messages settle the question.
+                        if pp.wind_msg == 2 {
+                            return Err(format!("config error (spec 4.4): model '{0}' configures ONLY {1} but needs {2} as well: in the first stable file '{3}' the WIND messages carry GRID-RELATIVE vector components (section 3 template 3.{4}, flag table 3.3 byte 0x{5:02X} with bit 0x08 set; {6} of {7} probed messages declare that flag). Rotating a single component to earth-relative is meaningless -- add {2} to [[models.params]] or drop {1}.",
+                                       mdl.name, pair.0, pair.1, chosen, pp.tmpl, pp.wind_flag33,
+                                       pp.winds_true, pp.messages));
+                        }
+                        if pp.wind_msg == 1 {
+                            notes.push(format!("wind-pair preflight: model '{0}' configures only {1}; in '{2}' the wind messages declare EARTH-relative components (flag table 3.3 byte 0x{3:02X}): accepted",
+                                       mdl.name, pair.0, chosen, pp.wind_flag33));
+                            continue;
+                        }
+                        // no wind message in the probed file: cannot decide
+                        notes.push(format!("wind-pair preflight: model '{0}' configures only {1}; '{2}' contains no wind message ({3} messages probed), cannot decide -- deferring to the decode-time rule",
+                                   mdl.name, pair.0, chosen, pp.messages));
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    return Ok(notes);
+}
+
 pub fn load_config(path: &str) -> Result<PointConfig, String> {
     let text = read_to_string(&path);
     match text {

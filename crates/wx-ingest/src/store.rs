@@ -7,20 +7,26 @@
 //! ## grid.bin format (versioned, custom — "define your own serialization")
 //!
 //! ```text
-//! magic 8B "WXPTGRID1" | version u32 LE = 1 | kind u8 (0 regular, 1 lambert)
+//! magic 8B "WXPTGRID1" | version u32 LE = 2 | kind u8 (0 regular, 1 lambert)
 //! regular:  nx u32 ny u32 | lon1 lat1 dlon dlat f64 | scan u8 | winds u8
-//! lambert:  nx u32 ny u32 | la1 lo1 lov lad latin1 latin2 dx_m dy_m f64 x9
+//! lambert:  nx u32 ny u32 | la1 lo1 lov lad latin1 latin2 dx_m dy_m f64 x8
 //!           | proj_flag u8 | scan u8 | earth_shape u8 | winds u8
+//!           | ua_major_m f64 | ua_minor_m f64 | inline_axes u8   (v2 addition:
+//!           the Code Table 3.2 codes 1/3/7 declare the earth axes INLINE in
+//!           section 3; without these bytes a warm-boot rebuild would silently
+//!           fall back to the CT table value and project/rotate on the wrong
+//!           spheroid)
 //! ```
 //! Precomputed projection constants are NOT stored: the reader rebuilds them
-//! via GridLambert::new (which calls prepare()), keeping one source of truth.
+//! via GridLambert::new (+ set_user_axes when inline_axes is set), keeping one
+//! source of truth for both the projection and the wind-rotation angle.
 
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
 use wx_core::storage::{write_bin_atomic, open_field, BinHeader, fsync_path};
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
-pub const GRID_VERSION: u32 = 1;
+pub const GRID_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // LE primitives (local copies; wx-core only exposes f32/u32 helpers)
@@ -91,6 +97,9 @@ pub fn encode_grid(grid: &GridDef) -> Vec<u8> {
             out.push(g.scan_mode);
             out.push(g.earth_shape);
             out.push(if g.winds_grid { 1 } else { 0 });
+            push_le_f64(&mut out, g.ua_major_m);
+            push_le_f64(&mut out, g.ua_minor_m);
+            out.push(if g.inline_axes { 1 } else { 0 });
         }
     }
     return out;
@@ -136,10 +145,11 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
         }
         1 => {
             // layout: magic(8)+ver(4)+kind(1)+nx/ny(8)+8 f64 params(64)+4 flag
-            // bytes = 89. NOTE: earlier guard said 72 for the f64 block (9
-            // slots); encode_grid writes 8 (la1,lo1,lov,lad,latin1,latin2,
-            // dx,dy) -> warm-boot rebuild silently dropped every LCC run.
-            if b.len() < 12 + 1 + 8 + 64 + 4 {
+            // bytes+16 axes bytes+1 inline flag = 106 total. NOTE: earlier guard
+            // said 72 for the f64 block (9 slots); encode_grid writes 8 (la1,
+            // lo1,lov,lad,latin1,latin2,dx,dy) -> warm-boot rebuild silently
+            // dropped every LCC run.
+            if b.len() < 12 + 1 + 8 + 64 + 4 + 16 + 1 {
                 return Err("truncated lambert grid".to_string());
             }
             let nx = le_u32_at(b, 13);
@@ -156,9 +166,16 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
             let scan = b[86];
             let earth_shape = b[87];
             let winds = b[88];
+            let ua_major = le_f64_at(b, 89);
+            let ua_minor = le_f64_at(b, 97);
+            let inline_axes = b[105];
             let g = GridLambert::new(nx, ny, la1, lo1, lov, lad, latin1, latin2,
                                      dx_m, dy_m, proj_flag, scan, earth_shape, winds != 0);
-            return Ok(GridDef::Lambert(g));
+            let mut gg = g;
+            if inline_axes != 0 {
+                gg.set_user_axes(ua_major, ua_minor);
+            }
+            return Ok(GridDef::Lambert(gg));
         }
         _ => { return Err("unknown grid kind".to_string()); }
     }

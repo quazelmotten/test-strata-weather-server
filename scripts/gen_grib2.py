@@ -74,6 +74,18 @@ def i2sm(v):
     return struct.pack(">H", sm)
 
 
+def scaled_pair(v, max_factor=9):
+    """GRIB "scaled value": INT1 scale factor + SIGN-MAGNITUDE INT4 value,
+    meaning v = value * 10^-factor (wgrib2 int8.c::scaled2dbl). Picks the
+    smallest factor that represents v exactly inside the int4 range."""
+    for f in range(0, max_factor + 1):
+        iv = int(round(v * (10 ** f)))
+        if abs(iv / float(10 ** f) - v) <= 1e-9 * max(1.0, abs(v)):
+            if abs(iv) < 2 ** 31:
+                return bytes([f]) + i4sm(iv)
+    raise ValueError("no exact scaled representation for %r" % (v,))
+
+
 def section(num, payload):
     body = bytes([num]) + payload
     return u4(len(body) + 4) + body
@@ -155,7 +167,12 @@ def sec3_latlon(nx, ny, lon1_deg, lat1_deg, dlon_deg, dlat_deg, wind_grid=False)
 
 
 def sec3_lambert(nx, ny, la1, lo1, lov, lad, latin1, latin2, dx_m, dy_m,
-                 wind_grid=False, scan_mode=0):
+                 wind_grid=False, scan_mode=0, earth_shape=6,
+                 axes_km=None):
+    """earth_shape: Code Table 3.2 byte. axes_km: (major, minor) in KILOMETRES
+    written into the INLINE slots that codes 3 (km) / 7 (m) declare; wgrib2
+    reads them from exactly these offsets (Earth.c::axes_earth: shape byte
+    +6/+7 major, +11/+12 minor)."""
     g = bytearray(81)
     g[0:4] = u4(81)
     g[4] = 3
@@ -165,13 +182,23 @@ def sec3_lambert(nx, ny, la1, lo1, lov, lad, latin1, latin2, dx_m, dy_m,
     g[11] = 0
     g[12] = 0
     g[13] = 30                                 # template 3.30 Lambert conformal
-    g[14] = 6                                  # earth shape (NCEP default)
-    g[15] = 0
-    g[16:20] = u4(0)
-    g[20] = 0
-    g[21:25] = u4(0)
-    g[25] = 0
-    g[26:30] = u4(0)
+    g[14] = earth_shape                        # shape of earth (CT 3.2)
+    g[15] = 0                                  # scale factor of spherical radius
+    g[16:20] = u4(0)                           # scaled value of same
+    g[20] = 0                                  # scale factor of major axis
+    g[21:25] = u4(0)                           # scaled value of major axis
+    g[25] = 0                                  # scale factor of minor axis
+    g[26:30] = u4(0)                           # scaled value of minor axis
+    if earth_shape == 1:
+        # user-defined sphere: radius in METERS (wgrib2 set_radius semantics)
+        r_m = axes_km[0] * 1000.0
+        g[15:20] = scaled_pair(r_m)
+    elif earth_shape in (3, 7):
+        # code 3 declares KILOMETRES, code 7 METERS (Earth.c multiplies code 3
+        # by 1000 after reading), so pass km here and adjust for code 7 below
+        unit = 1.0 if earth_shape == 3 else 1000.0
+        g[20:25] = scaled_pair(axes_km[0] * unit)
+        g[25:30] = scaled_pair(axes_km[1] * unit)
     E6 = 1000000
     g[30:34] = u4(nx)
     g[34:38] = u4(ny)
@@ -515,6 +542,41 @@ def main():
 
     with open(os.path.join(a.out, "hrrr_small.grib2"), "wb") as f:
         for r in hrecs:
+            f.write(r)
+
+    # --------- OBLATE ELLIPSOID LCC GRID (V1.1 phase 4, spec §4.3/§4.4) ------
+    # Code Table 3.2 byte 3 ("user-defined spheroid"): the axes are declared
+    # INLINE in section 3, here WGS 84 (6378.137 / 6356.75231 km), so this
+    # fixture exercises the oblate branch end to end -- ns/rh/eccentricity in
+    # the projection AND the conformal wind-rotation angle -- and its rotation
+    # is validated against pyproj's DEFAULT WGS84 ellipsoid. wgrib2 reads the
+    # same inline slots (`-radius` reports the axes; gen_fixtures.sh asserts it)
+    # and `-ll2ij` corroborates the projection (expected.json).
+    enx, eny = 41, 31
+    egrid_w = sec3_lambert(enx, eny, 40.0, 250.0, 235.0, 30.0, 30.0, 40.0,
+                           12000.0, 12000.0, wind_grid=True,
+                           earth_shape=3, axes_km=(6378.137, 6356.75231))
+    egrid_s = sec3_lambert(enx, eny, 40.0, 250.0, 235.0, 30.0, 30.0, 40.0,
+                           12000.0, 12000.0, wind_grid=False,
+                           earth_shape=3, axes_km=(6378.137, 6356.75231))
+    eth = sec1(2026, 10, 19, 12, 0, 0)
+    erecs = []
+    for pname, wgrid in (("UGRD", True), ("VGRD", True), ("TMP", False)):
+        pcat, pnum = PARAMS[pname]
+        incs = []
+        for j in range(eny):
+            for i in range(enx):
+                off = {"TMP": 0, "UGRD": 4000, "VGRD": 8000}[pname]
+                incs.append(off + j * 100 + i)
+        s5b, s7b, s6b, _ = encode_field(incs, 255.0, 0, None)
+        s4 = sec4(pcat, pnum, LEVEL_AGL, 2 if pname == "TMP" else 10, 0)
+        # winds ride the grid-relative grid, scalars the earth-relative one,
+        # exactly like the hrrr_small fixture; the wind messages come FIRST so
+        # the startup probe sees the grid-relative flag immediately.
+        erecs.append(build_record(eth, egrid_w if wgrid else egrid_s,
+                                  s4, s5b, s7b, None))
+    with open(os.path.join(a.out, "hrrr_ellip_small.grib2"), "wb") as f:
+        for r in erecs:
             f.write(r)
 
     # ------------- PDT 4.8 statistically-processed fixture -------------------

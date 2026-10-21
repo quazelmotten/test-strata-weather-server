@@ -100,4 +100,17 @@ if [ -f tests/perfdata/gfs_perf_f000.grib2 ]; then
   echo "ok gfs_perf_f000_jpeg (DRT 5.40, checksum-equal)"
 fi
 
+# ---------------------------------------------------------------------------
+# oblate LCC fixture: wgrib2 must read the INLINE Code Table 3.2 = 3 axes
+# (Earth.c::axes_earth) exactly as written, proving our reader and wgrib2 agree
+# on the earth model that both the projection and the wind rotation use.
+# ---------------------------------------------------------------------------
+radout="$("$WG" tests/fixtures/hrrr_ellip_small.grib2 -radius 2>/dev/null | head -1)"
+case "$radout" in
+  *"code3.2=3"*"radius_maj=6378137.000000"*"radiusmin=6356752.310000"*"is_spherical=0"*)
+    echo "ok hrrr_ellip_small (CT 3.2=3 inline WGS84 axes read by wgrib2)" ;;
+  *)
+    echo "FATAL: hrrr_ellip_small: wgrib2 read '$radout', expected the inline WGS84 axes"; exit 1 ;;
+esac
+
 echo "gen_fixtures.sh: fixtures regenerated under tests/fixtures (+ tests/perfdata)"

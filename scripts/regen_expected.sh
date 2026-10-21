@@ -250,6 +250,51 @@ for lon, lat in [(351.5, 9.0), (350.0, 10.0)]:
                     "stored_by_our_pipeline": idx in (0, 3)})
 fx["point_checks"] = rob
 
+# ---------------- hrrr_ellip_small (oblate LCC, CT 3.2 = 3 inline axes) ----
+# V1.1 phase 4: proves the inline user-defined spheroid is read the same way
+# by wgrib2 (Earth.c::axes_earth) and that the OBLATE projection branch agrees
+# with wgrib2 -ll2ij, which is what makes the conformal wind-rotation angle
+# correct on a non-spherical earth.
+fname = "tests/fixtures/hrrr_ellip_small.grib2"
+fx = out["fixtures"].setdefault("hrrr_ellip_small.grib2", {})
+ENX, ENY = 41, 31
+ELA1, ELO1 = 40.0, 250.0
+fx["inventory_raw"] = probe(fname)
+rad = probe(fname, "-radius")
+assert rad and "code3.2=3" in rad[0] and "radius_maj=6378137.000000" in rad[0] \
+    and "radiusmin=6356752.310000" in rad[0] and "is_spherical=0" in rad[0], \
+    f"hrrr_ellip_small: wgrib2 did not read the inline WGS84 axes: {rad[:1]}"
+fx["radius_raw"] = rad[:1]
+eij = []
+rnd = random.Random(6378137)
+def echeck(lon, lat):
+    lines = probe(fname, "-ll2ij", str(lon), str(lat))
+    if not lines:
+        return None
+    tail = lines[0].split(":", 2)[2]
+    ij = tail.split("->")[1].strip().lstrip("(").rstrip(")")
+    i, j = (float(x) for x in ij.split(","))
+    if not (1.0 <= i <= ENX and 1.0 <= j <= ENY):
+        return None
+    return {"lon": lon, "lat": lat, "i": i, "j": j, "raw_ij": lines[0]}
+# corners + center first, then random interior probes
+for (lon, lat) in [(ELO1, ELA1), (ELO1 + 5.5, ELA1), (ELO1, ELA1 - 3.2),
+                   (ELO1 + 5.5, ELA1 - 3.2), (ELO1 + 2.75, ELA1 - 1.6),
+                   (ELO1 + 1.0, ELA1 - 0.5), (ELO1 + 4.5, ELA1 - 2.5)]:
+    rec = echeck(lon, lat)
+    if rec:
+        eij.append(rec)
+tries = 0
+while len(eij) < 16 and tries < 4000:
+    tries += 1
+    lo = round(ELO1 + rnd.random() * 5.6, 5)
+    la = round(ELA1 - rnd.random() * 3.2, 5)
+    rec = echeck(lo, la)
+    if rec:
+        eij.append(rec)
+assert len(eij) >= 16, f"hrrr_ellip_small: only {len(eij)} in-domain probes"
+fx["ij_checks"] = eij
+
 with open("tests/fixtures/expected.json", "w") as f:
     json.dump(out, f, indent=1)
 print("expected.json rewritten")
