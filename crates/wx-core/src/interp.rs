@@ -50,10 +50,26 @@ pub enum TimeInterpMode {
 /// Bracketing levels reported in the response (`"vertical": {"method":
 /// "linear", "levels": [850, 800]}`); `None` when the exact stored level was
 /// used. Levels are reported in stored order.
+///
+/// ## Per-time brackets (V1.2 phase B0 correctness fix)
+///
+/// Spec §6.4 interpolates vertically SEPARATELY AT EACH forecast hour, so each
+/// time slot brackets the requested level inside ITS OWN stored level stack.
+/// Two forecast hours of one run can legitimately carry DIFFERENT stacks
+/// (transient during partial ingest: f006 written with `[1000,850,700]`, f012
+/// later gains `925` ⇒ `[1000,925,850,700]`), so there can be TWO different
+/// brackets. `levels` stays the EARLIER slot's pair (spec §7 shape, back-
+/// compatible); `levels_later` carries the LATER slot's pair; `per_time` is
+/// true ONLY when the two pairs differ, and the server then ALSO emits
+/// `"levels_per_time": [[earlier...],[later...]]` so the answer is never
+/// misleading. When the brackets agree `per_time` is false and the extra key
+/// is omitted (byte-identical output to V1.1 for every uniform-stack query).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VertMeta {
     pub method: LevelInterpMethod,
-    pub levels: (f64, f64),
+    pub levels: (f64, f64), // earlier forecast hour's bracket (spec §7)
+    pub levels_later: (f64, f64), // later forecast hour's bracket
+    pub per_time: bool, // true when the two brackets differ
 }
 
 /// Bracketing forecast hours reported in the response
@@ -319,6 +335,18 @@ pub fn time_lerp(v0: f64, fh0: f64, v1: f64, fh1: f64, want_fh: f64) -> f64 {
 /// storage order with nx*ny values (already widened to f64 by the caller —
 /// the server keeps mmapped f32 and may use the low-level kernels directly
 /// instead of this entry point; see its doc).
+///
+/// MIRROR CONTRACT (V1.2 phase B0): this kernel resolves the level bracket ONCE
+/// against `levels` and applies it to EVERY forecast hour, i.e. it models ONE
+/// level stack SHARED by all times. That is NOT the slot-index bug the ingest
+/// evaluator had (slabs are addressed `li * nt + ti`, so a level index can never
+/// be applied to the wrong TIME), but it CANNOT express per-hour stacks. The
+/// PRODUCTION path (`wx_ingest::index::evaluate_point`) resolves the bracket
+/// INSIDE each time slot's own header and interpolates vertically PER SLOT before
+/// blending in time, exactly per spec §6.4. A caller holding per-hour stacks
+/// must feed the union stack with duplicated slabs (equal values where a level
+/// is absent) or evaluate hour-by-hour here and blend itself. Cross-slot slab
+/// independence is pinned by `tests/slot_independence.rs`.
 #[derive(Clone, Debug)]
 pub struct FieldSamples<'d> {
     pub levels: Vec<f64>, // numeric level coords (see tables.rs)
@@ -384,6 +412,8 @@ pub fn query_point(grid: &GridDef, fd: &FieldSamples<'_>, lat: f64, lon: f64,
         info.vertical = Some(VertMeta {
             method: LevelInterpMethod::Linear,
             levels: (l0, l1),
+            levels_later: (l0, l1),
+            per_time: false,
         });
     }
     let h0 = fd.fhs[ti0];

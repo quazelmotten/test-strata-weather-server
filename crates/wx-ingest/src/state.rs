@@ -87,6 +87,28 @@ impl StateStore {
         self.recs.push(rec);
     }
 
+    /// Forget every record whose path lies under `prefix` (V1.2 phase B0).
+    /// Used by the storage-format recovery path in `pipeline::ingest_run_dir`:
+    /// when a run directory has to be DISCARDED because its grid.bin belongs to
+    /// an older GRID_VERSION, the source files that produced it must become
+    /// eligible again, otherwise `scan_round` would skip them as "unchanged"
+    /// forever and the model would stay EMPTY. Matching is on `<prefix>/` so a
+    /// sibling directory whose name merely STARTS with the prefix is untouched.
+    pub fn drop_under(self: &mut Self, prefix: &str) -> usize {
+        let needle = format!("{0}/", prefix);
+        let mut kept: Vec<FileRec> = Vec::<FileRec>::new();
+        let mut n = 0usize;
+        for r in &self.recs {
+            if r.path.len() >= needle.len() && r.path[0 .. needle.len()] == *needle.as_str() {
+                n += 1;
+                continue;
+            }
+            kept.push(r.clone());
+        }
+        self.recs = kept;
+        return n;
+    }
+
     /// Persist atomically after each scan round.
     pub fn save(self: &Self) -> Result<(), String> {
         let mut copied: Vec<FileRec> = Vec::<FileRec>::new();

@@ -327,25 +327,46 @@ pub fn evaluate_point<'s>(ctx: &PointQueryContext<'s>, lat: f64, lon: f64) -> Qu
                 None => { return Err(PointError::MissingData); }
                 Some(ss0) => {
                     let s1 = &ctx.slots[1];
-                    let v00 = h_at(&ss0, ss0.li0);
-                    let mut v01 = v00;
+
+                    // ---- SLOT A (earlier forecast hour): OWN level indices ----
+                    let a_lv0 = ss0.field.header.levels[ss0.li0] as f64;
+                    let a_lv1 = ss0.field.header.levels[ss0.li1] as f64;
+                    let a_brk = ss0.li1 != ss0.li0;
+                    let va0 = h_at(&ss0, ss0.li0);
+                    let mut va1 = va0;
+                    if a_brk {
+                        va1 = h_at(&ss0, ss0.li1);
+                    }
+
+                    // ---- SLOT B (later forecast hour): OWN indices + OWN header.
+                    // V1.2 phase B0 CRITICAL FIX: pre-change this slot was read
+                    // with `ss0.li0` / `ss0.li1`, so whenever the two forecast
+                    // hours carried DIFFERENT level stacks (e.g. f006 [1000,850,
+                    // 700] vs f012 [1000,925,850,700]) slot B read the WRONG
+                    // PLANE and was vertically interpolated on slot A's pressure
+                    // bracket: a plausible-but-wrong number, no error (§6.4
+                    // violated). `SamplesSlot` carries li0/li1 PER SLOT for
+                    // exactly this reason. Regression test: tests/slot_levels.rs.
+                    let mut b_lv0 = a_lv0;
+                    let mut b_lv1 = a_lv1;
+                    let mut vb0 = va0;
+                    let mut vb1 = va1;
+                    let mut b_brk = a_brk;
                     match s1 {
                         None => {}
-                        Some(sr) => { v01 = h_at(&sr, ss0.li0); }
-                    }
-                    let l0 = ss0.field.header.levels[ss0.li0] as f64;
-                    let mut l1 = l0;
-                    let mut v10 = v00;
-                    let mut v11 = v01;
-                    if ss0.li1 != ss0.li0 {
-                        l1 = ss0.field.header.levels[ss0.li1] as f64;
-                        v10 = h_at(&ss0, ss0.li1);
-                        match s1 {
-                            None => { v11 = v10; }
-                            Some(sr) => { v11 = h_at(&sr, ss0.li1); }
+                        Some(sr) => {
+                            b_lv0 = sr.field.header.levels[sr.li0] as f64;
+                            b_lv1 = sr.field.header.levels[sr.li1] as f64;
+                            vb0 = h_at(&sr, sr.li0);
+                            vb1 = vb0;
+                            b_brk = sr.li1 != sr.li0;
+                            if b_brk {
+                                vb1 = h_at(&sr, sr.li1);
+                            }
                         }
                     }
-                    if v00.is_nan() || v01.is_nan() || v10.is_nan() || v11.is_nan() {
+
+                    if va0.is_nan() || va1.is_nan() || vb0.is_nan() || vb1.is_nan() {
                         return Err(PointError::MissingData);
                     }
                     let fi = di - di.floor();
@@ -357,12 +378,26 @@ pub fn evaluate_point<'s>(ctx: &PointQueryContext<'s>, lat: f64, lon: f64) -> Qu
                         vertical: None,
                         time: None,
                     };
-                    let f0 = if ss0.li1 == ss0.li0 { v00 } else { vertical_at(v00, l0, v10, l1, ctx.want_level) };
-                    let f1 = if ss0.li1 == ss0.li0 { v01 } else { vertical_at(v01, l0, v11, l1, ctx.want_level) };
-                    if ss0.li1 != ss0.li0 {
+                    // Spec §6.4 ORDER: vertical happens SEPARATELY at each time
+                    // slot (each inside that slot's own bracket), THEN the two
+                    // vertical results are blended in time. Degenerate cases:
+                    // an exact level hit in one slot (li1 == li0) skips that
+                    // slot's vertical step (no divide-by-zero); a level can be
+                    // exact-present in ONE slot and bracketed in the other.
+                    let fa = if a_brk { vertical_at(va0, a_lv0, va1, a_lv1, ctx.want_level) } else { va0 };
+                    let fb = if b_brk { vertical_at(vb0, b_lv0, vb1, b_lv1, ctx.want_level) } else { vb0 };
+                    if a_brk || b_brk {
+                        // Report slot A's pair in "levels" (spec §7 shape, back-
+                        // compatible). When the two slots bracket DIFFERENTLY the
+                        // single pair would misdescribe slot B, so the response
+                        // ADDITIVELY gains "levels_per_time" (documented in
+                        // docs/DECISIONS.md + README API section).
+                        let differs = !(a_lv0 == b_lv0 && a_lv1 == b_lv1);
                         info.vertical = Some(VertMeta {
                             method: LevelInterpMethod::Linear,
-                            levels: (l0, l1),
+                            levels: (a_lv0, a_lv1),
+                            levels_later: (b_lv0, b_lv1),
+                            per_time: differs,
                         });
                     }
                     // Time arithmetic runs in SECONDS: whole-second offsets are
@@ -372,9 +407,9 @@ pub fn evaluate_point<'s>(ctx: &PointQueryContext<'s>, lat: f64, lon: f64) -> Qu
                     // form it replaces. The REPORTED bracket converts back to
                     // HOURS because spec §7 shows forecast_hours in hours.
                     let val = if ctx.fh_secs.0 == ctx.fh_secs.1 {
-                        f0
+                        fa
                     } else {
-                        time_lerp(f0, ctx.fh_secs.0, f1, ctx.fh_secs.1, ctx.want_fh_secs)
+                        time_lerp(fa, ctx.fh_secs.0, fb, ctx.fh_secs.1, ctx.want_fh_secs)
                     };
                     if ctx.fh_secs.0 != ctx.fh_secs.1 {
                         info.time = Some(TimeMeta {

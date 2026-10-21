@@ -14,6 +14,7 @@ use std::sync::mpsc::channel;
 use std::sync::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use std::fs::read_dir;
 use std::path::{Path, PathBuf};
 
@@ -115,15 +116,45 @@ pub fn path_to_str(p: &Path) -> String {
 // stability tracking (window strategy state lives across scan rounds)
 // ---------------------------------------------------------------------------
 
+/// Monotonic nanosecond clock (V1.2 phase B0). Built on `std::time::Instant`,
+/// which this toolchain exposes as `Instant::now()` / subtraction /
+/// `Duration::as_nanos()`. EVERY in-memory timing decision (the stability
+/// window) is measured against this, NEVER against wall-clock file mtimes:
+/// a backward wall-clock jump (NTP step-back, container restore, VM pause)
+/// used to make `now_ns - first_observed` NEGATIVE, so a file whose stat had
+/// been stable for the whole window stayed INELIGIBLE forever and a scan round
+/// silently ingested NOTHING (this is the mechanism behind the flaky
+/// `r2 == 4` acceptance gate). mtime remains part of the file IDENTITY (a
+/// changed mtime means a re-delivery and resets the window) but plays NO part
+/// in measuring how long the identity has been observed stable.
+#[derive(Clone, Debug)]
+pub struct MonoClock {
+    pub t0: Instant, // arbitrary process-local origin
+}
+
+impl MonoClock {
+    /// Nanoseconds elapsed since this clock's origin. Never decreases.
+    pub fn elapsed_ns(self: &Self) -> i64 {
+        let d = Instant::now() - self.t0;
+        return d.as_nanos() as i64;
+    }
+
+    pub fn new_clock() -> MonoClock {
+        return MonoClock { t0: Instant::now() };
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StabilityTracker {
-    // (path, size, mtime_ns, first_seen_ns)
+    // (path, size, mtime_ns, first_observed_MONOTONIC_ns)
     pub obs: Vec<(String, u64, i64, i64)>,
 }
 
 impl StabilityTracker {
     /// Window strategy: eligible once (size,mtime) has been continuously
-    /// observed unchanged for `window_ns`. Re-observed changed stat resets.
+    /// observed unchanged for `window_ns` of MONOTONIC time. Re-observed changed
+    /// stat resets the observation stamp. `now_ns` MUST come from
+    /// [`MonoClock::elapsed_ns`] (wall-clock stamps are identity-only).
     pub fn observe(self: &mut Self, path: String, size: u64, mtime_ns: i64,
                    now_ns: i64, window_ns: i64) -> bool {
         for o in &mut self.obs {

@@ -112,6 +112,21 @@ curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP&level=isobaric:837.5&la
       "time":{"method":"linear","forecast_hours":[6,9]}}}]}
 ```
 
+**Additive vertical metadata (V1.2 phase B0).** Spec §6.4 interpolates vertically
+SEPARATELY AT each forecast hour, and two bracketing forecast hours of one run CAN
+carry DIFFERENT level stacks (normal during partial ingest: f006 written with
+`[1000,900,800,700]` while f012 already gained 950/850). `"levels"` stays the EARLIER
+slot's pair exactly as above (back compatible); when the two slots' pairs DIFFER the
+vertical object additionally carries BOTH, earlier slot first:
+
+```json
+"vertical":{"method":"linear","levels":[900,800],
+            "levels_per_time":[[900,800],[950,850]]}
+```
+
+When the two pairs agree (the overwhelmingly common case) `levels_per_time` is
+OMITTED and the body is byte-identical to V1.1.
+
 | Param | Required | Notes |
 |---|---|---|
 | `model` | yes | configured model name |
@@ -218,8 +233,9 @@ data_dir/
   then nlevels × f32 level values (pressure-sorted), then raw little-endian
   f32 planes laid out `[level][y][x]`. f32 because GRIB packing precision is
   already below f32; bitmap-masked points (§ sec 6) are stored as NaN.
-* `grid.bin`: magic `WXPTGRID`, u32 version (**`GRID_VERSION` = 2**; version-1
-  files are REJECTED on read, not mis-restored), kind byte (0 regular lat/lon,
+* `grid.bin`: magic `WXPTGRID`, u32 version (**`GRID_VERSION` = 2**; a version-1
+  file from a pre-V1.1-phase-4 store is detected on read and TRIGGERS AUTOMATIC
+  RECOVERY — see §9 — instead of being silently ignored), kind byte (0 regular lat/lon,
   1 Lambert Conformal Conic) + template fields (regular: nx,ny,lon1,lat1,dlon,
   dlat,scan,winds; LCC: nx,ny,la1,lo1,lov,lad,latin1,latin2,dx_m,dy_m,proj_flag,
   scan,earth_shape,winds, then two f64 major/minor axes in metres + an inline-axes
@@ -499,6 +515,20 @@ live in §10 and docs/DECISIONS.md.
   subsetting, unit conversion, derived quantities (e.g. dewpoint from RH),
   authentication, downloading model data from NOAA. Ingest only reads what is
   already in the configured directories.
+* **Storage-format upgrade (V1.2 phase B0).** A `<data_dir>` written by a pre-V1.1-
+  phase-4 build (`grid.bin` GRID_VERSION 1) is handled AUTOMATICALLY: on warm start
+  an unreadable `grid.bin` is logged loudly (`STORAGE-FORMAT RECOVERY: …`, also
+  counted in `wxpoint_ingest_errors_total`), that RUN directory is DELETED, and that
+  MODEL's ingest records are forgotten so its source files are re-decoded with the
+  current format on the NEXT scan round. Cost: one re-ingest per affected model;
+  requirement: the SOURCE files must still be present in `ingest_dir` (if they were
+  already pruned upstream the run is simply gone, LOUDLY — no silent empty inventory).
+  No manual `rm -rf <data_dir>` step is needed anymore.
+* **Stability timing is MONOTONIC (V1.2 phase B0).** The file-stability window is
+  measured with `std::time::Instant`, never against wall-clock mtimes, so NTP step-
+  backs, container restore or VM pause cannot freeze ingest. File IDENTITY is still
+  path + size + mtime + content hash (mtime change ⇒ re-delivery ⇒ window RESET).
+  Wall-clock mtimes remain used for the `/metrics` ingest-lag gauge only.
 * **Typed-rejection list** (each yields a typed error or a skip-and-note, never
   a guess, never a wrong number):
   * DRT **5.1 "dictionary"** — `UnsupportedData(1)`: GRIB2 has no dictionary

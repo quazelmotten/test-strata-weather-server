@@ -1373,3 +1373,160 @@ vendored-`bitflags` future-incompat NOTE). `--all-targets` still carries the
 pre-existing test-code lint debt documented at phase 6 (now 138 diagnostics
 including the new test files, same categories: `needless_return`,
 `assertions_on_constants`, index-loops); PRODUCT code (lib+bin) is clean.
+
+
+# V1.2 phase B0 decisions — correctness hotfix (per-slot level indices, monotonic stability clock, upgrade recovery)
+
+Scope: the three P1 items of the V1.1 audit (`AUDIT_1.1.md`, untracked third-party
+review file — its prose/ratings NOT trusted, only independently verified claims).
+Item 1's CRITICAL claim was verified TRUE by reading the code; items 2 and 3 were
+verified as described (item 2's reproduction RATE was NOT reproducible locally, see
+below). Retention-skip / overlap-validation refactors stay in Phase C.
+
+## 1. Per-slot vertical interpolation (silent wrong answer — FIXED)
+
+* `index::evaluate_point` sampled TIME SLOT 1 with SLOT 0's level indices
+  (`h_at(&sr, ss0.li0)` / `ss0.li1`) and bracketed it with SLOT 0's level VALUES.
+  Two forecast hours of one run CAN carry different level stacks (normal during
+  partial ingest), so slot B read the WRONG PLANE and was blended on the wrong
+  pressure bracket: a plausible number, no error → §6.4 violated.
+* Fix: each slot resolves and reads with ITS OWN `li0`/`li1` and ITS OWN
+  `field.header.levels`. Spec §6.4 order implemented literally: horizontal bilinear
+  at each (level,time), then VERTICAL PER TIME SLOT (`f_slot = vertical_at(...)`),
+  THEN the two vertical results are time-blended. Degenerate cases handled per slot:
+  an exact level hit in one slot (`li1 == li0`) skips that slot's vertical step (no
+  divide-by-zero), while the other slot may still bracket; a level can be exact-present
+  in one stack and bracketed in the other. NaN propagation UNCHANGED (any of the four
+  samples NaN → `MissingData`, weights never renormalized).
+* `build_context` still rejects when EITHER slot cannot bracket the requested level
+  (never extrapolate), so a level inside one stack but OUTSIDE the other's stored
+  range stays a 422 `LevelOutOfRange` — documented, deliberate.
+
+## 2. JSON decision: additive `levels_per_time` (truthful AND back compatible)
+
+Chosen over "report slot 0's pair only" (misleading) and over "omit metadata when
+they differ" (loses information):
+
+```json
+"vertical":{"method":"linear","levels":[900,800],
+            "levels_per_time":[[900,800],[950,850]]}
+```
+
+* `VertMeta` gained `levels_later: (f64,f64)` and `per_time: bool` (still `Copy`,
+  stack-only — the ZERO-ALLOC hot-path guarantee is untouched; `hotpath_alloc` and
+  `hotpath_full_alloc` still report 0 allocations).
+* `"levels"` keeps the EARLIER slot's pair ⇒ every pre-existing client parses the
+  spec §7 shape unchanged. The extra key is emitted ONLY when the pairs genuinely
+  DIFFER, so uniform-stack bodies are BYTE-IDENTICAL to V1.1 (pinned by
+  `point_json_omits_levels_per_time_when_brackets_agree`).
+* Server-side rendering lives in `queryapi.render_entry`; README §5 documents the
+  extension.
+
+## 3. wx-core mirror: NO bug, contract documented + tested
+
+`interp::query_point` resolves the bracket ONCE against `FieldSamples.levels` and
+addresses slabs as `li * nt + ti`, so a level index can never be applied to another
+time's data — the flat-index confusion was specific to the ingest evaluator. Its
+data model DOES assume ONE level stack shared by all times (documented as the
+MIRROR CONTRACT on `FieldSamples`: production queries use the ingest evaluator; a
+caller with per-hour stacks must feed the union stack with duplicated slabs or
+evaluate hour-by-hour). Cross-slot independence pinned by new
+`crates/wx-core/tests/slot_independence.rs`:
+`per_pair_planes_compose_horizontally_then_vertically_then_in_time` (planes distinct
+per (level,time) pair ⇒ any transposition changes the number) and
+`exact_forecast_hour_reads_only_its_own_slabs` (rewriting the non-selected hour's
+planes leaves the answer BIT-IDENTICAL; rewriting the selected hour moves it exactly
+as predicted).
+
+## 4. Stability window moved to a MONOTONIC clock (flake root cause)
+
+* `discovery::MonoClock` wraps `std::time::Instant` (`Instant::now()`, subtraction,
+  `Duration::as_nanos()` — this toolchain has no `Instant.now()` VALUE form and no
+  `std::chrono`; statics are called with `::`). `Pipeline` owns one; `scan_round`
+  feeds `clock.elapsed_ns()` into `StabilityTracker::observe`.
+* File IDENTITY is UNCHANGED (path + size + mtime_ns); mtime is now IDENTITY-ONLY.
+  A changed (size,mtime) resets the observation stamp; window expiry is measured
+  purely monotonically. `state::now_ns_marker` REMAINS for wall-clock uses
+  (preflight staleness, perf-lag probes) but is no longer on the ingest path.
+* Why it mattered: with `stable_window_secs = 0` the predicate is
+  `now - first >= 0`, which a BACKWARD stamp makes NEGATIVE ⇒ the round ingests
+  NOTHING. Reproduction evidence:
+  * BEFORE fix: 10 consecutive `cargo test --test hotpath_full_alloc` runs, rc=0
+    every time (the audit's 2-of-11 rate did NOT reproduce locally — the trigger is
+    a wall-clock step-back during those ~25 s, not ordinary scheduling).
+  * MECHANISM proven deterministically by injecting a NON-MONOTONIC stamp source
+    (alternating 5 s backward jumps) into `scan_round`: `stability.rs` then fails
+    at `r4 == 1` (file never becomes eligible) — the audit's failure mode, reproduced
+    on demand. Reverted after capture.
+  * AFTER fix: 10 more consecutive runs, rc=0 every time, AND the same hostile
+    clock injection leaves `hotpath_full_alloc` GREEN (the settle loop recovers on
+    the next round instead of failing the gate).
+* New unit gates in `crates/wx-ingest/tests/stability_clock.rs`:
+  `mono_clock_never_decreases_and_tracks_real_time`,
+  `window_eligibility_is_measured_monotonically`,
+  `backward_wall_clock_cannot_freeze_the_window_anymore` (asserts the OLD rule
+  `(backward_stamp - first) >= win` would have been false forever),
+  `identity_change_resets_the_monotonic_window` (size-only and mtime-only re-delivery
+  both reset).
+* `tests/stability.rs` spin replaced by a SLEEPING bounded wait on the monotonic
+  clock with a 10 s deadline plus an assertion that the deadline was not hit — the
+  old busy-loop could hang the suite FOREVER if the marker clock stopped advancing.
+* Gate tests made deterministic by RULE: never assert WHICH scan round ingests;
+  accumulate over a BOUNDED settle loop and assert the TOTAL
+  (`hotpath_full_alloc`: total 4 / total 1; `grid_upgrade.settle`). This also absorbs
+  the OTHER realistic skip class — a transient `stat_size_mtime` / `content_hash_file`
+  error silently skips ONE candidate for that round.
+
+## 5. GRID_VERSION 1→2 upgrade trap: automatic recovery (no silent empty inventory)
+
+Chosen recovery (over "force grid rewrite" — cannot, the v1 bytes lack the earth
+axes — and over "document `rm -rf <data_dir>`"): in `ingest_run_dir`, when
+`decode_grid` FAILS on an existing `grid.bin`:
+1. LOUD note naming the run dir, decode reason, found vs current version
+   (`STORAGE-FORMAT RECOVERY: …`) + `counters.errors += 1` (so `/metrics` sees it);
+2. DELETE the unusable run directory;
+3. FORGET that MODEL's ingest records (`StateStore.drop_under(ingest_dir)`, matching
+   on `<prefix>/` so sibling dirs are untouched) and persist state immediately, so
+   the NEXT scan round re-decodes from source with the CURRENT format.
+Idempotent and correctness-preserving (re-decode is deterministic); costs one re-ingest
+per affected model. Requires the SOURCE files still be present in `ingest_dir`; if they
+were pruned upstream the run is simply GONE, loudly — never a silent empty inventory.
+README §9 documents the migration behavior.
+
+Gates in `crates/wx-ingest/tests/grid_upgrade.rs`:
+`v1_grid_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source` (planted
+GRID_VERSION=1 blob ⇒ log + errors==1 + run dir deleted + `"recs":[]` + no gfs run
+indexed, then settle-scan rebuilds with GRID_VERSION=2 on disk and the node probe
+answers 250 K exact-node again) and `healthy_run_dirs_are_left_untouched_by_the_recovery_path`
+(current-format warm start: nothing deleted, log EMPTY, unchanged files NOT re-ingested).
+
+## 6. Tests added (names)
+
+* `crates/wx-ingest/tests/slot_levels.rs` — `differing_level_stacks_across_time_bracket_interpolate_per_slot`
+  (f006 `[1000,900,800,700]` vs f012 `[950,850,800,700]`, analytic field
+  `L*100 + F*10 + (j*10+i)`; expected 87535.5, pre-fix 85660.5 asserted away),
+  `identical_stacks_keep_single_vertical_bracket_metadata`,
+  `exact_level_in_one_slot_bracket_in_the_other`,
+  `masked_plane_in_either_slot_still_returns_missing_data`.
+  PROVEN to be real regression gates: with the pre-fix slot-B semantics re-injected,
+  the first and third FAIL (`pv.value == 87535.5` / `== 85035.5`); with the fix all
+  four pass.
+* `crates/wx-core/tests/slot_independence.rs` — 2 tests (mirror check, above).
+* `crates/wx-server/tests/point_json_brackets.rs` — `point_json_reports_both_brackets_when_stacks_differ`
+  (real axum router over a hand-built snapshot; asserts
+  `"vertical":{"method":"linear","levels":[900,800],"levels_per_time":[[900,800],[950,850]]}`
+  and `"value":87535.5`) and `point_json_omits_levels_per_time_when_brackets_agree`.
+* `crates/wx-ingest/tests/stability_clock.rs` — 4 tests (above).
+* `crates/wx-ingest/tests/grid_upgrade.rs` — 2 tests (above).
+* Modified: `crates/wx-ingest/tests/stability.rs` (bounded sleeping wait),
+  `crates/wx-server/tests/hotpath_full_alloc.rs` (settle loops instead of
+  `r2 == 4` / `r2x == 1`).
+
+## 7. Gate
+
+`cargo test --workspace`: green **117 tests / 48 binaries** (103/43 baseline + 14 new
+across 5 new binaries), executed twice back-to-back with identical results, PLUS
+**10 consecutive runs of `cargo test --test hotpath_full_alloc` at rc=0** (the previously
+flaky binary) after the monotonic-clock change. `cargo clippy --workspace -- -D warnings`:
+rc=0, zero diagnostics (vendored-`bitflags` future-incompat NOTE only; NEVER `-q`).
+`AUDIT_1.1.md` left UNTRACKED and untouched (origin unknown; not trusted, not deleted).

@@ -8,7 +8,7 @@ use wx_ingest::pipeline::Pipeline;
 use wx_ingest::index::{build_context, evaluate_point};
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
-use wx_ingest::state::{join_path, now_ns_marker};
+use wx_ingest::state::{join_path};
 use wx_ingest::discovery::{path_to_str};
 use memmap2::Mmap;
 use std::fs::File;
@@ -17,6 +17,16 @@ use std::fs::create_dir_all;
 use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
+use std::thread;
+use std::time::Duration;
+
+// Bounded, SLEEPING wait helper (V1.2 phase B0): replaces the unbounded busy-spin
+// that could hang the suite when the wall-clock marker stopped advancing.
+#[allow(clippy::needless_return)]
+pub fn thread_sleep_ms(ms: i64) {
+    let d = Duration::from_millis(ms as u64);
+    thread::sleep(d);
+}
 
 fn rm_tree(dir: &str) {
     match read_dir(&dir) {
@@ -134,12 +144,27 @@ fn window_strategy_skips_half_written() {
     let r3 = p.scan_round();
     assert!(r3 == 0);
 
-    // Busy-wait on the marker clock until >1 s has elapsed since round 3.
-    let t0 = now_ns_marker(&p.state.dir_path);
-    let one_s = 1000000000;
-    while now_ns_marker(&p.state.dir_path) - t0 < one_s {
-        // spin: each call re-creates the marker (advances the clock)
+    // Bounded wait on the MONOTONIC clock (V1.2 phase B0): the pre-fix version
+    // spun on the marker-file wall clock with NO deadline and NO sleep, so a
+    // non-advancing clock (File::create failure returns 0, coarse mtime
+    // granularity, backward jump) hung the test FOREVER. Now: sleep between
+    // polls, hard deadline, and an explicit assertion that the deadline was not
+    // hit. The window is measured from the first observation of the COMPLETED
+    // file (recorded inside round 3), so waiting >= window + margin from HERE
+    // guarantees eligibility in round 4.
+    let base = p.clock.elapsed_ns();
+    let one_s = 1000000000i64;
+    let margin = 200000000i64; // 200 ms slack for scheduling jitter
+    let deadline_ms = 10000i64;
+    let mut waited_ms = 0i64;
+    while p.clock.elapsed_ns() - base < one_s + margin {
+        thread_sleep_ms(50);
+        waited_ms += 50;
+        if waited_ms >= deadline_ms {
+            break;
+        }
     }
+    assert!(waited_ms < deadline_ms); // never spins forever
     let r4 = p.scan_round();
     assert!(r4 == 1);
     assert!(p.counters.errors == 0);

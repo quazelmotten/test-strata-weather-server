@@ -7,9 +7,9 @@ use wx_core::grid::{GridDef};
 use crate::grib2::{DecodeStats, decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, GribErr, grid_winds, epoch_secs};
 use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS};
 use serde_json::from_str;
-use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, now_ns_marker, join_path};
-use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str};
-use crate::store::{write_grid_bin, merge_field, write_field, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc};
+use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, join_path};
+use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str, MonoClock};
+use crate::store::{write_grid_bin, merge_field, write_field, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc, le_u32_at, GRID_VERSION};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
 use wx_core::storage::{open_field, MmapField};
 use memmap2::Mmap;
@@ -221,6 +221,9 @@ pub struct Pipeline {
     pub stable_window_ns: i64,
     pub state: StateStore,
     pub stability: StabilityTracker,
+    // V1.2 phase B0: monotonic clock for the stability WINDOW (see
+    // discovery::MonoClock). Wall-clock mtimes stay IDENTITY-ONLY.
+    pub clock: MonoClock,
     pub registry: Vec<RegModel>,
     // Arc-wrapped so milestone 4's HTTP handlers can hold a clone of the SAME
     // ArcSwap while the Pipeline itself lives on the ingest thread.
@@ -560,6 +563,7 @@ impl Pipeline {
             stable_window_ns: (window as i64) * 1000000000,
             state: st.unwrap(),
             stability: StabilityTracker { obs: Vec::<(String, u64, i64, i64)>::new() },
+            clock: MonoClock::new_clock(),
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
             counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0 },
@@ -628,7 +632,30 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
         Some(b) => {
             let gd = decode_grid(&b);
             match gd {
-                Err(_) => { return; }
+                Err(e) => {
+                    // V1.2 phase B0 UPGRADE-TRAP FIX. Pre-change this branch
+                    // returned SILENTLY: a run dir written by an older storage
+                    // format (grid.bin GRID_VERSION 1, before the earth-axes
+                    // addition) was rejected on read, never logged, and NEVER
+                    // rewritten (`store_plane` only writes grid.bin when MISSING),
+                    // while the persistent state still marked the SOURCE files as
+                    // ingested — so `/ready` stayed false FOREVER with no clue.
+                    // Recovery chosen (documented in docs/DECISIONS.md + README
+                    // limitations): LOUD log + DELETE the unusable run dir +
+                    // FORGET this MODEL's ingest records so the NEXT scan round
+                    // re-decodes from source with the CURRENT format. Idempotent
+                    // and correctness-preserving (re-decode is deterministic);
+                    // costs one re-ingest per affected model.
+                    let found_ver = if b.len() >= 12 { le_u32_at(&b, 8) } else { 0 };
+                    p.note(format!("STORAGE-FORMAT RECOVERY: grid.bin in {} cannot be decoded ({}); found grid version {}, current {}; deleting the run dir and forgetting model '{}'s ingest records so its source files are re-decoded on the next scan round",
+                        run_dir, e, found_ver, GRID_VERSION, mdl.name));
+                    p.counters.errors += 1;
+                    delete_tree(&run_dir);
+                    let dropped = p.state.drop_under(&mdl.ingest_dir);
+                    p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
+                    let _ = p.state.save();
+                    return;
+                }
                 Ok(grid) => {
                     let mp = format!("{}/manifest.json", run_dir);
                     let mt = read_text_maybe(&mp);
@@ -870,8 +897,11 @@ fn read_text_maybe(path: &str) -> Option<String> {
 
 impl Pipeline {
     /// One full discovery+ingest pass. Returns files ingested.
+    /// V1.2 phase B0: the stability window is measured on the MONOTONIC clock
+    /// (`self.clock`), so a backward wall-clock jump can no longer make an
+    /// otherwise-stable file ineligible.
     pub fn scan_round(self: &mut Self) -> usize {
-        let now_ns = now_ns_marker(&self.state.dir_path);
+        let now_ns = self.clock.elapsed_ns();
         let mut ingested = 0;
         for mi in 0 .. self.models.len() {
             let mdl = self.models[mi].clone();

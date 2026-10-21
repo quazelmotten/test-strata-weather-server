@@ -527,7 +527,23 @@ fn render_entry(e: QueryEntry) -> String {
                     };
                     let lv0 = fmt_num(vv.levels.0);
                     let lv1 = fmt_num(vv.levels.1);
-                    obj = format!("{0},\"vertical\":{{\"method\":\"{1}\",\"levels\":[{2},{3}]}}", obj, meth, lv0, lv1);
+                    let pair_a = format!("[{0},{1}]", lv0, lv1);
+                    // V1.2 phase B0: the two TIME slots can bracket DIFFERENT
+                    // level pairs (transient during partial ingest). "levels"
+                    // stays the EARLIER slot's pair (spec §7 shape, back-
+                    // compatible); when the pairs differ the vertical object
+                    // ADDITIVELY carries "levels_per_time" holding BOTH pairs
+                    // so the answer is never misleading. Output is byte-identical
+                    // to V1.1 whenever the two stacks agree.
+                    if vv.per_time {
+                        let lb0 = fmt_num(vv.levels_later.0);
+                        let lb1 = fmt_num(vv.levels_later.1);
+                        let pair_b = format!("[{0},{1}]", lb0, lb1);
+                        obj = format!("{0},\"vertical\":{{\"method\":\"{1}\",\"levels\":{2},\"levels_per_time\":[{3},{4}]}}",
+                            obj, meth, pair_a, pair_a, pair_b);
+                    } else {
+                        obj = format!("{0},\"vertical\":{{\"method\":\"{1}\",\"levels\":{2}}}", obj, meth, pair_a);
+                    }
                 }
             }
             match ii.time {
