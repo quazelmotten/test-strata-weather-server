@@ -30,10 +30,27 @@ deps), `wx-ingest`, `wx-server`. Release profile: `lto = "fat"`,
 unwinds (criterion requirement; this cargo ignores `panic` there — documented
 in Cargo.toml).
 
+Startup failures are MACHINE-OBSERVABLE (V1.2 phase C): every failure path exits NON-ZERO
+with a distinct code, so a supervisor or CI smoke script can tell a dead boot from a healthy
+one without reading logs.
+
+| code | meaning |
+|---|---|
+| 0 | served normally (or stopped cleanly) |
+| 1 | config missing / unparsable / invalid (spec §3 loud failure) |
+| 2 | usage error: no `--config` and no `WXPOINT_CONFIG` |
+| 3 | pipeline init failed (state/grid/data-dir problems) |
+| 4 | startup wind-pair preflight rejected the configuration (spec §4.4) |
+| 5 | tokio runtime init failed |
+| 6 | the configured `bind` address could not be bound |
+| 8 | the HTTP server itself returned an error |
+
+
 Gate, as measured in the phase-6 acceptance sweep:
 
-* `cargo test --workspace` → **rc=0, 95 tests passed across 38 test binaries,
-  0 failed** (68.6 s wall).
+* `cargo test --workspace` → **rc=0, 149 tests passed across 58 test binaries (+8 empty
+  lib targets), 0 failed** (54.0 s wall; re-measured after V1.2 phase C, green on three
+  consecutive back-to-back runs).
 * `cargo clippy --workspace -- -D warnings` → **rc=0**, zero lint diagnostics
   (the only stderr line is cargo's future-incompat note about the vendored
   `bitflags` 0.4.0/0.7.0 deps, not a lint). This is the documented gate scope
@@ -49,7 +66,13 @@ Gate, as measured in the phase-6 acceptance sweep:
 ## 2. Configuration
 
 One TOML file (path via `--config` or `WXPOINT_CONFIG`; validated loudly at
-startup — unknown param/level names fail). See `config.example.toml`.
+startup — unknown param/level names fail). See `config.example.toml`. Since V1.2
+phase C, `[server].data_dir` may NOT equal, contain or be contained in any model's
+`ingest_dir`: the two sides would fight (retention deleting trees that may BE the
+source products, atomic renames landing inside the watched tree and being re-ingested),
+so startup fails naming BOTH paths and their normalized forms. Comparison is component-wise
+after normalization (canonicalize when the path exists, else lexical absolutization), so
+`/data-x` is NOT treated as under `/data`, while `./x/data` and `<cwd>/x/data` DO collide.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -196,7 +219,9 @@ product-definition template, unimplemented grid/PDT templates; since V1.2 phase 
 also wind components DROPPED by the pair rule or ORPHANED inside one file; they
 never increment `wxpoint_ingest_errors_total`), `wxpoint_ignored_files_total`
 (V1.2 phase B: candidates whose magic bytes are not `GRIB`, never decoded),
-`wxpoint_quarantined_files_total` (decode failures recorded WITH their content
+`wxpoint_retention_skipped_files_total` (V1.2 phase C: candidates whose SECTION-1 reference
+time made them PROVABLY obsolete — vetoed before decode, never counted as errors, and NO
+state record is written for them), `wxpoint_quarantined_files_total` (decode failures recorded WITH their content
 hash so a corrupt file is not retried every round), `wxpoint_ingest_groups_written_total`
 (the write-once grouping unit — compare it with a message count to see the
 amplification phase B removed), and `wxpoint_ingest_lag_seconds` (newest ingested
@@ -209,8 +234,8 @@ reflects a scan round that is still running.
 ```
 data_dir/
   state/files.json                 # persistent ingest record
-  <model>/<run>/                   # YYYYMMDDHH, +MM when the run minute != 0,
-                                   # +SS when the run second != 0 (10/12/14 chars)
+  <model>/<run>/                   # YYYYMMDDHH, +MM when the run minute OR second
+                                   # != 0, +SS when the run second != 0 (10/12/14 chars)
     grid.bin                       # serialized grid definition
     manifest.json                  # params, levels, fhs, units, stat info + ranges
     <PARAM>/<level_type>/f<FFF>.bin  # e.g. TMP/isobaric/f006.bin
@@ -362,6 +387,23 @@ ONE publish, ONE progress line, and a state upsert+save. A decode failure record
 kind=FAILED with the content hash (so `errors` advances ONCE per new/changed corrupt
 file, not once per round) and a group-write failure leaves the file UNMARKED so the
 next round retries it idempotently. Full rationale + measured numbers: docs/DECISIONS.md.
+
+**Retention-aware skip + state hygiene (V1.2 phase C).** Before the magic-byte precheck,
+each candidate gets a cheap SECTION-1 header PEEK (`peek_ref_times`: framing-only walk,
+sections 2..7 stepped over by their declared lengths). It is VETOED without decoding ONLY
+when the model's registry already holds ≥ `retention_runs` runs AND the file's NEWEST
+reference time is STRICTLY OLDER than the oldest kept run — such a run would be evicted again
+in the SAME round. Equality is NEVER skipped (a partially delivered same-run product must
+still merge). An UNCERTAIN peek falls through to the normal path, never to a skip. Skipped
+files get NO persistent record (the verdict is re-derived per round, so they become ingestible
+again if newer runs vanish); the note and the `wxpoint_retention_skipped_files_total` counter
+are deduped per (path, content-hash). Candidates are ordered NEWEST-RUN-FIRST by a FILENAME
+hint that is ORDERING ONLY — the skip verdict always comes from GRIB section 1.
+State hygiene: `find` is an O(1) derived HashMap (on-disk `state/files.json` format UNCHANGED,
+`kind` included, legacy files without `kind` still load), records whose source file VANISHED
+are pruned once per model per round, stability observations are LRU-bounded
+(`STABILITY_OBS_CAP = 10 000`) and forget vanished paths, and the notify event queue is drained
+ONCE per ROUND so no model starves the others.
 
 Concurrency: read-mostly index published atomically with `arc-swap`; query
 threads take zero locks, ZERO heap allocations anywhere on the lookup path

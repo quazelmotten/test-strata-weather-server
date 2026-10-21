@@ -1685,3 +1685,221 @@ directory, and the CPU win from removing ~4x redundant plane serialization.
 
 `cargo test --workspace` green twice back-to-back (54 binaries, 0 failed), `cargo clippy
 --workspace -- -D warnings` rc=0.
+
+# V1.2 phase C decisions — retention-aware skip, config overlap guard, state hygiene, strict dates, exit codes
+
+Scope: build ON TOP of phases A / B0 / B. Untouched here: slot-index interpolation (B0),
+writer primitives (A), grouping / chunking / poison-quarantine core (B).
+
+## 0. Audit claims verified against current source BEFORE fixing
+
+Line numbers had drifted across phases, so each claim was re-checked in place:
+
+| claim | status | where |
+|---|---|---|
+| `timeparse.parse_iso_z` validated the day as `d < 1 \|\| d > 31`, accepting impossible dates | **TRUE** | `crates/wx-server/src/timeparse.rs` (the shortcut sat inside the nested match, ~line 44) |
+| startup failures printed a message and STILL exited 0 | **TRUE** | `crates/wx-server/src/main.rs`: every failure path fell through to the end of `main` |
+| `run_dir_name` dropped SECONDS when the minute was 0 (`12:00:30` → `2026101912`) | **TRUE** | `crates/wx-ingest/src/pipeline.rs::run_dir_name` keyed `+mm` on MINUTE ALONE |
+
+SURPRISE found while verifying #1: the SAME `da2 > 31` bug existed a SECOND TIME in
+`wx_ingest::store::parse_iso_utc` (manifest statistical ranges). Beyond the literal task
+text, BOTH parsers were fixed against ONE shared rule so they cannot drift again.
+
+## 1. RETENTION-AWARE SKIP BEFORE DECODE — the exact semantics chosen
+
+Decision function `Pipeline::retention_skip_reason(mdl, path, hash) -> Option<String>`,
+called for EVERY ready candidate BEFORE the magic-byte precheck, the rayon decode AND
+any write. It returns `Some(reason)` only when BOTH hold:
+
+1. the model's registry already holds **at least `retention_runs` DISTINCT RUNS**
+   (a registry with room left can always absorb another run — skipping would be wrong), AND
+2. the **NEWEST SECTION-1 REFERENCE TIME declared anywhere in the file** is **STRICTLY
+   OLDER** than the oldest run the registry keeps (`max_epoch < oldest_kept`).
+
+Why that is SAFE rather than merely convenient: ingesting such a file could only ADD
+runs older than everything kept, and `retention_prune` removes runs oldest-first, so the
+new run(s) would be evicted again at the end of the SAME round — observable state is
+IDENTICAL minus a full decode.
+
+Chosen details, all deliberate:
+
+* **Source of truth = the file.** The reference time comes from `grib2.peek_ref_times`,
+  a framing-only walk that interprets ONLY section-1 payloads (sections 2..7 stepped over
+  by their DECLARED byte lengths, so payload pages are never faulted in). Big-endian
+  framing, edition byte must be 2, both terminators accepted — same rules as the decoder.
+* **Multi-run files judged on the NEWEST** reference time (`frac_small.grib2` carries two
+  runs): the conservative end, since one OLD message in a mostly-new product must not make
+  the whole file look obsolete.
+* **STRICT inequality.** Equality means the file belongs to a run that is ALREADY KEPT —
+  the classic partially delivered / re-delivered product (and the `_c3` packing twin used
+  in the tests). Skipping it would DROP the rest of a run the user can already query.
+* **UNCERTAINTY NEVER SKIPS.** Any structural problem (bad magic, bad edition byte,
+  truncated framing, no section 1, unreadable) returns Err and falls through to the NORMAL
+  path, where the magic precheck and the poison quarantine apply exactly as in phase B.
+* **NO persistent record is written** for a skipped file. The verdict is RE-DERIVED every
+  round against the CURRENT registry, so if the newer runs later disappear upstream and
+  the registry empties, the stale file becomes ingestible again instead of being stuck
+  behind a false "already ingested" claim. A `kind=SKIPPED` record would have been the
+  wrong tool: it survives restarts and implies an ingest ATTEMPT that never happened.
+* **Note + counter deduped per `(path, content-hash)`** via the bounded memo
+  `stale_verdicts` (cap `STALE_VERDICT_CAP = 4096`), mirroring the kind=FAILED quarantine
+  rule: a still-stale file costs ONE note and ONE count, and a CONTENT CHANGE re-arms
+  exactly one more of each.
+
+New counters/gauge: `IngestCounters.retention_skipped_files`, `LiveCounters.retention_skipped`
+(+ `bump_retention_skip()`), Prometheus gauge `wxpoint_retention_skipped_files_total`, read as
+`max(legacy store, live mirror)` like every other ingest-side gauge.
+
+## 2. Filename run hint is ORDERING ONLY (never a skip input)
+
+`order_newest_first` sorts each model's ready list NEWEST-HINT-FIRST with a STABLE
+`sort_by` on `filename_run_hint(path)`: scans the BASENAME's digit runs of length ≥ 10 for
+a `YYYYMMDDHH` stamp and returns the max plausible epoch, or 0 (sorts LAST) when absent.
+
+The hint decides only WHICH candidate is consumed FIRST, so a freshly delivered burst fills
+the registry with its newest runs before older candidates are judged — maximizing how many
+stale files the §1 skip can veto WITHOUT ever decoding them. It NEVER decides whether a file
+is skipped. A wrong, misleading or absent hint therefore costs nothing but a little wasted
+decode; because the sort is stable, names without a parseable stamp keep their previous
+sorted-path order and every pre-existing fixture behaves exactly as in phase B.
+
+Both wrong directions are tested (`retention_skip_hint.rs`): a name claiming an OLD run whose
+CONTENT is new is STILL ingested (and its run survives retention), and a name claiming a
+much NEWER run whose CONTENT is old IS skipped — with the note quoting the reference time
+read from the file, never the filename stamp.
+
+## 3. data_dir / ingest_dir OVERLAP GUARD (startup validation)
+
+Ingest WRITES into `<data_dir>/<model>/...` and READS from `<ingest_dir>`. If one CONTAINS
+the other (or they are the same directory spelled two ways), retention can delete run trees
+that may BE the source products, and atomic renames land INSIDE the watched ingest tree where
+the glob matches them again (self-ingestion). Rejected at startup naming BOTH paths, their
+normalized forms and the relation ("same directory" / "data_dir contains the ingest_dir" /
+"ingest_dir contains data_dir").
+
+Normalization: `norm_dir_path` canonicalizes when the path EXISTS (which also resolves symlinks)
+and otherwise ABSOLUTIZES lexically against the process CWD collapsing `.`/`..` — routinely
+needed because `data_dir` does not exist on first boot. Comparison is COMPONENT-WISE
+(`path_parts` + `dir_relation`), never string-prefix, so `/data-x` is NOT "under" `/data`.
+Documented caveat: a symlink pointing at an EXISTING directory is resolved, while a symlink
+whose target does not exist yet is compared lexically; the guard catches configuration
+mistakes, not hostile filesystems.
+
+## 4. STATE HYGIENE — persistent records and stability observations
+
+`StateStore` keeps `recs: Vec<FileRec>` (UNCHANGED serialized order) plus a DERIVED
+`idx: HashMap<String, usize>` rebuilt by `reindex()` after load / upsert / drop_under /
+prune_missing. `find` is now O(1) instead of a linear scan over every file ever ingested
+(`scan_round` calls it once per candidate). **FORMAT COMPATIBILITY: the on-disk
+`state/files.json` is BYTE-COMPATIBLE with V1.1/V1.2-B** — same keys, same order, `kind`
+still emitted, and legacy files without `kind` still load as `REC_OK` (`#[serde(default)]`).
+No migration, no version bump; `FileRec` gained no fields.
+
+`prune_missing(prefix)` forgets records whose SOURCE FILE vanished UNDER that prefix: ONE
+stat per matching record, called ONCE per model per scan round, bounded by that model's
+record count. Records for files that merely FAILED/IGNORED are KEPT while the file exists,
+so pruning never RE-ARMS a quarantined file. Prefix matched on `<dir>/`, so a sibling named
+`ing-archive` is untouched by `ing`.
+
+`StabilityTracker` gained NO FIELDS (existing tests construct it as a literal): the `obs`
+vector doubles as an LRU — `observe` bumps RECENCY by moving the entry to the BACK,
+`trim_obs` enforces `STABILITY_OBS_CAP = 10_000` by evicting from the FRONT, and
+`prune_vanished` (called ONCE per round) drops entries whose file is gone. Eviction only
+restarts a stability WINDOW, which can never change an answer.
+
+## 5. EVENT QUEUE DRAINED ONCE PER ROUND, NOT ONCE PER MODEL
+
+`scan_round` hoists `drain_queue(self.queue.clone())` ABOVE the per-model loop; every model
+filters the SAME drained list through its own glob. Previously the FIRST model consumed
+every queued path and later models always saw an EMPTY queue — their events were silently
+stolen, leaving them dependent on the next periodic scan. Correctness was never broken (the
+directory walk reconciles), which is exactly why no existing test caught it; the new test
+discriminates with a product file placed OUTSIDE the model's ingest dir, visible ONLY through
+an event. Note that a drain CONSUMES the queue, so the test re-enqueues between rounds —
+what a real watcher does during a CREATE+RENAME delivery.
+
+## 6. STRICT CALENDAR DATES, ONE SHARED RULE
+
+New helpers in `wx-core/src/tables.rs`: `DAYS_IN_MONTH`, `is_leap_year` (proleptic Gregorian:
+÷4, except centuries unless ÷400), `days_in_month`, `valid_civil_date`. Consumed by BOTH
+`wx_server::timeparse::parse_iso_z` (impossible date → `None` → HTTP 400 `bad_time`) and
+`wx_ingest::store::parse_iso_utc` (a hand-edited manifest cannot smuggle `2026-02-31` into a
+statistical range). The Hinnant day formula CARRIES overflow, so the pre-fix behaviour silently
+shifted the query/range by DAYS instead of failing. Feb 29 valid in 2024 and 2000, rejected in
+2026 and 2100; Feb 30/31 and Apr/Jun/Sep/Nov 31 always rejected; Dec 31 always fine.
+
+## 7. EXIT CODES ARE MACHINE-OBSERVABLE
+
+| code | meaning |
+|---|---|
+| 0 | served normally (or stopped cleanly) |
+| 1 | config missing / unparsable / invalid (spec §3 loud failure) |
+| 2 | usage error: no `--config` and no `WXPOINT_CONFIG` |
+| 3 | pipeline init failed (state/grid/data-dir problems) |
+| 4 | startup wind-pair preflight rejected the configuration (spec §4.4) |
+| 5 | tokio runtime init failed |
+| 6 | the configured `bind` address could not be bound |
+| 8 | the HTTP server itself returned an error |
+
+Distinct codes rather than "at least 1": an operator can fix a bad config WITHOUT reading
+logs, and smoke/CI harnesses can gate on them. `start_pipeline` now returns `i64` and `main`
+calls `std::process::exit`. Covered by `crates/wx-server/tests/exit_codes.rs`, which SPAWNS
+the built binary (via `CARGO_BIN_EXE_wxpoint`, falling back to the debug output path) using
+an `extern "C"` `system` binding and reads the captured rc back from a file.
+
+## 8. `run_dir_name` made TOTAL and INVERTIBLE
+
+Base `YYYYMMDDHH`; `+mm` whenever minute OR second is non-zero; `+ss` whenever the second is
+non-zero → canonical lengths 10 / 12 / 14, which is what makes the length rule UNAMBIGUOUS
+and lets `parse_run_dir` recover the exact instant. Pre-existing 10-char directories parse
+exactly as before (minute/second default 0), and runs differing only in minutes or seconds
+can never COLLIDE into one directory.
+
+## 9. Tests added (names)
+
+| file | test |
+|---|---|
+| `wx-ingest/tests/retention_skip_stale.rs` | `stale_run_arriving_late_is_skipped_without_decode_or_write` (zero renames/bytes, counter bumped ONCE, note counted, NO state record, dedup across rounds, newer run still ingests) |
+| `wx-ingest/tests/retention_skip_peekfail.rs` | `unpeekable_header_falls_through_to_the_normal_quarantine_path` |
+| `wx-ingest/tests/retention_skip_hint.rs` | `hint_says_old_run_content_is_new_run_so_it_is_still_ingested`, `hint_says_new_run_content_is_old_run_so_it_is_skipped` |
+| `wx-ingest/tests/retention_skip_same_run.rs` | `same_run_second_file_is_never_skipped_and_merges_into_the_kept_run` |
+| `wx-ingest/tests/state_hygiene.rs` | `find_uses_the_derived_index_and_stays_correct_across_structural_changes`, `prune_missing_forgets_only_records_whose_source_actually_vanished`, `state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy` |
+| `wx-ingest/tests/stability_hygiene.rs` | `vanished_paths_are_forgotten_while_surviving_windows_keep_their_state`, `remembered_observations_are_bounded_and_evict_least_recently_seen_first` |
+| `wx-ingest/tests/config_overlap.rs` | 5 tests: identical dirs, store-inside-delivery, delivery-inside-store, relative-vs-absolute collision (+`..` walk), sibling name-prefix accepted |
+| `wx-ingest/tests/run_dir_roundtrip.rs` | `every_minute_and_second_instant_round_trips_through_its_directory_name` (40×4×4×5 instants, no collisions), `seconds_survive_a_boot_and_the_hour_only_name_stays_back_compatible` |
+| `wx-ingest/tests/strict_dates_store.rs` | `february_29_is_accepted_only_in_a_real_leap_year`, `impossible_days_are_rejected_instead_of_rolling_over_into_the_next_month` |
+| `wx-ingest/tests/queue_drain_fairness.rs` | `queued_events_reach_every_model_in_the_same_round_not_just_the_first_one` |
+| `wx-server/tests/strict_dates.rs` | `the_parser_validates_days_against_the_real_calendar_including_leap_years`, `an_impossible_date_answers_400_bad_time_instead_of_answering_wrong_data` |
+| `wx-server/tests/exit_codes.rs` | 4 tests: usage rc=2, missing config rc=1, overlap guard rc=1 (+ message names both paths), unknown param rc=1 |
+
+## 10. Surprises / deviations worth remembering
+
+* The date bug existed TWICE (HTTP parser AND manifest parser); fixing only the audited one
+  would have left the same class of silent day-shift reachable.
+* The queue-drain bug was LATENCY-ONLY because the periodic walk reconciles, so it had no
+  observable data effect — a fairness test needed an out-of-tree product to discriminate at
+  all. Re-enqueuing between rounds is REQUIRED in that test because a drain CONSUMES the queue.
+* `state.save()` uses plain `std::fs::rename` (NOT the instrumented writer), so a retention-skip
+  round shows ZERO storage-counter renames — which is exactly what makes the "nothing at all
+  was written" assertion meaningful rather than trivially true.
+* Skipped files STAY in the ingest dir and are re-peeked every round (a handful of bytes per
+  section). That is intentional: cheap, self-healing, and it keeps the verdict honest if the
+  registry later shrinks.
+* Dialect friction while writing tests: this toolchain does NOT coerce `String` → `&str` at
+  call sites (helpers taking `&str` must be called with `&x` / `.as_str()`), string literals
+  need `.to_string()` where a `String` is required, `Type.method()` needs `Type::method`,
+  slice temporaries must be borrowed (`let c = &s[a..b]` or compare inline), and mutex guards
+  must be scoped so a later `scan_round()` cannot deadlock on the same lock.
+* `patch_day` (12-byte sec1 pattern, day byte at offset 10, 39 hits in `gfs_small.grib2`) is
+  reused to synthesize extra runs; the hint tests use NAMES carrying explicit `YYYYMMDDHH`
+  stamps so the two directions of the lie are unambiguous.
+
+## Gate
+
+`cargo test --workspace` green twice back-to-back (**rc=0, 149 tests passed across 58
+test binaries + 8 empty lib targets, 0 failed**, 54.0 s wall — a third consecutive run was
+also green), `cargo clippy --workspace -- -D warnings` **rc=0** (gate scope: workspace
+lib+bin targets; the only stderr line is cargo's future-incompat note about the vendored
+`bitflags` deps). Three new lints had to be satisfied in phase-C source itself
+(`manual_range_contains` ×2 in `wx-core::tables`, `comparison_to_empty` ×2 in
+`wx-ingest::config`, `needless_return` in `main.rs`) — fixed rather than allowed.

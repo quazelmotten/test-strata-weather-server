@@ -10,6 +10,7 @@
 use serde_json::from_str;
 use memmap2::Mmap;
 use wx_core::storage::{fsync_path};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -57,6 +58,14 @@ pub struct StateStore {
     pub dir_path: String, // <data_dir>/state
     pub file_path: String, // <data_dir>/state/files.json
     pub recs: Vec<FileRec>,
+    /// V1.2 phase C STATE HYGIENE: path -> position in `recs`, so [`StateStore.find`]
+    /// is O(1) instead of a linear scan over every file ever ingested (a busy
+    /// ingest dir can hold tens of thousands of records, and `scan_round` calls
+    /// `find` once per candidate). `recs` stays the SERIALIZED ORDER and the
+    /// on-disk format is UNCHANGED (`save()` still walks `recs`, `kind` included);
+    /// `idx` is derived state, rebuilt by `reindex()` after every structural
+    /// change (load / upsert / drop_under / prune_missing).
+    pub idx: HashMap<String, usize>,
 }
 
 impl StateStore {
@@ -67,9 +76,10 @@ impl StateStore {
             dir_path: state_dir,
             file_path: file.to_string(),
             recs: Vec::<FileRec>::new(),
+            idx: HashMap::<String, usize>::new(),
         };
         match read_to_string(&file) {
-            Err(_) => { return Ok(st); }
+            Err(_) => { st.reindex(); return Ok(st); }
             Ok(text) => {
                 match from_str::<StateDoc>(&text) {
                     Err(e) => { return Err(format!("bad state file {}: {}", file, e)); }
@@ -77,6 +87,7 @@ impl StateStore {
                         for r in &doc.recs {
                             st.recs.push(r.clone());
                         }
+                        st.reindex();
                         return Ok(st);
                     }
                 }
@@ -84,25 +95,47 @@ impl StateStore {
         }
     }
 
+    /// Rebuild the path index from `recs` (last write wins for duplicate paths,
+    /// which `upsert` never creates but a hand-edited state file might).
+    pub fn reindex(self: &mut Self) {
+        self.idx = HashMap::<String, usize>::new();
+        for k in 0 .. self.recs.len() {
+            self.idx.insert(self.recs[k].path.to_string(), k);
+        }
+    }
+
+    /// Look up the record for one source path. O(1) since V1.2 phase C (was a
+    /// linear scan over every record); semantics identical.
     pub fn find(self: &Self, path: String) -> Option<FileRec> {
-        for r in &self.recs {
-            if r.path == path {
-                return Some(r.clone());
+        let pos = self.idx.get(&path);
+        match pos {
+            None => { return None; }
+            Some(pi) => {
+                let at = *pi;
+                if at >= self.recs.len() {
+                    return None; // defensive: index must never outrun `recs`
+                }
+                return Some(self.recs[at].clone());
             }
         }
-        return None;
     }
 
     pub fn upsert(self: &mut Self, rec: FileRec) {
-        for r in &mut self.recs {
-            if r.path == rec.path {
-                r.size = rec.size;
-                r.mtime_ns = rec.mtime_ns;
-                r.hash = rec.hash;
-                r.kind = rec.kind;
-                return;
+        let pos = self.idx.get(&rec.path);
+        match pos {
+            Some(pi) => {
+                let at = *pi;
+                if at < self.recs.len() {
+                    self.recs[at].size = rec.size;
+                    self.recs[at].mtime_ns = rec.mtime_ns;
+                    self.recs[at].hash = rec.hash;
+                    self.recs[at].kind = rec.kind;
+                    return;
+                }
             }
+            None => {}
         }
+        self.idx.insert(rec.path.to_string(), self.recs.len());
         self.recs.push(rec);
     }
 
@@ -114,17 +147,52 @@ impl StateStore {
     /// forever and the model would stay EMPTY. Matching is on `<prefix>/` so a
     /// sibling directory whose name merely STARTS with the prefix is untouched.
     pub fn drop_under(self: &mut Self, prefix: &str) -> usize {
-        let needle = format!("{0}/", prefix);
         let mut kept: Vec<FileRec> = Vec::<FileRec>::new();
         let mut n = 0usize;
         for r in &self.recs {
-            if r.path.len() >= needle.len() && r.path[0 .. needle.len()] == *needle.as_str() {
+            if under_prefix(&r.path, prefix) {
                 n += 1;
                 continue;
             }
             kept.push(r.clone());
         }
-        self.recs = kept;
+        if n > 0 {
+            self.recs = kept;
+            self.reindex();
+        }
+        return n;
+    }
+
+    /// V1.2 phase C STATE HYGIENE: forget records whose SOURCE FILE no longer
+    /// exists under `prefix` (upstream deleted a product after ingest). Without
+    /// this the record list grows monotonically forever: every ingested file of
+    /// every run keeps a row, and a retention-pruned run whose tree AND sources
+    /// are gone still costs memory plus a `find` hit per stale candidate name.
+    /// BOUNDED by construction: ONE stat() per record located under `prefix`,
+    /// called ONCE per model per scan round (`pipeline::scan_round`), and only
+    /// records matching that model's ingest dir are touched. Returns the number
+    /// of records dropped; the caller logs it. Records for files that merely
+    /// FAILED/IGNORED are KEPT (their existence is what makes the quarantine
+    /// stick), so this never re-arms a poisoned file.
+    pub fn prune_missing(self: &mut Self, prefix: &str) -> usize {
+        let mut kept: Vec<FileRec> = Vec::<FileRec>::new();
+        let mut n = 0usize;
+        for r in &self.recs {
+            if under_prefix(&r.path, prefix) {
+                match stat_size_mtime(&r.path) {
+                    Err(_) => {
+                        n += 1;
+                        continue;
+                    }
+                    Ok(_) => {}
+                }
+            }
+            kept.push(r.clone());
+        }
+        if n > 0 {
+            self.recs = kept;
+            self.reindex();
+        }
         return n;
     }
 
@@ -149,6 +217,17 @@ pub fn join_path(dir: &str, name: &str) -> String {
         return format!("/{}", name);
     }
     return format!("{}/{}", dir, name);
+}
+
+/// True when `path` lies UNDER `dir` (matched on `<dir>/`, so a sibling whose
+/// name merely STARTS with the prefix does not match — the same rule phase B0
+/// used inside `drop_under`).
+fn under_prefix(path: &str, dir: &str) -> bool {
+    let needle = format!("{0}/", dir);
+    if path.len() < needle.len() {
+        return false;
+    }
+    return path[0 .. needle.len()] == *needle.as_str();
 }
 
 /// FNV-1a 64 over the head/tail windows of a whole-file buffer.

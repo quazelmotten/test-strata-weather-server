@@ -147,32 +147,90 @@ impl MonoClock {
 #[derive(Clone, Debug)]
 pub struct StabilityTracker {
     // (path, size, mtime_ns, first_observed_MONOTONIC_ns)
+    // V1.2 phase C: the vector doubles as an LRU — an entry is MOVED TO THE
+    // BACK whenever its path is observed, so the FRONT holds the paths that
+    // have gone quiet longest (vanished files, names that stopped matching the
+    // glob). [`prune_vanished`] drops entries whose file is gone; [`observe`]
+    // enforces [`STABILITY_OBS_CAP`] by evicting from the front.
     pub obs: Vec<(String, u64, i64, i64)>,
 }
+
+/// Generous upper bound on remembered stability observations (V1.2 phase C
+/// state hygiene). One entry per candidate FILE, so 10 000 covers any realistic
+/// single-model ingest dir many times over; eviction only costs a re-observation
+/// round for an evicted path (its window restarts), NEVER a wrong answer.
+pub const STABILITY_OBS_CAP: usize = 10_000;
 
 impl StabilityTracker {
     /// Window strategy: eligible once (size,mtime) has been continuously
     /// observed unchanged for `window_ns` of MONOTONIC time. Re-observed changed
     /// stat resets the observation stamp. `now_ns` MUST come from
     /// [`MonoClock::elapsed_ns`] (wall-clock stamps are identity-only).
+    /// Every observation also bumps the path's RECENCY (see the LRU note on
+    /// [`StabilityTracker`]) and enforces [`STABILITY_OBS_CAP`].
     pub fn observe(self: &mut Self, path: String, size: u64, mtime_ns: i64,
                    now_ns: i64, window_ns: i64) -> bool {
-        for o in &mut self.obs {
-            if o.0 == path {
-                if o.1 != size || o.2 != mtime_ns {
-                    o.1 = size;
-                    o.2 = mtime_ns;
-                    o.3 = now_ns;
-                    return false;
-                }
-                if now_ns - o.3 >= window_ns {
-                    return true;
-                }
-                return false;
+        let mut hit: i64 = -1;
+        for k in 0 .. self.obs.len() {
+            if self.obs[k].0 == path {
+                hit = k as i64;
+                break;
             }
         }
-        self.obs.push((path, size, mtime_ns, now_ns));
-        return false;
+        if hit < 0 {
+            self.obs.push((path, size, mtime_ns, now_ns));
+            self.trim_obs();
+            return false;
+        }
+        let ki = hit as usize;
+        let o = self.obs[ki].clone();
+        if o.1 != size || o.2 != mtime_ns {
+            // IDENTITY CHANGED (a re-delivery): reset the stamp, stay INELIGIBLE.
+            self.obs[ki] = (path, size, mtime_ns, now_ns);
+            self.bump_recency(ki);
+            return false;
+        }
+        let eligible = now_ns - o.3 >= window_ns;
+        self.bump_recency(ki);
+        return eligible;
+    }
+
+    /// Move one entry to the back of the LRU (recency bump).
+    fn bump_recency(self: &mut Self, ki: usize) {
+        if ki + 1 == self.obs.len() {
+            return; // already the most recent
+        }
+        let e = self.obs.remove(ki);
+        self.obs.push(e);
+    }
+
+    /// Enforce [`STABILITY_OBS_CAP`] by evicting the LEAST recently observed
+    /// paths (front of the vector).
+    pub fn trim_obs(self: &mut Self) {
+        while self.obs.len() > STABILITY_OBS_CAP {
+            let _e = self.obs.remove(0);
+        }
+    }
+
+    /// V1.2 phase C STATE HYGIENE: drop observations whose FILE no longer exists
+    /// (deleted upstream, or renamed away mid-delivery). BOUNDED: ONE stat() per
+    /// remembered path, called ONCE per scan round by `pipeline::scan_round`;
+    /// returns the number dropped so the caller can log it. A still-present file
+    /// keeps its window state untouched, so this can never shorten a window.
+    pub fn prune_vanished(self: &mut Self) -> usize {
+        use std::fs::metadata;
+        let mut kept: Vec<(String, u64, i64, i64)> = Vec::<(String, u64, i64, i64)>::new();
+        let mut n = 0usize;
+        for o in &self.obs {
+            match metadata(&o.0) {
+                Err(_) => { n += 1; }
+                Ok(_) => { kept.push(o.clone()); }
+            }
+        }
+        if n > 0 {
+            self.obs = kept;
+        }
+        return n;
     }
 
     /// Sidecar strategy: `<path><suffix>` exists => eligible immediately.

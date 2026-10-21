@@ -4,7 +4,7 @@
 //! reconcile with a full recursive scan (authoritative on network mounts).
 
 use wx_core::grid::{GridDef};
-use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs};
+use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times};
 use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES};
 use serde_json::from_str;
 use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, join_path};
@@ -16,6 +16,7 @@ use memmap2::Mmap;
 use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -225,6 +226,14 @@ pub struct IngestCounters {
     /// Field files written (the write-once grouping unit; compare with a
     /// message count to see the amplification removed by phase B).
     pub groups_written: u64,
+    /// V1.2 phase C RETENTION-AWARE SKIP: candidate FILES whose SECTION-1
+    /// reference time is STRICTLY OLDER than the oldest run the registry keeps
+    /// while the registry is ALREADY FULL (`runs >= retention_runs`), so
+    /// ingesting them could only produce a run retention would evict again
+    /// IMMEDIATELY. Such a file is NEVER DECODED. Counted ONCE per
+    /// (path,content-hash) verdict — like the quarantine counters, never once
+    /// per scan round — and NEVER added to `errors`.
+    pub retention_skipped_files: u64,
 }
 
 /// Live mirror of the ingest counters (V1.2 phase B). The pipeline updates this
@@ -240,6 +249,7 @@ pub struct LiveCounters {
     pub ignored_files: AtomicU64,
     pub quarantined_files: AtomicU64,
     pub groups_written: AtomicU64,
+    pub retention_skipped: AtomicU64,
     pub last_mtime_ns: AtomicI64,
     /// Bumped once per consumed file; the printer side compares it against the
     /// last value it saw to decide whether a fresh progress line exists.
@@ -258,6 +268,7 @@ impl LiveCounters {
             ignored_files: AtomicU64::new(0),
             quarantined_files: AtomicU64::new(0),
             groups_written: AtomicU64::new(0),
+            retention_skipped: AtomicU64::new(0),
             last_mtime_ns: AtomicI64::new(0),
             progress_seq: AtomicU64::new(0),
             last_msg: Mutex::<String>::new("".to_string()),
@@ -281,6 +292,13 @@ impl LiveCounters {
         if ns > cur {
             self.last_mtime_ns.store(ns, Ordering::Relaxed);
         }
+    }
+
+    /// One retention-aware skip happened (V1.2 phase C). Separate from
+    /// [`add`] because the pipeline counts it ONCE per (path,content-hash)
+    /// verdict, not as part of a consumed-file delta.
+    pub fn bump_retention_skip(self: &Self) {
+        let _a = self.retention_skipped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Monotone merge of ABSOLUTE values (used by `QueryStats.set_ingest`, which
@@ -326,6 +344,7 @@ impl LiveCounters {
             ignored_files: self.ignored_files.load(Ordering::Relaxed),
             quarantined_files: self.quarantined_files.load(Ordering::Relaxed),
             groups_written: self.groups_written.load(Ordering::Relaxed),
+            retention_skipped_files: self.retention_skipped.load(Ordering::Relaxed),
         };
     }
 }
@@ -352,6 +371,12 @@ pub struct Pipeline {
     // Live per-FILE mirror shared with the HTTP side (phase B).
     pub live: Arc<LiveCounters>,
     pub wind_violation: bool,
+    // V1.2 phase C: bounded memo of retention-skip VERDICTS already noted/counted
+    // ((path, content hash)). A stale file stays in the ingest dir and is re-peeked
+    // every round — cheap by design — but must not spam the log or inflate the
+    // counter once per round. A CONTENT CHANGE produces a new hash, re-arms exactly
+    // ONE note plus ONE count, mirroring the kind=FAILED quarantine rule.
+    pub stale_verdicts: Vec<(String, String)>,
     pub queue: WatchQueue,
     pub watchers: Vec<RecommendedWatcher>,
     pub pool: ThreadPool,
@@ -387,6 +412,125 @@ impl Pipeline {
 // ---------------------------------------------------------------------------
 // naming helpers
 // ---------------------------------------------------------------------------
+
+/// Bounded memo of retention-skip VERDICTS already noted/counted (§4.6 skip
+/// path). Sized generously: one entry per (file,content hash) whose staleness
+/// was judged, so ordinary churn never evicts anything.
+pub const STALE_VERDICT_CAP: usize = 4096;
+
+/// FILENAME-DERIVED RUN-TIME HINT — AN ORDERING HEURISTIC, NOTHING MORE.
+/// Scans the BASENAME for digit runs of at least 10 characters and reads the
+/// leading `YYYYMMDDHH` of each (covers `gfs.t2026101912z...`,
+/// `hrrr.t2026101912.wrf...f006`, `20261019/12`-style names too because every
+/// run of digits in the basename is tried). Returns the MAXIMUM plausible epoch
+/// found, or 0 when the name carries no timestamp (hint 0 sorts LAST).
+///
+/// THE HINT NEVER DRIVES A SKIP OR A VALUE. The retention decision is taken
+/// from the SECTION-1 REFERENCE TIME read out of the FILE (`peek_ref_times`),
+/// per spec §4.2 ("never trust filenames for metadata"); this hint only decides
+/// which candidate is consumed first so that the registry is as FULL and as NEW
+/// as possible when the older candidates are judged. A misleading filename
+/// therefore changes performance, never correctness — see the ordering-hint test.
+pub fn filename_run_hint(path: String) -> i64 {
+    let bn = base_name(path.to_string()).to_string();
+    let mut best: i64 = 0;
+    let n = bn.len();
+    let mut k: usize = 0;
+    while k < n {
+        // START of a digit run?
+        match digit_at(&bn, k) {
+            None => { k += 1; continue; }
+            Some(_) => {}
+        }
+        let start = k;
+        let mut end = k;
+        while end < n {
+            match digit_at(&bn, end) {
+                None => { break; }
+                Some(_) => { end += 1; }
+            }
+        }
+        if end - start >= 10 {
+            let ep = hint_epoch_at(&bn, start);
+            match ep {
+                None => {}
+                Some(ev) => {
+                    if ev > best {
+                        best = ev;
+                    }
+                }
+            }
+        }
+        k = end;
+    }
+    return best;
+}
+
+/// One `YYYYMMDDHH` slot of a digit run as an epoch, None when the fields are
+/// not a plausible UTC timestamp.
+fn hint_epoch_at(bn: &str, start: usize) -> Option<i64> {
+    let y = parse_num(bn, start, 4);
+    let mo = parse_num(bn, start + 4, 2);
+    let da = parse_num(bn, start + 6, 2);
+    let hr = parse_num(bn, start + 8, 2);
+    match y {
+        None => { return None; }
+        Some(yv) => {
+            match mo {
+                None => { return None; }
+                Some(mov) => {
+                    if mov < 1 || mov > 12 {
+                        return None;
+                    }
+                    match da {
+                        None => { return None; }
+                        Some(dav) => {
+                            if dav < 1 || dav > 31 {
+                                return None;
+                            }
+                            match hr {
+                                None => { return None; }
+                                Some(hrv) => {
+                                    if hrv > 23 {
+                                        return None;
+                                    }
+                                    return Some(epoch_secs(yv as u16, mov as u8, dav as u8, hrv as u8, 0, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sort ONE model's ready list NEWEST-RUN-FIRST by [`filename_run_hint`]
+/// (descending), STABLY: equal hints — including "no hint at all" (0) — keep the
+/// sorted-path order they had, so pre-existing fixtures and tests consume files
+/// in exactly the same sequence as before this change. ORDERING ONLY; see the
+/// call site and [`filename_run_hint`] for why correctness is unaffected.
+pub fn order_newest_first(ready: Vec<(String, u64, i64, String)>) -> Vec<(String, u64, i64, String)> {
+    let mut keyed: Vec<(i64, String, u64, i64, String)> = Vec::<(i64, String, u64, i64, String)>::new();
+    for r in &ready {
+        keyed.push((filename_run_hint(r.0.to_string()), r.0.to_string(), r.1, r.2, r.3.to_string()));
+    }
+    keyed.sort_by(|a, b| {
+        if a.0 > b.0 {
+            return CmpOrdering::Less; // DESCENDING: bigger hint first
+        }
+        if a.0 < b.0 {
+            return CmpOrdering::Greater;
+        }
+        return CmpOrdering::Equal;
+    });
+    let mut out: Vec<(String, u64, i64, String)> = Vec::<(String, u64, i64, String)>::new();
+    for kv in &keyed {
+        out.push((kv.1.to_string(), kv.2, kv.3, kv.4.to_string()));
+    }
+    return out;
+}
+
 
 pub fn level_dir_name(code: u8) -> String {
     let cn = canonical_level_name(code);
@@ -435,12 +579,25 @@ pub fn pad_num(v: i64, w: usize) -> String {
     return format!("{0}{1}", zeros, s);
 }
 
-/// Run-directory name. Base is the classic `YYYYMMDDHH`; when the run MINUTE
-/// is non-zero `mm` is appended, and when the run SECOND is also non-zero
-/// `ss` after that (so 10/12/14-char names, disambiguated by length). This
-/// removes the collision where two runs 12Z and 12:30Z on one day both mapped
-/// to `2026101912` (V1.1 phase 3 bug (a)). Pre-existing 10-char directories
-/// keep parsing exactly as before: minute/second default to 0.
+/// Run-directory name — A TOTAL FUNCTION of the run time, and INVERTIBLE.
+/// Base is the classic `YYYYMMDDHH`; `mm` is appended whenever the run MINUTE
+/// OR the run SECOND is non-zero, and `ss` whenever the SECOND is non-zero, so
+/// the three canonical lengths are 10 / 12 / 14 and [`parse_run_dir`] recovers
+/// the exact instant from the name alone:
+///
+///   12:00:00 -> `2026101912`      (10, unchanged from V1.1: back compatible)
+///   12:30:00 -> `202610191230`    (12)
+///   12:00:30 -> `20261019120030`  (14)  ← was DROPPED to `2026101912` before
+///   12:30:15 -> `20261019123015`  (14)
+///
+/// The pre-fix rule keyed on MINUTE ALONE, so a run at 12:00:30 named
+/// `2026101912` and its SECONDS silently became 12:00:00 on the next warm boot
+/// (a 30-second shift of every forecast-hour offset in that run). With `+mm`
+/// driven by `m != 0 || s != 0`, `HHmmss` is ALWAYS present when any sub-hour
+/// component is, which is what makes the 10/12/14 length rule unambiguous.
+/// Pre-existing 10-char directories keep parsing exactly as before (minute and
+/// second default to 0), and two runs that differ ONLY in minutes or seconds
+/// can never COLLIDE into one directory.
 pub fn run_dir_name(rt: RunTime) -> String {
     let a = pad_num(rt.year as i64, 4);
     let b = pad_num(rt.month as i64, 2);
@@ -449,7 +606,7 @@ pub fn run_dir_name(rt: RunTime) -> String {
     let ab = format!("{0}{1}", a, b);
     let cd = format!("{0}{1}", c, d);
     let base = format!("{0}{1}", ab, cd);
-    if rt.minute != 0 {
+    if rt.minute != 0 || rt.second != 0 {
         let mm = pad_num(rt.minute as i64, 2);
         let with_mm = format!("{0}{1}", base, mm);
         if rt.second != 0 {
@@ -710,9 +867,10 @@ impl Pipeline {
             clock: MonoClock::new_clock(),
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
-            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0 },
+            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0 },
             live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
+            stale_verdicts: Vec::<(String, String)>::new(),
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
             pool: pool.unwrap(),
@@ -1045,14 +1203,30 @@ impl Pipeline {
     /// V1.2 phase B0: the stability window is measured on the MONOTONIC clock
     /// (`self.clock`), so a backward wall-clock jump can no longer make an
     /// otherwise-stable file ineligible.
+    /// V1.2 phase C additions: the notify queue is drained ONCE PER ROUND into
+    /// per-model buckets (draining inside the model loop let the FIRST model
+    /// consume every event, so later models' event latency waited for the NEXT
+    /// round); stale candidates are skipped BEFORE decode; and both the persistent
+    /// record list and the stability tracker are PRUNED of vanished files.
     pub fn scan_round(self: &mut Self) -> usize {
         let now_ns = self.clock.elapsed_ns();
         let mut ingested = 0;
+        // ---- EVENT QUEUE: drained ONCE for the WHOLE ROUND ------------------
+        let evs_all = drain_queue(self.queue.clone());
+        // ---- STABILITY TRACKER HYGIENE (bounded: one stat per remembered path)
+        let vanished = self.stability.prune_vanished();
+        if vanished > 0 {
+            self.note(format!("stability tracker: forgot {} vanished file(s)", vanished));
+        }
         for mi in 0 .. self.models.len() {
             let mdl = self.models[mi].clone();
+            // ---- PERSISTENT RECORD HYGIENE (bounded by this model's record count)
+            let pruned = self.state.prune_missing(&mdl.ingest_dir);
+            if pruned > 0 {
+                self.note(format!("state: dropped {} ingest record(s) whose source file vanished under {}", pruned, mdl.ingest_dir));
+            }
             let mut cands: Vec<String> = Vec::<String>::new();
-            let evs = drain_queue(self.queue.clone());
-            for e in &evs {
+            for e in &evs_all {
                 if glob_match(&mdl.file_glob, base_name(e.to_string()).as_str()) {
                     cands.push(e.to_string());
                 }
@@ -1098,6 +1272,19 @@ impl Pipeline {
             if ready.is_empty() {
                 continue;
             }
+            // ---- CANDIDATE ORDERING: NEWEST RUN FIRST, HINT ONLY -------------
+            // The sort key is a run time read OUT OF THE FILENAME, and it is a
+            // HEURISTIC FOR ORDERING ONLY: it decides which candidate is
+            // CONSUMED FIRST so a freshly delivered burst fills the registry with
+            // its NEWEST runs before older candidates are judged against them
+            // (maximizing how many stale files the §4.6 skip below can veto
+            // WITHOUT ever decoding them). It NEVER decides whether a file is
+            // skipped: that verdict comes SOLELY from the SECTION-1 peek
+            // (`peek_ref_times`). A wrong, misleading or absent hint therefore
+            // costs nothing but a little wasted decode; `sort_by` is STABLE, so
+            // names without a parseable stamp keep their sorted-path order and
+            // every pre-existing fixture behaves exactly as in phase B.
+            ready = order_newest_first(ready);
             let mut triples: Vec<(u8, u8, u8)> = Vec::<(u8, u8, u8)>::new();
             for rp in &mdl.params {
                 triples.push((rp.disc, rp.cat, rp.num));
@@ -1128,6 +1315,22 @@ impl Pipeline {
                     let rsize = ready[cj].1;
                     let rmtime = ready[cj].2;
                     let rhash = ready[cj].3.to_string();
+                    // ---- RETENTION-AWARE SKIP BEFORE DECODE (spec §4.6) -----
+                    // Proven entirely-obsolete candidates are vetoed HERE, i.e.
+                    // BEFORE the magic-byte precheck, the rayon decode AND any
+                    // write. See `retention_skip_reason` for the exact rule
+                    // (registry FULL + SECTION-1 reference time STRICTLY OLDER
+                    // than the oldest kept run) and why an uncertain peek always
+                    // falls through to the normal path.
+                    let stale = self.retention_skip_reason(&mdl, rpath.clone(), rhash.clone());
+                    match stale {
+                        Some(reason) => {
+                            self.progress(format!("skipped {0}: {1}", rpath, reason));
+                            cj += 1;
+                            continue;
+                        }
+                        None => {}
+                    }
                     let hg = head_is_grib(&rpath);
                     let isg = match hg {
                         Err(e) => {
@@ -1260,6 +1463,98 @@ impl Pipeline {
     pub fn publish(self: &Self) {
         let snap = build_snapshot(&self.registry);
         self.shared.store.swap(Arc::new(snap));
+    }
+
+    /// V1.2 phase C — RETENTION-AWARE SKIP DECISION (spec §4.6 efficiency, gated
+    /// by §4.2 "never trust filenames"). Returns `Some(reason)` when this candidate
+    /// may be vetoed WITHOUT being decoded, `None` when the normal path must run.
+    ///
+    /// THE RULE, exactly:
+    ///   * the model's registry holds AT LEAST `retention_runs` DISTINCT RUNS
+    ///     (a registry with room left can always absorb another run: skipping
+    ///     would be wrong), AND
+    ///   * the NEWEST SECTION-1 REFERENCE TIME declared anywhere in the file is
+    ///     STRICTLY OLDER than the OLDEST run the registry keeps.
+    ///
+    /// WHY THAT IS SAFE (not just convenient): ingesting such a file could only
+    /// ADD runs older than everything kept, and `retention_prune` removes runs
+    /// oldest-first, so the new run(s) would be evicted again at the end of the
+    /// SAME round — the observable state is IDENTICAL, minus a full decode.
+    ///
+    /// STRICTNESS MATTERS: equality means the file belongs to a run that is ALREADY
+    /// KEPT, e.g. a partially delivered same-run product, so it is NEVER skipped.
+    /// A file carrying SEVERAL runs (`frac_small.grib2`) is judged on its NEWEST
+    /// reference time, which is the conservative end.
+    ///
+    /// UNCERTAINTY NEVER SKIPS: if the header peek fails for ANY structural
+    /// reason (bad magic, bad edition byte, truncated framing, no section 1,
+    /// unreadable) the candidate falls through to the normal path, where the
+    /// magic-byte precheck and the poison quarantine apply exactly as before.
+    ///
+    /// NO STATE RECORD IS WRITTEN for a skipped file: the verdict is re-derived
+    /// every round against the CURRENT registry, so if the newer runs later
+    /// disappear upstream and the registry empties out, the file becomes
+    /// ingestible again instead of being stuck behind a false "already ingested"
+    /// claim. The note/counter are deduped per (path,content-hash) instead.
+    pub fn retention_skip_reason(self: &mut Self, mdl: &ResolvedModel,
+                                 path: String, hash: String) -> Option<String> {
+        let mi = find_model_idx(&self.registry, &mdl.name);
+        match mi {
+            None => { return None; }
+            Some(mi2) => {
+                if self.registry[mi2].runs.len() < (self.retention_runs as usize) {
+                    return None; // registry has room: nothing is obsolete yet
+                }
+                let oldest_kept = self.registry[mi2].runs[0].epoch_secs;
+                let pk = peek_ref_times(path.clone());
+                match pk {
+                    Err(e) => {
+                        // Uncertain: fall through, ONCE-noted per (path,hash).
+                        if !self.seen_verdict(path.clone(), hash.clone()) {
+                            self.remember_verdict(path.clone(), hash.clone());
+                            self.note(format!("retention-skip peek failed for {} ({:?}): decoding it normally", path, e));
+                        }
+                        return None;
+                    }
+                    Ok(pv) => {
+                        if pv.max_epoch >= oldest_kept {
+                            return None; // same-run partial delivery or a newer run
+                        }
+                        let fresh = !self.seen_verdict(path.clone(), hash.clone());
+                        if fresh {
+                            self.remember_verdict(path.clone(), hash.clone());
+                            self.counters.retention_skipped_files += 1;
+                            self.live.bump_retention_skip();
+                            self.note(format!(
+                                "retention skip: {} declares newest reference time {} (oldest {}), strictly older than the oldest kept run {} of model '{}' ({} runs kept) — not decoded",
+                                path, iso_utc(pv.max_epoch), iso_utc(pv.min_epoch), iso_utc(oldest_kept),
+                                mdl.name, self.registry[mi2].runs.len()));
+                        }
+                        return Some(format!("reference time {0} is older than the oldest kept run {1}",
+                            iso_utc(pv.max_epoch), iso_utc(oldest_kept)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Already noted/counted this (path,content-hash) verdict?
+    fn seen_verdict(self: &Self, path: String, hash: String) -> bool {
+        for v in &self.stale_verdicts {
+            if v.0 == path && v.1 == hash {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remember a verdict, evicting the oldest when the bounded memo is full
+    /// (an evicted path simply gets ONE more note+count if it is still stale).
+    fn remember_verdict(self: &mut Self, path: String, hash: String) {
+        while self.stale_verdicts.len() >= STALE_VERDICT_CAP {
+            let _x = self.stale_verdicts.remove(0);
+        }
+        self.stale_verdicts.push((path.to_string(), hash.to_string()));
     }
 }
 

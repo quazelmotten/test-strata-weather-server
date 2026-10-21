@@ -22,6 +22,7 @@
 //! source of truth for both the projection and the wind-rotation angle.
 
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
+use wx_core::tables::valid_civil_date;
 use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, fsync_path,
                        PlaneSource, count_rename, count_bytes_written, le_u32, bits_to_f32,
                        unique_tmp_path, TouchedDirs};
@@ -612,7 +613,14 @@ pub fn parse_iso_utc(t: &str) -> Option<i64> {
                                             match ss {
                                                 None => { return None; }
                                                 Some(ss2) => {
-                                                    if mo2 < 1 || mo2 > 12 || da2 < 1 || da2 > 31 || hh2 > 23 || mi2 > 59 || ss2 > 59 {
+                                                    if hh2 > 23 || mi2 > 59 || ss2 > 59 {
+                                                        return None;
+                                                    }
+                                                    // STRICT CALENDAR VALIDATION (V1.2 phase C):
+                                                    // same rule as the HTTP time parser, so a
+                                                    // hand-edited manifest cannot smuggle "2026-02-31"
+                                                    // into a statistical range and shift it by days.
+                                                    if !valid_civil_date(y, mo2, da2) {
                                                         return None;
                                                     }
                                                     return Some(days_from_civil(y, mo2, da2) * 86400 + hh2 * 3600 + mi2 * 60 + ss2);

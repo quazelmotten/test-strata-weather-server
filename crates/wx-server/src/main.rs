@@ -5,9 +5,32 @@
 //! dedicated rayon decode pool per config, spec §4.2 "separate from the
 //! HTTP runtime"), while the tokio HTTP runtime serves immediately; /ready
 //! reflects indexing progress (spec §7).
+//!
+//! ## Exit codes (V1.2 phase C — startup failures are MACHINE-OBSERVABLE)
+//!
+//! Before this change every startup failure PRINTED its message and still exited
+//! WITH STATUS 0, so a supervisor (systemd, a k8s entrypoint, a CI smoke script)
+//! could not tell a healthy boot from a dead one. Now:
+//!
+//! | code | meaning |
+//! |---|---|
+//! | 0  | served normally (or stopped cleanly) |
+//! | 1  | config missing/unparsable/invalid (spec §3 loud failure) |
+//! | 2  | usage error: no `--config` and no `WXPOINT_CONFIG` |
+//! | 3  | pipeline init failed (state/grid/data-dir problems) |
+//! | 4  | startup wind-pair preflight rejected the configuration (spec §4.4) |
+//! | 5  | tokio runtime init failed |
+//! | 6  | the configured `bind` address could not be bound |
+//! | 8  | the HTTP server itself returned an error |
+//!
+//! Distinct codes are deliberate (the task allowed "at least 1"): an operator can
+//! fix a bad config without reading logs, and `scripts/smoke.sh` style harnesses
+//! can gate on it. Covered by `crates/wx-server/tests/exit_codes.rs`, which SPAWNS
+//! the built binary with broken configs and asserts rc != 0 for each class.
 
 use std::env::args;
 use std::env::var;
+use std::process::exit;
 use std::thread::spawn;
 use libc::usleep;
 use tokio::runtime::Runtime;
@@ -55,30 +78,32 @@ pub fn main() {
     let cfg_path = resolve_cfg_path();
     if cfg_path.is_empty() {
         println!("usage: wxpoint --config <path> (or set WXPOINT_CONFIG)");
-        return;
+        // USAGE ERROR (exit 2): nothing was started, nothing was served.
+        exit(2);
     }
     // validate loudly before anything else (spec §3)
     let cfg_r = load_config(&cfg_path);
     match cfg_r {
         Err(e) => {
             println!("config error: {0}", e);
-            return;
+            exit(1);
         }
         Ok(cfg) => {
             let bind_str = cfg.server.bind;
             let interval_secs = cfg.ingest.scan_interval_secs;
-            start_pipeline(&cfg_path, &bind_str, interval_secs);
+            let rc = start_pipeline(&cfg_path, &bind_str, interval_secs);
+            exit(rc as i32);
         }
     }
 }
 
 #[allow(clippy::needless_borrow)]
-fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
+fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) -> i64 {
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
         Err(e) => {
             println!("pipeline init failed: {0}", e);
-            return;
+            return 3;
         }
         Ok(pp) => { pp }
     };
@@ -95,7 +120,7 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
     match pf {
         Err(msg) => {
             println!("{0}", msg);
-            return;
+            return 4;
         }
         Ok(notes) => {
             for n in &notes {
@@ -169,27 +194,30 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
     let rt = match rt_r {
         Err(_e) => {
             println!("tokio runtime init failed");
-            return;
+            return 5;
         }
         Ok(rtx) => { rtx }
     };
+    let mut srv_rc: i64 = 0;
     rt.block_on(async {
         let lr = TcpListener::bind(&bind_str);
         match lr.await {
             Err(e) => {
                 println!("failed to bind {0}: {1}", bind_str, e);
+                srv_rc = 6;
             }
             Ok(listener) => {
                 println!("listening on {0}", bind_str);
                 let srv = serve(listener, app);
                 let res = srv.await;
                 match res {
-                    Err(e) => { println!("server error: {0}", e); }
+                    Err(e) => { println!("server error: {0}", e); srv_rc = 8; }
                     Ok(_) => { println!("server stopped"); }
                 }
             }
         }
     });
+    srv_rc
 }
 
 #[allow(clippy::needless_return)]

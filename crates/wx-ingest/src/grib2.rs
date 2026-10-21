@@ -1479,6 +1479,115 @@ fn probe_stream(bytes: &[u8]) -> Result<GridProbe, GribErr> {
 
 
 // ---------------------------------------------------------------------------
+// cheap SECTION-0/SECTION-1 header peek (V1.2 phase C retention-aware skip)
+// ---------------------------------------------------------------------------
+
+/// What a header peek learned about ONE FILE: the OLDEST and NEWEST SECTION-1
+/// REFERENCE TIMES it declares, plus the number of messages walked. A file can
+/// carry SEVERAL runs (`tests/fixtures/frac_small.grib2` has two), so BOTH ends
+/// of that range matter: the retention-skip rule asks whether the NEWEST run in
+/// the file is still older than everything the registry keeps.
+#[derive(Clone, Debug)]
+pub struct RefPeek {
+    pub min_epoch: i64, // oldest reference time declared
+    pub max_epoch: i64, // newest reference time declared
+    pub messages: u32, // messages whose section 1 was read
+}
+
+/// Cheap HEADER PEEK over one file: walks ONLY the message/section FRAMING and
+/// interprets ONLY SECTION-1 payloads (reference time + end-of-file flag).
+/// Sections 2..7 are stepped over by their DECLARED byte lengths — no grid,
+/// product or data-section parsing, no unpacking — so the cost is a handful of
+/// bytes per section (the payload pages are never faulted in), which is why this
+/// may gate the expensive decode. Big-endian framing, edition byte must be 2,
+/// both terminators accepted (bare ASCII `7777` and the LEN-prefixed end
+/// section), exactly like the full decoder and the wind-pair probe.
+/// ANY structural problem returns Err: the caller MUST fall through to the
+/// normal decode path rather than skip, because skipping on an uncertain
+/// reference time could DROP data.
+pub fn peek_ref_times(path: String) -> Result<RefPeek, GribErr> {
+    let f = std::fs::File::open(path);
+    match f {
+        Err(_) => { return Err(GribErr::Io); }
+        Ok(h) => {
+            let m = unsafe { Mmap::map(&h) };
+            match m {
+                Err(_) => { return Err(GribErr::Io); }
+                Ok(region) => { return peek_stream(&region[0 .. region.len()]); }
+            }
+        }
+    }
+}
+
+fn peek_stream(bytes: &[u8]) -> Result<RefPeek, GribErr> {
+    let n = bytes.len();
+    let mut pos = 0;
+    let mut mn: i64 = 0;
+    let mut mx: i64 = 0;
+    let mut seen: u32 = 0;
+    while pos < n {
+        if n - pos < 16 {
+            break; // trailing junk: what was learned stands
+        }
+        if !(bytes[pos] == 0x47 && bytes[pos + 1] == 0x52 &&
+             bytes[pos + 2] == 0x49 && bytes[pos + 3] == 0x42) {
+            return Err(GribErr::BadMagic);
+        }
+        if bytes[pos + 7] != 2 {
+            return Err(GribErr::BadEdition);
+        }
+        let msglen = be_u64(bytes, pos + 8);
+        if msglen < 16 || (pos as u64) + msglen > (n as u64) {
+            return Err(GribErr::Truncated);
+        }
+        let body_end = pos + (msglen as usize);
+        let mut eof_flag = false;
+        let mut q = pos + 16;
+        while q < body_end {
+            if q + 4 <= body_end && bytes[q] == 0x37 && bytes[q + 1] == 0x37 &&
+               bytes[q + 2] == 0x37 && bytes[q + 3] == 0x37 {
+                break; // bare wgrib2 terminator
+            }
+            if q + 5 > body_end {
+                return Err(GribErr::Truncated);
+            }
+            let ln = be_u32(bytes, q) as usize;
+            let num = bytes[q + 4];
+            if ln < 6 || q + ln > body_end {
+                return Err(GribErr::Truncated);
+            }
+            if num == 1 {
+                let payload = &bytes[q + 5 .. q + ln];
+                let pr = parse_sec1(payload);
+                match pr {
+                    Err(e) => { return Err(e); }
+                    Ok(rt_eof) => {
+                        if seen == 0 {
+                            mn = rt_eof.0.epoch_secs;
+                            mx = rt_eof.0.epoch_secs;
+                        } else {
+                            if rt_eof.0.epoch_secs < mn { mn = rt_eof.0.epoch_secs; }
+                            if rt_eof.0.epoch_secs > mx { mx = rt_eof.0.epoch_secs; }
+                        }
+                        seen += 1;
+                        eof_flag = rt_eof.1;
+                    }
+                }
+            }
+            q += ln;
+        }
+        pos = body_end;
+        if eof_flag {
+            break;
+        }
+    }
+    if seen == 0 {
+        return Err(GribErr::BadSectionOrder);
+    }
+    return Ok(RefPeek { min_epoch: mn, max_epoch: mx, messages: seen });
+}
+
+// ---------------------------------------------------------------------------
 // public file-level API
 // ---------------------------------------------------------------------------
 

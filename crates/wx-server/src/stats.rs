@@ -48,6 +48,11 @@ pub struct QueryStats {
     /// count to see the amplification phase B removed (e.g. 8 groups vs 22
     /// messages per GFS hour).
     pub groups_written: AtomicU64,
+    /// V1.2 phase C: candidate FILES vetoed BEFORE decode because their SECTION-1
+    /// reference time is strictly older than the oldest kept run while the registry
+    /// is already full (see `Pipeline.retention_skip_reason`). Counted once per
+    /// (file,content hash), never an error.
+    pub retention_skipped: AtomicU64,
     /// Slot holding the ingest pipeline's LIVE counter mirror (V1.2 phase B).
     /// Detached (fresh zeros) until [`QueryStats.attach_live`] points it at the
     /// Pipeline's own `Arc<LiveCounters>`; from then on `/metrics` reflects
@@ -191,6 +196,14 @@ impl QueryStats {
         }
         out = format!("{0}{1}", out, "\nwxpoint_ingest_groups_written_total ");
         out = format!("{0}{1}", out, v_grp);
+        // V1.2 phase C: files vetoed before decode by the §4.6 retention-aware skip.
+        let mut v_stale = self.retention_skipped.load(Ordering::Relaxed);
+        let l_stale = lv.retention_skipped.load(Ordering::Relaxed);
+        if l_stale > v_stale {
+            v_stale = l_stale;
+        }
+        out = format!("{0}{1}", out, "\nwxpoint_retention_skipped_files_total ");
+        out = format!("{0}{1}", out, v_stale);
         // ingest lag: file mtime -> now, seconds (mtime is epoch ns).
         let mtime = self.last_mtime_ns.load(Ordering::Relaxed);
         let mt2 = lv.last_mtime_ns.load(Ordering::Relaxed);
@@ -265,6 +278,7 @@ pub fn new_stats_with(live: Arc<LiveCounters>) -> Arc<QueryStats> {
         ignored_files: AtomicU64::new(0),
         quarantined_files: AtomicU64::new(0),
         groups_written: AtomicU64::new(0),
+        retention_skipped: AtomicU64::new(0),
         live_slot: Mutex::<Arc<LiveCounters>>::new(live),
     };
     return Arc::new(qs);

@@ -322,3 +322,46 @@ pub fn digit_at(s: &str, k: usize) -> Option<i64> {
     }
     return None;
 }
+
+// ---------------------------------------------------------------------------
+// Calendar validation (V1.2 phase C): ONE table-driven rule shared by every
+// ISO-8601 reader in the workspace (wx-server `timeparse::parse_iso_z` for the
+// HTTP query parameters, wx-ingest `store::parse_iso_utc` for manifest
+// statistical ranges). Both previously accepted any day 1..31 for every month,
+// so "2026-02-31" silently NORMALIZED into March instead of being rejected.
+// ---------------------------------------------------------------------------
+
+/// Days in each month (index 1..12) of a NON-leap year; index 0 unused so the
+/// table reads like a calendar.
+pub const DAYS_IN_MONTH: [i64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+/// Proleptic Gregorian leap year — the SAME calendar the Hinnant civil-days
+/// math in `epoch_secs`/`iso_utc` implements, so the two agree by construction.
+pub fn is_leap_year(y: i64) -> bool {
+    return y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+}
+
+/// Days in month `m` (1..12) of year `y`, leap-corrected; 0 for an out-of-range
+/// month (callers compare `d <= days_in_month(...)` after checking the month).
+pub fn days_in_month(y: i64, m: i64) -> i64 {
+    if !(1 ..= 12).contains(&m) {
+        return 0;
+    }
+    let base = DAYS_IN_MONTH[m as usize];
+    if m == 2 && is_leap_year(y) {
+        return base + 1;
+    }
+    return base;
+}
+
+/// True when (y, m, d) is a REAL calendar date: February 29 only in a leap year
+/// (2024 yes, 2026 no), February 30/31 NEVER, April 31 NEVER, December 31 ALWAYS.
+pub fn valid_civil_date(y: i64, m: i64, d: i64) -> bool {
+    if !(1 ..= 12).contains(&m) {
+        return false;
+    }
+    if d < 1 {
+        return false;
+    }
+    return d <= days_in_month(y, m);
+}

@@ -7,6 +7,7 @@
 use wx_ingest::grib2::epoch_secs;
 use wx_ingest::pipeline::pad_num;
 use wx_core::tables::digit_at;
+use wx_core::tables::valid_civil_date;
 
 /// Parse "YYYY-MM-DDTHH:MM:SSZ" -> epoch seconds. None on any deviation
 /// (wrong length, non-digits, bad separators, out-of-range components).
@@ -41,7 +42,22 @@ pub fn parse_iso_z(s: &str) -> Option<i64> {
                                             match se {
                                                 None => { return None; }
                                                 Some(sc) => {
-                                                    if m < 1 || m > 12 || d < 1 || d > 31 || h > 23 || mn > 59 || sc > 59 {
+                                                    if h > 23 || mn > 59 || sc > 59 {
+                                                        return None;
+                                                    }
+                                                    // STRICT CALENDAR VALIDATION (V1.2
+                                                    // phase C). The pre-fix shortcut was
+                                                    // `d < 1 || d > 31`, which ACCEPTED
+                                                    // IMPOSSIBLE DATES: "2026-02-31" silently
+                                                    // NORMALIZED into early MARCH (the Hinnant
+                                                    // day formula carries the overflow), so a typo'd
+                                                    // query answered with the WRONG DAY'S DATA
+                                                    // instead of returning 400 `bad_time`. Now
+                                                    // TABLE-DRIVEN per-month days WITH THE LEAP
+                                                    // RULE: Feb 29 ok in 2024, rejected in 2026;
+                                                    // Feb 30/31 and Apr 31 always rejected; Dec
+                                                    // 31 always fine.
+                                                    if !valid_civil_date(y, m, d) {
                                                         return None;
                                                     }
                                                     return Some(epoch_secs(y as u16, m as u8, d as u8, h as u8, mn as u8, sc as u8));

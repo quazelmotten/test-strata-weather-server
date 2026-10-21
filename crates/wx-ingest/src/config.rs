@@ -21,6 +21,8 @@
 //!   `"type:*"` (every value of that type present) or `"*"` (any level).
 
 use std::fs::read_to_string;
+use std::fs::canonicalize;
+use std::env::current_dir;
 use toml::from_str;
 use wx_core::tables::lookup_level_type;
 use wx_core::tables::param_code;
@@ -200,6 +202,23 @@ pub fn validate_config(cfg: &PointConfig) -> Result<Vec<ResolvedModel>, String> 
             }
         }
     }
+    // ---- V1.2 phase C: data_dir / ingest_dir OVERLAP GUARD -----------------
+    // Ingest WRITES into `<data_dir>/<model>/...` and READS from
+    // `<ingest_dir>`. If one directory contains the OTHER, the two sides fight:
+    // retention (§4.6) deletes run trees that may BE the source products, and
+    // atomic renames can land inside the watched ingest tree where the glob then
+    // matches them again (self-ingestion). Rejected at startup with BOTH paths
+    // named, exactly like every other validation failure.
+    let nd = norm_dir_path(&cfg.server.data_dir);
+    let nparts = path_parts(&nd);
+    for model in &cfg.models {
+        let ni = norm_dir_path(&model.ingest_dir);
+        let rel = dir_relation(&nparts, &path_parts(&ni));
+        if rel != 0 {
+            return Err(format!("config error: [server].data_dir \"{0}\" and model '{1}' ingest_dir \"{2}\" OVERLAP ({3}); normalized: \"{4}\" vs \"{5}\". The query-optimized store must NOT contain, or be contained in, a model's ingest directory.",
+                cfg.server.data_dir, model.name, model.ingest_dir, relation_text(rel), nd, ni));
+        }
+    }
     let mut out: Vec<ResolvedModel> = Vec::<ResolvedModel>::new();
     for model in &cfg.models {
         if model.name.is_empty() {
@@ -262,6 +281,134 @@ pub fn validate_config(cfg: &PointConfig) -> Result<Vec<ResolvedModel>, String> 
         out.push(rm);
     }
     return Ok(out);
+}
+
+// ---------------------------------------------------------------------------
+// data_dir / ingest_dir overlap guard helpers (V1.2 phase C)
+// ---------------------------------------------------------------------------
+
+/// Normalize a configured DIRECTORY path for comparison. When the path EXISTS
+/// it is canonicalized (which ALSO resolves symlinks); when it does not exist
+/// yet — routinely true for `data_dir`, which the pipeline creates on first
+/// boot — it is absolutized against the process CWD and `.`/`..` components are
+/// resolved LEXICALLY. Consequence documented deliberately: a symlink pointing
+/// at an EXISTING directory is resolved, while a symlink whose target does not
+/// exist yet is compared by its lexical form; the guard exists to catch
+/// configuration mistakes, not hostile filesystems.
+pub fn norm_dir_path(p: &str) -> String {
+    let c = canonicalize(p);
+    match c {
+        Ok(v) => { return v.to_string_lossy().to_string(); }
+        Err(_) => {}
+    }
+    let mut base = p.to_string();
+    if base.len() == 0 || base[0 .. 1] != *"/" {
+        let cwd = current_dir();
+        match cwd {
+            Err(_) => { return collapse_lexical(&base); }
+            Ok(d) => { base = format!("{0}/{1}", d.to_string_lossy(), base); }
+        }
+    }
+    return collapse_lexical(&base);
+}
+
+/// Split a path into its components (`""` = repeated separators, `.` dropped,
+/// `..` pops the previous component). Leading `/` yields an empty first marker
+/// so absolute and relative forms never compare equal by accident.
+pub fn path_parts(p: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::<String>::new();
+    if p.len() > 0 && p[0 .. 1] == *"/" {
+        out.push("".to_string());
+    }
+    for seg in p.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if out.len() > 1 {
+                let _x = out.pop();
+            }
+            continue;
+        }
+        out.push(seg.to_string());
+    }
+    return out;
+}
+
+/// Lexically absolutize+collapse a path WITHOUT touching the filesystem.
+fn collapse_lexical(p: &str) -> String {
+    let parts = path_parts(p);
+    let mut abs = false;
+    if parts.len() > 0 && parts[0].is_empty() {
+        abs = true;
+    }
+    let mut joined = "".to_string();
+    for k in 0 .. parts.len() {
+        if parts[k].is_empty() {
+            continue;
+        }
+        if joined.is_empty() {
+            joined = parts[k].to_string();
+        } else {
+            joined = format!("{0}/{1}", joined, parts[k]);
+        }
+    }
+    if !abs {
+        if joined.is_empty() {
+            return ".".to_string();
+        }
+        return joined;
+    }
+    return format!("/{0}", joined);
+}
+
+/// Relationship between two already-normalized directory paths:
+///   0 = DISJOINT, 1 = IDENTICAL, 2 = A lies UNDER B, 3 = B lies UNDER A.
+/// Component-wise prefix test (never string-prefix, so `/data-x` is NOT "under"
+/// `/data`).
+pub fn dir_relation(a: &Vec<String>, b: &Vec<String>) -> i32 {
+    if a.len() == b.len() {
+        let mut same = true;
+        for k in 0 .. a.len() {
+            if a[k] != b[k] {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            return 1;
+        }
+        return 0;
+    }
+    let mut short = a;
+    let mut long = b;
+    if a.len() > b.len() {
+        short = b;
+        long = a;
+    }
+    for k in 0 .. short.len() {
+        if short[k] != long[k] {
+            return 0;
+        }
+    }
+    // `short` is a proper prefix of `long`: which one is the ancestor?
+    if a.len() < b.len() {
+        return 3; // B contains A
+    }
+    return 2; // A contains B
+}
+
+fn relation_text(rel: i32) -> String {
+    if rel == 1 {
+        return "same directory".to_string();
+    }
+    if rel == 2 {
+        return "data_dir contains the ingest_dir".to_string();
+    }
+    if rel == 3 {
+        return "ingest_dir contains data_dir".to_string();
+    }
+    return "disjoint".to_string();
 }
 
 /// Validate a raw TOML text (used by tests + load_config).
