@@ -31,9 +31,13 @@
 //!   differencing (first AND second order, group widths/lengths, primary
 //!   missing-value management), 5.200 run length (the variant wgrib2 and
 //!   NCEP actually emit — there is no 5.1/5.2 dictionary encoder anywhere in
-//!   the wgrib2 ecosystem; dictionary 5.1 -> typed UnsupportedData), 5.4 IEEE.
-//!   DRT 5.40 JPEG2000 / 5.41 PNG / 5.42 AEC and everything else -> typed
-//!   `UnsupportedData(tmpl)` (documented limitation).
+//!   the wgrib2 ecosystem; dictionary 5.1 -> typed UnsupportedData), 5.4 IEEE,
+//!   plus (V1.1 phase 2) 5.40 JPEG2000, 5.41 PNG and 5.42 CCSDS AEC decoded by
+//!   the pure-Rust backends in `codecs::rs` (`hayro-jpeg2000`, `zlib-rs` + own
+//!   PNG chunk/unfilter code, `rust-aec`). Any other template -> typed
+//!   `UnsupportedData(tmpl)`; a well-formed stream using a construct those
+//!   backends deliberately do not implement -> `CodecUnsupported(reason)`;
+//!   an unparseable stream -> `CodecFailure(reason)`.
 //! * Filenames are never consulted for metadata (spec §4.2): everything comes
 //!   from sections 0/1/3/4.
 //!
@@ -46,6 +50,8 @@
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
 use wx_core::tables::param_name_for;
 use wx_core::grid::D2R;
+
+use crate::codecs;
 
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
@@ -68,6 +74,12 @@ pub enum GribErr {
     UnsupportedData(u16),
     UnsupportedPdt(u16),
     UnsupportedCoordLists,
+    /// A section-7 codec backend could not parse the stream at all (corrupt,
+    /// truncated, or rejected by the third-party decoder).
+    CodecFailure(&'static str),
+    /// The stream parsed but uses a construct the backend deliberately does
+    /// not implement (see codecs::rs module docs and docs/DECISIONS.md).
+    CodecUnsupported(&'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -525,6 +537,9 @@ pub fn decode_sec7(s3: &GridDef, s5: &[u8], s6: Option<&[u8]>, s7: &[u8]) -> Res
         3 => { return dec_complex(s5, s6, s7, ngrid, true); }
         200 => { return dec_runlength(s5, s6, s7, ngrid); }
         4 => { return dec_ieee(s5, s6, s7, ngrid); }
+        40 => { return dec_jpeg(s5, s6, s7, ngrid); }
+        41 => { return dec_png(s5, s6, s7, ngrid); }
+        42 => { return dec_aec(s5, s6, s7, ngrid); }
         _ => { return Err(GribErr::UnsupportedData(tmpl)); }
     }
 }
@@ -903,6 +918,88 @@ fn dec_ieee(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<Vec
         j += 1;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// DRT 5.40 / 5.41 / 5.42 wrappers (codec backends live in codecs::rs)
+// ---------------------------------------------------------------------------
+
+/// Shared shape of the three compressed templates: section 5 carries the same
+/// reference/binary/decimal scalars as simple packing (plus, for AEC, the CCSDS
+/// parameters), and the codec stream holds ONLY the packed integers of the
+/// DEFINED points, which are scaled and re-interleaved with the bitmap exactly
+/// like DRT 5.0 (`jpeg_pk.c`/`aec_pk.c` write `mk_bms` output; `unpk.c`
+/// re-interleaves).
+fn dec_jpeg(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<Vec<f32>, GribErr> {
+    let sc_r = codecs::scalars_of(s5);
+    match sc_r {
+        Err(e) => { return Err(e); }
+        Ok(sc) => {
+            let bm = bitmap_of(s6);
+            let ndef = codecs::defined_count(bm, ngrid);
+            let npts = be_u32(s5, 0) as usize;
+            if npts != ndef {
+                return Err(GribErr::BadField("jpeg defined-point count mismatch"));
+            }
+            let ud_r = if sc.nbits == 0 {
+                codecs::zero_samples(ndef)
+            } else {
+                codecs::jpeg_samples(s7, ndef)
+            };
+            match ud_r {
+                Err(e) => { return Err(e); }
+                Ok(ud) => { return Ok(codecs::finish_values(&sc, bm, ud, ngrid)); }
+            }
+        }
+    }
+}
+
+fn dec_png(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<Vec<f32>, GribErr> {
+    let sc_r = codecs::scalars_of(s5);
+    match sc_r {
+        Err(e) => { return Err(e); }
+        Ok(sc) => {
+            let bm = bitmap_of(s6);
+            let ndef = codecs::defined_count(bm, ngrid);
+            let npts = be_u32(s5, 0) as usize;
+            if npts != ndef {
+                return Err(GribErr::BadField("png defined-point count mismatch"));
+            }
+            let ud_r = if sc.nbits == 0 {
+                codecs::zero_samples(ndef)
+            } else {
+                codecs::png_samples(s7, ndef)
+            };
+            match ud_r {
+                Err(e) => { return Err(e); }
+                Ok(ud) => { return Ok(codecs::finish_values(&sc, bm, ud, ngrid)); }
+            }
+        }
+    }
+}
+
+fn dec_aec(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<Vec<f32>, GribErr> {
+    let sc_r = codecs::scalars_of(s5);
+    match sc_r {
+        Err(e) => { return Err(e); }
+        Ok(sc) => {
+            let bm = bitmap_of(s6);
+            let ndef = codecs::defined_count(bm, ngrid);
+            let npts = be_u32(s5, 0) as usize;
+            if npts != ndef {
+                return Err(GribErr::BadField("aec defined-point count mismatch"));
+            }
+            let ud_r = if sc.nbits == 0 {
+                codecs::zero_samples(ndef)
+            } else {
+                codecs::aec_samples(s5, s7, ndef)
+            };
+            match ud_r {
+                Err(e) => { return Err(e); }
+                Ok(ud) => { return Ok(codecs::finish_values(&sc, bm, ud, ngrid)); }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

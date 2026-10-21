@@ -16,6 +16,11 @@ clap = { version = "^4", features = ["derive"] }
 tracing = "^0.1"
 smallvec = "^1"
 criterion = "^0.5"
+# JPEG2000 backend for GRIB2 DRT 5.40. Default features pull in the `image``
+# integration (moxcms/pxfm); we only need the decoder itself.
+hayro-jpeg2000 = { version = "^0.4.1", default-features = false, features = ["std", "simd"] }
+zlib-rs = "^0.6.8"
+rust-aec = "^0.1.1"
 
 # Correctness-safe release tuning per spec §8. NOTE: `target-cpu=native` was
 # benchmarked separately (see README); it is NOT enabled here by default so

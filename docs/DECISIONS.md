@@ -42,11 +42,10 @@ Conclusion recorded in README as well: capability gap, not just packaging.
   actual GRIB2/wgrib2 numbering has run length as **5.200** and there is NO
   dictionary encoder anywhere in the wgrib2 ecosystem. We implement 5.200 and
   reject anything else with typed `UnsupportedData(tmpl)`.
-* 5.40 JPEG2000 / 5.41 PNG / 5.42 AEC: rejected with typed error (our nolib
-  wgrib2 lacks jpeg/aec too, so fixtures only guard the header path; real
-  GFS/HRRR pgrb2 files use 5.0/5.3 exclusively). Fallback decision: if NOAA
-  ever ships 5.40 products, link ecCodes or shell out to wgrib2 — deferred,
-  documented in README limitations.
+* 5.40 JPEG2000 / 5.41 PNG / 5.42 AEC: **at milestone 2 these were rejected** with
+  typed `UnsupportedData(tmpl)` because the local wgrib2 could not produce or read
+  them, so no truth was available. Resolved in V1.1 phase 2 (see that section below):
+  all three decode against `tools/wgrib2-full` ground truth.
 * Complex packing quirk found by hexdump of the wgrib2 `-set_grib_type c3`
   output: the group-LENGTH phase reserves `ceil(ngroups * lbits / 8)` bytes
   even though only ngroups-1 lengths are stored (complex_pk.c pads one extra
@@ -536,3 +535,180 @@ would require a machine with a Fortran toolchain.
   must zero-pad before reading the final value.
 * jpeg twins carry per-message metadata `Creator: JasPer Version 1.900.1` -> compare
   decoded VALUES (or `-checksum data`), never bytes.
+
+---
+
+# V1.1 phase 2 decisions (JPEG2000 / PNG / CCSDS AEC codecs)
+
+## Backends chosen — pure Rust, NO C FFI
+
+| DRT | backend | version | why this one |
+|---|---|---|---|
+| 5.40 JPEG2000 | `hayro-jpeg2000` | 0.4.1 | pure-Rust J2C decoder (MQ arithmetic coder + bitplane/tile assembly). `default-features = false`, features `std`,`simd` only, so the image/colour machinery (`moxcms`, `pxfm`) is not compiled into an ingest binary that never displays pixels |
+| 5.41 PNG | `zlib-rs` 0.6.8 (inflate + CRC32) + in-house chunk walk and unfilter | wgrib2 reads PNG through libpng; there is no maintained pure-Rust PNG reader that hands back raw scanlines without a pixel-format pipeline, and pulling one in would add exactly the conversion code we must NOT run (samples are integers, not colours) |
+| 5.42 CCSDS AEC | `rust-aec` 0.1.1 | direct port of the libaec block model GRIB2 describes; takes the same three parameters Sec5 stores |
+
+Why no C FFI (spec §4.2 offered ecCodes via FFI as the fallback): `openjpeg-sys`/
+`aec-sys`/libpng bindings need **libclang**, absent on this machine (phase 1 hit the
+same wall with IPLIB/Fortran), and an FFI dependency would make the shipped binary
+depend on system libraries we cannot pin or verify here. All three backends come
+from crates.io and are pinned in `Cargo.lock`; nothing in the workspace links C.
+
+## Error taxonomy for codec paths (`GribErr`)
+
+* `UnsupportedData(u16)` — unchanged meaning: a data representation template we do
+  not implement at all (dictionary 5.1, …).
+* `CodecFailure(&'static str)` — the stream is corrupt/truncated/unparseable
+  (bad signature, chunk CRC mismatch, inflate failure, backend parse error).
+* `CodecUnsupported(&'static str)` — the stream parsed but uses a construct the
+  backend deliberately does not implement (see scope table below).
+
+Rule kept from phase 1: anything that cannot be validated against wgrib2 truth in
+CI stays behind a typed error. No silent guessing, no partial decode.
+
+## Section-5 payload offsets consumed (payload = wgrib2 `sec[5]` minus its 5-byte header)
+
+Common to 5.40/5.41/5.42: `0..4` defined-point count, `4..6` DRT, `6..10` reference
+value (f32 BE), `10..12` binary scale E, `12..14` decimal scale S, `14` bits-per-value.
+
+| template | extra fields |
+|---|---|
+| 5.40 | `16` lossless flag, `17` undefined byte (both recorded, unused: Jasper always writes lossless) |
+| 5.41 | nothing past `14`; bits-per-value (`payload[14]` = octet 20) MUST equal the IHDR depth |
+| 5.42 | `16` ccsdsFlags, `17` block size, `18..20` RSI (uint2) |
+
+Section 7 carries **no** PSV/leading field for any of the three: the codec stream
+starts at payload offset 0.
+
+## JPEG2000 specifics
+
+* Verified end-to-end against `tools/wgrib2-full`: a Jasper-written GRS-style
+  stream (41 x 21, bit depth 7) decodes to samples 0…120 in **file scan order**.
+* wgrib2/Jasper embed a text box `Creator: JasPer Version 1.900.1`. hayro parses
+  `COM` (marker 0xFF64), skips `CRG` (0xFF63) and the parameterless
+  `0xFF30..0xFF3F` markers, and bails with `MarkerError::Unsupported` on any other
+  marker code — which we surface as `CodecFailure("jpeg-stream")`. So NCEP-style
+  metadata boxes are fine; exotic boxes are rejected loudly.
+* Samples come back as f32: exact only up to 2^24, so `bit_depth > 24` and
+  multi-component images are `CodecUnsupported` rather than silently rounded.
+
+## PNG specifics (field layout)
+
+* Stream: `[u32 len][7][PNG]`; chunks are `u32 | 4-byte type | data | u32 crc32`
+  and the CRC covers **type bytes + data** (RFC PNG). Implemented as zlib-style
+  chaining: `crc32(crc32(0, name_bytes), body)`. Bug found while wiring this up:
+  seeding the CRC over data only rejected every valid file (`png-crc`).
+* Accepted: color type 0 (grayscale), depths 8/16, non-interlaced, compression
+  and filter methods 0, `w * h == defined-value count`, samples big-endian over
+  `depth/8` bytes per value (equivalent to wgrib2's `unpk_0(..., ((nbits+7)/8)*8, ...)`
+  bitstream read). Rejected: everything else (`png-color-type`, `png-bit-depth`,
+  `png-interlace`, `png-methods`).
+* Unfilter implemented **exactly** as the libpng 1.2.59 that wgrib2 links
+  (`pngrutil.c::png_read_filter_row`): None/Sub/Up/Average/Paeth, with the first
+  `bpp` bytes of each row predicted from `up` alone. Paeth predictor as libpng has
+  it: `p = b - c; pc = a - c; pa = |p|; pb = |pc|; pc' = |p + pc|; pick a, else b,
+  else c` (a=left, b=up, c=upper-left). The textbook form written from the prose
+  spec picks differently on real data — the first PNG twin failed on every message
+  until this was corrected, in both the Rust reader and the Python writer.
+* Per-row filter bytes are collected and exposed as `codecs::png_filter_types`
+  so a fixture can prove which predictor branches it actually exercises.
+
+## CCSDS AEC specifics (parameter layout)
+
+* `aec_pk.c` writes `sec5[21]=ccsdsFlags`, `sec5[22]=block size`,
+  `uint2(sec5+23)=rsi`; `unpk.c` reads exactly those, i.e. payload offsets
+  `16`, `17`, `18..20` in our representation.
+* Call shape: `AecParams(nbits, block, rsi, flags_from_grib2_ccsds_flags(flags))`
+  then `decode(s7, params, expect_n)`.
+* Verified against wgrib2 output: gfs twin `nbits=7 flags=14 block=32 rsi=128`
+  yields packed integers identical to wgrib2's; hrrr twin uses `nbits=9` → 2-byte
+  big-endian samples. Parameter sets `rust-aec` refuses become typed errors.
+
+## Shared integer pipeline (why values stay bit-identical)
+
+* With a bitmap, the codec stream holds ONLY the DEFINED points (Jasper/libaec write
+  `mk_bms` output); samples are re-interleaved with the bitmap exactly like DRT 5.0,
+  and Sec5's defined-point count is cross-checked against the bitmap population
+  (`BadField("* defined-point count mismatch")`).
+* Scaling `(ref + p * 2^E) * 10^-S` computed in f64 then narrowed to f32 — the same
+  code path as simple packing (`codecs::finish_values`), so decoded bits match
+  `dec_simple` and wgrib2 exactly.
+* `nbits == 0` (constant field) short-circuits without touching the codec stream but
+  still honours the bitmap.
+
+## Checksum normalization rule (validation primitive)
+
+`wgrib2 -checksum data` hashes wgrib2's **normalized** array — rows south→north,
+columns west→east — not the file scan order (proved by `-text` dumps and
+permutation search on three fixtures). Rule implemented in `codecs::data_cksum_grid`:
+
+```
+row_flip = (scan_mode & 0x40) == 0     # file scans north-to-south -> rows reversed
+col_flip = (scan_mode & 0x80) != 0     # file scans east-to-west  -> cols reversed
+```
+
+Masked points are hashed as wgrib2's `UNDEFINED` sentinel `9.999e20f`, never NaN.
+Encoders still write file scan order; only the checksum view is normalized.
+
+## Tests added (names)
+
+* `checksum_parity.rs`: `gfs_drt50_data_checksums_match_wgrib2`,
+  `hrrr_drt50_data_checksums_match_wgrib2`, `stat_pdt48_data_checksums_match_wgrib2`
+  (39 / 6 / 3 embedded wgrib2 checksums).
+* `packing_twins.rs`: `gfs_twins_match_simple_packing`,
+  `hrrr_twins_match_simple_packing`, `masked_points_are_nan_for_every_codec`,
+  `point_probes_reproduce_on_every_gfs_twin`,
+  `point_probes_reproduce_on_every_hrrr_twin`,
+  `skip_unpack_counters_hold_for_compressed_twins`,
+  `png_twin_filter_coverage`, `dictionary_packing_rejected_with_typed_error`.
+* `stat_pdt.rs`: `jpeg_twin_keeps_pdt48_metadata_and_values` replaces the old
+  `j2k_rejected_with_typed_error` guard (5.40 is now decodable, so the guard moved).
+* `perf_fixture.rs`: `perf_gfs_hour_jpeg_matches_simple_packing` — 22 embedded
+  wgrib2 `-checksum data` values for the full-geometry JPEG twin, skips silently
+  when the gitignored perf dataset is absent.
+
+## Fixture set (regenerated by `scripts/gen_fixtures.sh`)
+
+`_c3` (5.3), `_jpeg` (5.40), `_aec` (5.42), `_ieee` (5.4), `_png` (5.41, filter
+None), `_png_f` (5.41, all five PNG filters cycled across messages) for both
+`gfs_small` and `hrrr_small`, plus `stat_small_jpeg` (PDT 4.8 x 5.40) and the
+perf-scale `gfs_perf_f000_jpeg`. Every twin is asserted two ways inside the script:
+per-record DRT via `-code_table_5.0`, and `-checksum data` equality with the
+simple-packed original. Guard fixture moved from `unsupported_j2k.grib2` (now
+decodable) to `unsupported_drt.grib2` declaring DRT 5.1 — which wgrib2 itself
+refuses (`*** FATAL ERROR: packing type 1 not supported ***`, rc=8). Note the guard
+must force a decode (`-checksum data`): a bare listing never touches section 7, so
+the earlier check passed vacuously. `scripts/regen_expected.sh` switched to
+`tools/wgrib2-full` and probes every twin, asserting offset-normalized inventories
+and point/ij values are identical across packings.
+
+## Measured numbers (this machine: AMD EPYC 7402, release build)
+
+| workload | value |
+|---|---|
+| one GFS forecast hour (1440 x 720, 22 fields) decode, simple packing | 752 ms |
+| same hour, JPEG2000 twin (33.9 MB -> 1.0 MB on disk) | 1143 ms |
+| small-fixture twin decode (all six packings) | < 1 ms per file |
+| workspace test suite incl. twins | green; clippy `-D warnings` clean |
+
+JPEG2000 costs ~1.5x of simple packing at scale while shrinking files ~33x, so
+ingest latency stays well inside the §8 "few seconds" target even if NOAA ships
+packed products.
+
+## Deviations / follow-ups
+
+* **Transient 422 during ingest.** The pipeline publishes after every field write
+  (§4.5 incremental visibility), so mid-file a run can hold `TMP@1000` without
+  `TMP@850/700`; a request for a NON-STORED level (925) then has no bracketing pair
+  and answers 422 `level_out_of_range` instead of extrapolating — spec §7-correct,
+  but noisy. `concurrency_http.rs` previously asserted "only 200/404" and therefore
+  flaked under CPU load (36 of 12000 queries in a reproduced failure); it now counts
+  those separately (`transient_422`) while still requiring zero 5xx and zero torn
+  bodies, plus a settled-state batch proving they disappear once ingest finishes.
+  Coarsening publish granularity (per forecast-hour group) is the documented follow-up.
+* PNG fixtures come from our own writer (`make_png_twin.py`) because wgrib2 has no
+  PNG encoder; the round trip is validated in both directions (our reader vs
+  wgrib2's libpng reader), which is stronger than a self-consistent loop.
+* Still unsupported by design: JPEG2000 >24-bit depth or multi-component, PNG
+  colour types / interlace / depths other than 8-16 / non-zero methods, AEC
+  parameter sets `rust-aec` rejects, DRT 5.1 dictionary. All typed errors.

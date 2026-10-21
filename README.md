@@ -190,8 +190,14 @@ recursive scan every `scan_interval_secs` (authoritative fallback). Files must
 pass stability (window or sidecar) BEFORE decode. Decoding skips messages not
 in the configured list by reading section 4 before unpacking section 7. Data
 representations implemented: DRT 5.0 simple, 5.2 complex, 5.3 complex + spatial
-differencing (first and second order), 5.200 run length, 5.4 IEEE; JPEG2000
-(5.40)/PNG (5.41)/AEC (5.42) rejected with typed errors (see limitations).
+differencing (first and second order), 5.200 run length, 5.4 IEEE raw float32,
+**5.40 JPEG2000** (`hayro-jpeg2000` 0.4.1, `default-features = false` + `std`,`simd`),
+**5.41 PNG** (`zlib-rs` 0.6.8 inflate + in-house chunk/CRC/unfilter layer),
+**5.42 CCSDS AEC** (`rust-aec` 0.1.1) — all pure Rust, no C FFI anywhere.
+Templates outside that set (e.g. dictionary 5.1, which nothing in the wgrib2
+ecosystem can read either) yield typed `UnsupportedData(tmpl)`; a well-formed
+stream using a construct a backend deliberately does not implement yields
+`CodecUnsupported(reason)`, an unparseable stream `CodecFailure(reason)`.
 Note the task text listed "5.1 runlength / 5.2 dict" — actual GRIB2 numbering
 has run length as 5.200 and NO dictionary encoder exists in the wgrib2
 ecosystem; we implement 5.200. PDT 4.0 and 4.8 both handled (stat process type
@@ -254,6 +260,12 @@ Files placed cold; scan_interval_secs=1, stable_window_secs=0, ingest_threads=16
   §8 target MET)
 * peak RSS (VmHWM): **372 MB** for the whole dataset indexed
 
+Codec cost at production scale (release build, this machine): decoding one full
+GFS forecast hour (1440 x 720, 22 fields) takes **752 ms** from the simple-packed
+file and **1143 ms** from its JPEG2000 twin (33.9 MB -> 1.0 MB on disk, values
+bit-identical). Both stay far inside the "few seconds" §8 target, and packed
+products cut transfer volume by ~33x.
+
 ### 7.4 Profiling pass (`scripts/profile.sh [secs]`, optional `STRACE=1`)
 
 This machine has `perf_event_paranoid=4` AND yama `ptrace_scope=1`: perf
@@ -297,7 +309,17 @@ materially; the §8 margin (≤20 µs vs 50 µs target) stands without any.
 7. Masked points → null, never blended (`nan_neighbor_missing_data`).
 8. APCP time interpolation rejected (`time_guard_stat_and_none` + probe replay).
 9. Ingest-under-load concurrency: `concurrency.rs` + `concurrency_http.rs`
-   (readers hammer while publishers churn; zero errors/torn bodies).
+   (readers hammer while publishers churn; zero 5xx, zero torn bodies; the only
+   non-200/404 statuses accepted are the documented transient 422s).
+10. Packing parity (V1.1 phase 2): each small fixture exists in five extra packings
+   (`_c3` 5.3, `_jpeg` 5.40, `_png` 5.41 filter None, `_png_f` 5.41 cycling all five
+   PNG predictors, `_aec` 5.42, `_ieee` 5.4). `packing_twins.rs` asserts element-wise
+   identical arrays (NaN positions preserved), wgrib2 point probes reproduce on
+   every twin, masked nodes stay NaN per codec, skip-unpack counters hold when a
+   compressed message is filtered out, and all five PNG filters are proven present.
+   `checksum_parity.rs` reproduces wgrib2 `-checksum data` (POSIX cksum over the
+   normalized array) for gfs/hrrr/stat fixtures; `perf_fixture.rs` pins all 22
+   checksums of the JPEG2000 twin of the full-geometry GFS hour.
 Plus milestone-5 regressions: warm-boot LCC restore (`restart.rs` now covers
 hrrr) and `/v1/models` + `/v1/inventory` JSON validity (`meta_json.rs`).
 
@@ -313,9 +335,16 @@ oha.
 
 Full log: `docs/DECISIONS.md` (per milestone). Highlights:
 
-* JPEG2000/PNG/AEC section-7 templates rejected with typed errors (no
-  dependency added; real NOAA GFS/HRRR pgrb2 use 5.0/5.3 exclusively; fallback
-  decision if 5.40 ever ships: link ecCodes or shell out to wgrib2 — deferred).
+* Codec scope still unsupported (typed `CodecUnsupported`, never a guess):
+  JPEG2000 streams whose samples exceed 8-bit-per-value packing or carry multiple
+  components; PNG non-grayscale color types, bit depths other than 8/16, interlacing,
+  non-zero compression/filter methods; AEC parameter sets `rust-aec` rejects. DRT
+  5.1 "dictionary" remains `UnsupportedData(1)` — no encoder for it exists in the
+  wgrib2 ecosystem (guard fixture `tests/fixtures/unsupported_drt.grib2`).
+* Field-by-field publish (§4.5 incremental visibility) means a run can momentarily
+  expose a parameter without its whole level stack; a request for a NON-STORED
+  level then answers 422 `level_out_of_range` rather than extrapolating. Coarser
+  publish granularity is a documented follow-up (see docs/DECISIONS.md).
 * Run-length DRT is 5.200 (task text's "5.1" does not exist in GRIB2); no
   dictionary encoder exists in the ecosystem.
 * Layer-range messages (multi-level single messages) and non-integral forecast

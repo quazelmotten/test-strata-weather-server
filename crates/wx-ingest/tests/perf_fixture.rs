@@ -6,6 +6,9 @@
 
 use wx_ingest::pipeline::Pipeline;
 use wx_ingest::index::{PointQueryContext, evaluate_point};
+use wx_ingest::grib2::decode_file;
+use wx_ingest::grib2::ParamFilter;
+use wx_ingest::codecs::data_cksum_grid;
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
 use wx_ingest::state::{join_path, now_ns_marker, stat_size_mtime};
@@ -77,6 +80,55 @@ fn write_bytes(path: &str, bytes: &[u8]) {
                 Err(_) => { assert!(false); }
                 Ok(_) => {}
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JPEG2000 packing at production scale (spec §9.1 at GFS geometry): the same
+// forecast hour repacked as DRT 5.40 must decode to bit-identical arrays. The
+// checksums below were captured from tools/wgrib2-full `-checksum data` on
+// tests/perfdata/gfs_perf_f000_jpeg.grib2 (and are identical to the simple-packed
+// file's); regenerating fixtures re-checks that equality, this test pins it in
+// CI without wgrib2. Also prints the wall time of decoding one GFS-scale hour
+// through the JPEG2000 path, for the README ingest-latency numbers.
+// ---------------------------------------------------------------------------
+
+const PERF_JPEG_CKSUMS: [u32; 22] = [
+    313604276, 3623768571, 1605277577, 1093394411, 3302352484, 385811988,
+    4150684559, 4286297571, 183562162, 2724321841, 1830331398, 3780209560,
+    2536677251, 3457776197, 1335159323, 3035415466, 1830331398, 3032319591,
+    701295723, 96053817, 3109806711, 416041556,
+];
+
+#[test]
+fn perf_gfs_hour_jpeg_matches_simple_packing() {
+    match stat_size_mtime("../../tests/perfdata/gfs_perf_f000_jpeg.grib2") {
+        Err(_) => { return; }
+        Ok(_) => {}
+    }
+
+    let t0 = now_ns_marker("../../tests/perfdata");
+    let r = decode_file("../../tests/perfdata/gfs_perf_f000_jpeg.grib2".to_string(), ParamFilter::All);
+    let t1 = now_ns_marker("../../tests/perfdata");
+    match r {
+        Err(_e) => {
+            println!("jpeg perf twin decode failed");
+            assert!(false);
+        }
+        Ok((msgs, st)) => {
+            assert!(msgs.len() == PERF_JPEG_CKSUMS.len());
+            assert!(st.messages_decoded == 22);
+            let mut k = 0;
+            while k < msgs.len() {
+                let gk = msgs[k].grid.clone();
+                assert!(data_cksum_grid(msgs[k].data.clone(), &gk) == PERF_JPEG_CKSUMS[k]);
+                k += 1;
+            }
+            let ms = (t1 - t0) / 1000000;
+            println!("{}", ms);
+            // generous CI bound; the README records the real measured number
+            assert!(ms < 120000);
         }
     }
 }

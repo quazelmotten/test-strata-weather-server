@@ -1,11 +1,13 @@
 // PDT 4.8 statistically-processed fixture (stat_small.grib2): APCP
 // accumulations must carry StatKind::Accumulation + time ranges, TMP an
 // Average; values analytic; wgrib2 point checks from expected.json. Also:
-// unsupported_j2k.grib2 (DRT 5.40 JPEG2000) -> typed UnsupportedData.
+// the JPEG2000 twin (stat_small_jpeg.grib2, DRT 5.40) must decode with identical
+// metadata and values (spec §4.2: template 4.8 alongside compressed packing),
+// and a template nothing can read (DRT 5.1 dictionary) must surface as a typed
+// UnsupportedData error rather than a guessed array.
 
 use wx_ingest::grib2::decode_file;
 use wx_ingest::grib2::ParamFilter;
-use wx_ingest::grib2::GribErr;
 use wx_ingest::grib2::StatKind;
 
 const SNX: usize = 11;
@@ -105,16 +107,44 @@ fn stat_point_checks() {
 }
 
 #[test]
-fn j2k_rejected_with_typed_error() {
-    // spec §4.2 fallback decision: JPEG2000 (DRT 5.40) is not implemented;
-    // the decoder must reject it with a typed error, never silently guess.
-    let r = decode_file(spath("unsupported_j2k.grib2"), ParamFilter::All);
-    match r {
-        Ok((_m, _s)) => { assert!(false); }
-        Err(e) => {
-            match e {
-                GribErr::UnsupportedData(tmpl) => { assert!(tmpl == 40); }
-                _ => { assert!(false); }
+fn jpeg_twin_keeps_pdt48_metadata_and_values() {
+    // spec §4.2: product definition template 4.8 (statistically processed) must
+    // survive alongside compressed data representations. stat_small_jpeg.grib2
+    // is stat_small.grib2 re-encoded by tools/wgrib2-full with -set_grib_type
+    // jpeg (DRT 5.40); decoded metadata and values must be unchanged.
+    let a = decode_file(spath("stat_small.grib2"), ParamFilter::All);
+    match a {
+        Err(_) => { assert!(false); }
+        Ok((ma, _sa)) => {
+            let b = decode_file(spath("stat_small_jpeg.grib2"), ParamFilter::All);
+            match b {
+                Err(_) => { assert!(false); }
+                Ok((mb, sb)) => {
+                    assert!(mb.len() == 3);
+                    assert!(sb.messages_total == 3);
+                    assert!(sb.messages_decoded == 3);
+                    assert!(sb.messages_skipped == 0);
+                    for x in 0 .. 3 {
+                        assert!(mb[x].fc_secs == ma[x].fc_secs);
+                        assert!(mb[x].valid_epoch_secs == ma[x].valid_epoch_secs);
+                        assert!(mb[x].levels == ma[x].levels);
+                        assert!(mb[x].stat.kind == ma[x].stat.kind);
+                        assert!(mb[x].stat.ct4_11 == ma[x].stat.ct4_11);
+                        assert!(mb[x].stat.begin_secs == ma[x].stat.begin_secs);
+                        assert!(mb[x].stat.end_secs == ma[x].stat.end_secs);
+                        assert!(mb[x].data.len() == ma[x].data.len());
+                        for k in 0 .. ma[x].data.len() {
+                            assert!(mb[x].data[k] == ma[x].data[k]);
+                        }
+                    }
+                    // statistical process identity survives the repack, so the
+                    // accumulation time-interpolation guard (§6.3) still fires
+                    assert!(mb[0].stat.kind == StatKind::Accumulation);
+                    assert!(mb[0].stat.end_secs == 6 * 3600);
+                    assert!(mb[1].stat.kind == StatKind::Accumulation);
+                    assert!(mb[1].stat.begin_secs == 6 * 3600);
+                    assert!(mb[2].stat.kind == StatKind::Average);
+                }
             }
         }
     }

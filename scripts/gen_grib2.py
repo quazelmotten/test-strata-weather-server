@@ -498,18 +498,22 @@ def main():
         for r in srecs:
             f.write(r)
 
-    # ------- unsupported representation guard (JPEG2000 5.40) --------------
-    # Structurally valid message whose section 5 declares DRT 5.40; our
-    # decoder must fail with the typed UnsupportedData error, never garbage.
+    # ------- unsupported representation guard (DRT 5.1 dictionary) ---------
+    # Structurally valid message whose section 5 declares a data representation
+    # template no decoder in the wgrib2 ecosystem implements (dictionary packing
+    # 5.1: unpk.c handles 0/2/3/4/40/41/42/200 only). Our decoder must fail with
+    # the typed UnsupportedData error, never garbage. NOTE: JPEG2000 (5.40) used
+    # to live here; V1.1 phase 2 decodes it for real, so the guard moved to a
+    # template that is genuinely unsupported (see tests/packing_twins.rs).
     u5 = bytearray()
     u5 += u4(snx * sny)
-    u5 += u2(40)          # template 5.40 JPEG2000
+    u5 += u2(1)           # template 5.1 dictionary packing (unsupported)
     u5 += f4be(0.0) + i2sm(0) + i2sm(0) + bytes([8, 0])
     u5 += u4(16) + bytes([0, 0, 0, 0, 0, 0, 0])
     urec = build_record(sth, sgrid, sec4(PARAMS["APCP"][0], PARAMS["APCP"][1],
                                          LEVEL_SURFACE, 0, 6), section(5, bytes(u5)),
                         sec7(bytes(range(16))), None)
-    with open(os.path.join(a.out, "unsupported_j2k.grib2"), "wb") as f:
+    with open(os.path.join(a.out, "unsupported_drt.grib2"), "wb") as f:
         f.write(urec)
 
     # ------- full-size realistic perf DATASET (gitignored dir) ---------------

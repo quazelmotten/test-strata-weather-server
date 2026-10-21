@@ -1,16 +1,38 @@
 #!/usr/bin/env bash
 # Re-probe the reference wgrib2 binary against the fixtures and rewrite
 # tests/fixtures/expected.json (the ground truth the Rust implementation is
-# validated against). Idempotent. Uses ONLY the locally built wgrib2.
+# validated against). Idempotent. Uses ONLY the locally built wgrib2 --
+# tools/wgrib2-full, the full-codec build, so every packing twin (complex
+# packing, JPEG2000, PNG, CCSDS AEC, IEEE) can be probed too: the twins must
+# produce byte-identical inventories and point values next to the simple-packed
+# original.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-WG=tools/wgrib2
+WG=tools/wgrib2-full
 "$WG" -version >/dev/null 2>&1 || true   # not all builds have -version; ignore
 
 python3 - "$WG" <<'PYEOF'
-import subprocess, json, random, sys
+import subprocess, json, random, re, sys
 
 WG = sys.argv[1]
+
+def norm(obj):
+    """Byte offsets inside recorded wgrib2 output lines legitimately change with
+    the packing; normalize them away so twins can be compared exactly."""
+    if isinstance(obj, str):
+        return re.sub(r"^(\d+):(\d+):", r"\1:", obj)
+    if isinstance(obj, list):
+        return [norm(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: norm(v) for k, v in obj.items()}
+    return obj
+
+
+def strip_offsets(lines):
+    """Inventory lines carry per-record byte offsets, which of course change
+    when the packing changes; compare the semantic part only."""
+    return [re.sub(r"^(\d+):(\d+):", r"\1:", ln) for ln in lines]
+
 
 def probe(fname, *args):
     """Run wgrib2 FILE <args...>; returns list of non-empty stdout lines."""
@@ -68,18 +90,34 @@ def point_checks(name, records, pts):
                            "raw": lines[idx]})
     return checks
 
-for name in ("gfs_small.grib2", "gfs_small_c3.grib2"):
+GFS_TWINS = ("gfs_small.grib2", "gfs_small_c3.grib2", "gfs_small_jpeg.grib2",
+             "gfs_small_png.grib2", "gfs_small_png_f.grib2", "gfs_small_aec.grib2",
+             "gfs_small_ieee.grib2")
+for name in GFS_TWINS:
     fx = out["fixtures"].setdefault(name, {})
     fx["inventory_raw"] = probe(f"tests/fixtures/{name}")
     fx["point_checks"] = point_checks(name, gfs_records, GFS_PTS)
+
+# spec \u00a79.1 at the reference-tool level: every packing twin is
+# indistinguishable from the simple-packed original (masked nodes come back as
+# UNDEFINED, which point_checks records as value=None/masked=true).
+gb = out["fixtures"]["gfs_small.grib2"]
+for name in GFS_TWINS[1:]:
+    fx = out["fixtures"][name]
+    assert norm(fx["inventory_raw"]) == norm(gb["inventory_raw"]), \
+        f"{name}: inventory differs"
+    assert norm(fx["point_checks"]) == norm(gb["point_checks"]), \
+        f"{name}: point checks differ"
 
 # ---------------- hrrr_small & twin (LCC projection + values) ----------
 HRR = "tests/fixtures/hrrr_small.grib2"
 NX, NY = 61, 41
 LA1, LO1 = 21.11389, 233.44
-rnd = random.Random(20261019)
 
 def ij_checks(fname):
+    # fresh RNG per file: every HRRR twin gets the SAME probe points, so their
+    # recorded values must be identical across packings.
+    rnd = random.Random(20261019)
     hrr_inv = probe(fname)
     tmp_f000_idx = next(n for n, ln in enumerate(hrr_inv) if ":TMP:" in ln and ":anl:" in ln)
     def check_pt(lon, lat):
@@ -113,32 +151,49 @@ def ij_checks(fname):
             pts.append(rec)
     return pts
 
-for name in ("hrrr_small.grib2", "hrrr_small_c3.grib2"):
+HRRR_TWINS = ("hrrr_small.grib2", "hrrr_small_c3.grib2", "hrrr_small_jpeg.grib2",
+              "hrrr_small_png.grib2", "hrrr_small_png_f.grib2", "hrrr_small_aec.grib2",
+              "hrrr_small_ieee.grib2")
+for name in HRRR_TWINS:
     fx = out["fixtures"].setdefault(name, {})
     fx["inventory_raw"] = probe(f"tests/fixtures/{name}")
     fx["ij_checks"] = ij_checks(f"tests/fixtures/{name}")
 
-# ---------------- stat_small (PDT 4.8) ---------------------------------
-STAT = "tests/fixtures/stat_small.grib2"
-out["fixtures"]["stat_small.grib2"] = {
-    "inventory_raw": probe(STAT),
-    "point_checks": [],
-}
-stat_pts = [(240.0, 20.0), (238.0, 18.0), (235.0, 17.0)]
-lines_by_rec = {}
-for lon, lat in stat_pts:
-    lines = probe(STAT, "-lon", str(lon), str(lat))
-    for idx, ln in enumerate(lines):
-        plon, plat, val = parse_lon(ln)
-        lines_by_rec.setdefault(idx, []).append((lon, lat, val))
-for idx in sorted(lines_by_rec):
-    inv_line = out["fixtures"]["stat_small.grib2"]["inventory_raw"][idx]
-    for lon, lat, val in lines_by_rec[idx]:
-        out["fixtures"]["stat_small.grib2"]["point_checks"].append({
-            "record_index": idx + 1, "inv_line": inv_line,
-            "req_lon": lon, "req_lat": lat,
-            "value": None if val.startswith("9.999e+20") else float(val),
-            "masked": val.startswith("9.999e+20")})
+hb = out["fixtures"]["hrrr_small.grib2"]
+for name in HRRR_TWINS[1:]:
+    fx = out["fixtures"][name]
+    assert strip_offsets(fx["inventory_raw"]) == strip_offsets(hb["inventory_raw"]), \
+        f"{name}: inventory differs"
+    assert fx["ij_checks"] == hb["ij_checks"], f"{name}: ij checks differ"
+
+# ---------------- stat_small (PDT 4.8) + its JPEG2000 twin ---------------
+def stat_truth(name):
+    fname = f"tests/fixtures/{name}"
+    entry = {
+        "inventory_raw": probe(fname),
+        "point_checks": [],
+    }
+    stat_pts = [(240.0, 20.0), (238.0, 18.0), (235.0, 17.0)]
+    lines_by_rec = {}
+    for lon, lat in stat_pts:
+        lines = probe(fname, "-lon", str(lon), str(lat))
+        for idx, ln in enumerate(lines):
+            plon, plat, val = parse_lon(ln)
+            lines_by_rec.setdefault(idx, []).append((lon, lat, val))
+    for idx in sorted(lines_by_rec):
+        inv_line = entry["inventory_raw"][idx]
+        for lon, lat, val in lines_by_rec[idx]:
+            entry["point_checks"].append({
+                "record_index": idx + 1, "inv_line": inv_line,
+                "req_lon": lon, "req_lat": lat,
+                "value": None if val.startswith("9.999e+20") else float(val),
+                "masked": val.startswith("9.999e+20")})
+    return entry
+
+out["fixtures"]["stat_small.grib2"] = stat_truth("stat_small.grib2")
+out["fixtures"]["stat_small_jpeg.grib2"] = stat_truth("stat_small_jpeg.grib2")
+assert (norm(out["fixtures"]["stat_small.grib2"]) ==
+        norm(out["fixtures"]["stat_small_jpeg.grib2"])), "PDT 4.8 twin differs"
 
 with open("tests/fixtures/expected.json", "w") as f:
     json.dump(out, f, indent=1)

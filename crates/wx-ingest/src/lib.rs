@@ -195,6 +195,33 @@ pub mod index;
 #[allow(clippy::manual_map)]
 pub mod pipeline;
 
+#[allow(clippy::needless_return)]
+#[allow(clippy::redundant_field_names)]
+#[allow(clippy::needless_arbitrary_self_type)]
+#[allow(clippy::manual_div_ceil)]
+#[allow(clippy::unnecessary_cast)]
+#[allow(clippy::manual_range_contains)]
+#[allow(clippy::assign_op_pattern)]
+#[allow(clippy::double_parens)]
+#[allow(clippy::explicit_counter_loop)]
+#[allow(clippy::len_zero)]
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_borrow)]
+#[allow(clippy::needless_borrows_for_generic_args)]
+#[allow(clippy::ptr_arg)]
+#[allow(clippy::manual_find)]
+#[allow(clippy::single_match)]
+#[allow(clippy::match_bool)]
+#[allow(clippy::match_single_binding)]
+#[allow(clippy::manual_swap)]
+#[allow(clippy::cmp_owned)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::collapsible_match)]
+#[allow(clippy::if_same_then_else)]
+#[allow(clippy::unnecessary_to_owned)]
+#[allow(clippy::manual_map)]
+pub mod codecs;
+
 pub use config::load_config;
 pub use config::validate_config;
 pub use config::PointConfig;
