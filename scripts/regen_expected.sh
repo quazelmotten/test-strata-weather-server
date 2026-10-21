@@ -195,6 +195,61 @@ out["fixtures"]["stat_small_jpeg.grib2"] = stat_truth("stat_small_jpeg.grib2")
 assert (norm(out["fixtures"]["stat_small.grib2"]) ==
         norm(out["fixtures"]["stat_small_jpeg.grib2"])), "PDT 4.8 twin differs"
 
+# ------- frac_small (fractional forecast hours, V1.1 phase 3) -------------
+# The generator's analytic formula is value = BASE + j*nx + i + fc_minute
+# (BASE 250 for run 12Z, 500 for run 12:30Z, 5 for the APCP accumulation),
+# which must agree with what wgrib2 reads back from CT 4.4 unit=minute.
+FNX, FNY = 21, 11
+def frac_expect(idx, lon, lat):
+    """(record_index is 1-based) -> analytic value at the snapped node."""
+    i = round((lon - 350.0) / 0.5)
+    j = round((10.0 - lat) / 0.5)
+    k = j * FNX + i
+    if idx <= 3:
+        return 250 + k + (0, 30, 60)[idx - 1]
+    if idx <= 5:
+        return 500 + k + (0, 30)[idx - 4]
+    return 5 + k + 30
+
+fname = "tests/fixtures/frac_small.grib2"
+fx = out["fixtures"].setdefault("frac_small.grib2", {})
+fx["inventory_raw"] = probe(fname)
+frac_pts = [(351.5, 9.0), (350.0, 10.0), (359.5, 5.0)]
+checks = []
+for lon, lat in frac_pts:
+    lines = probe(fname, "-lon", str(lon), str(lat))
+    for idx, ln in enumerate(lines):
+        plon, plat, val = parse_lon(ln)
+        exp = frac_expect(idx + 1, plon, plat)
+        assert float(val) == float(exp), \
+            f"frac_small record {idx+1} at ({plon},{plat}): wgrib2={val} analytic={exp}"
+        checks.append({"record_index": idx + 1, "inv_line": fx["inventory_raw"][idx],
+                       "req_lon": lon, "req_lat": lat, "snapped_lon": plon,
+                       "snapped_lat": plat, "value": float(val),
+                       "analytic_formula": "BASE + j*21 + i + fc_minute"})
+fx["point_checks"] = checks
+
+# ---------------- robust_small (skip-and-note fixtures) ------------------
+fname = "tests/fixtures/robust_small.grib2"
+fx = out["fixtures"].setdefault("robust_small.grib2", {})
+fx["inventory_raw"] = probe(fname)
+rob = []
+for lon, lat in [(351.5, 9.0), (350.0, 10.0)]:
+    lines = probe(fname, "-lon", str(lon), str(lat))
+    for idx, ln in enumerate(lines):
+        plon, plat, val = parse_lon(ln)
+        # records 1 and 4 are the GOOD messages; 2 (coord list) and 3 (layer)
+        # are skipped by our decoder/pipeline, so only 1 and 4 must be stored.
+        i = round((plon - 350.0) / 0.5)
+        j = round((10.0 - plat) / 0.5)
+        exp = 300 + j * FNX + i
+        assert float(val) == float(exp), \
+            f"robust_small record {idx+1}: wgrib2={val} analytic={exp}"
+        rob.append({"record_index": idx + 1, "inv_line": fx["inventory_raw"][idx],
+                    "req_lon": lon, "req_lat": lat, "value": float(val),
+                    "stored_by_our_pipeline": idx in (0, 3)})
+fx["point_checks"] = rob
+
 with open("tests/fixtures/expected.json", "w") as f:
     json.dump(out, f, indent=1)
 print("expected.json rewritten")

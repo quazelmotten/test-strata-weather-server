@@ -712,3 +712,158 @@ packed products.
 * Still unsupported by design: JPEG2000 >24-bit depth or multi-component, PNG
   colour types / interlace / depths other than 8-16 / non-zero methods, AEC
   parameter sets `rust-aec` rejects, DRT 5.1 dictionary. All typed errors.
+
+# V1.1 phase 3 decisions (fractional forecast hours, skip-and-note, durability)
+
+Audit items closed: fractional forecast hours end-to-end, robustness for
+structurally unusable messages, real directory fsync, PDT 4.8 statistical time
+ranges in `manifest.json`.
+
+## Canonical forecast-hour naming (spec §4.5 storage keys)
+
+Internal join key everywhere is **integer SECONDS past the run reference time**
+(`RegFh.fh_secs`, `IdxFh.fh_secs`, `PointQueryContext.want_fh_secs`). Filenames
+render that offset with ONE canonical scheme, trailing zero components omitted:
+
+| condition | name | example |
+|---|---|---|
+| `secs % 3600 == 0` | `f<HHH>.bin` | `f000.bin`, `f006.bin`, `f1000.bin` |
+| `secs % 60 == 0` (not an hour) | `f<HHH>m<MM>.bin` | `f000m30.bin`, `f001m30.bin` |
+| whole seconds otherwise | `f<HHH>m<MM>s<SS>.bin` | `f001m01s01.bin` |
+
+* Integral hours are **byte-identical** to the milestone-3 layout, so every pre-
+  existing store stays readable and `/v1/inventory` output is unchanged for them.
+* Hours pad to ≥3 digits; ≥1000 h widens instead of breaking the pattern.
+* Sub-second offsets cannot exist: Code Table 4.4's finest unit is SECOND (code
+  13), so `fc_secs` is always whole seconds by construction.
+* The reader (`parse_fh_name`) is strict about non-canonical names — `f001m5.bin`,
+  `f001m70.bin`, `f001m00s777.bin` are IGNORED rather than reinterpreted — but
+  tolerates `f006m00.bin` as an alias of `f006.bin`: the writer never emits it, and
+  refusing it would silently DROP data from a hand-assembled store. Documented
+  nuance rather than a bug either way.
+* Why not decimal-hour filenames (`f0.5.bin`)? Locale/format ambiguity, and a
+  float can't be a filesystem key; seconds are exact integers.
+
+## Run-directory naming (collision fix)
+
+`YYYYMMDDHH` gains `MM` when the run minute ≠ 0 and `SS` when the run second ≠
+0 → lengths 10/12/14, disambiguated by length. Before this, runs 12Z and 12:30Z
+on one day both mapped to `2026101912` and MERGED into one run directory (data
+corruption, not cosmetic). Old 10-char directories keep parsing (minute/second
+default 0); `parse_run_dir` rejects impossible fields (minute 60 etc.).
+
+## Time arithmetic in seconds, reported in hours
+
+All comparisons/interpolation use whole-second offsets (`select_run(want_fh_secs)`,
+`resolve_times`, `time_lerp`): 1800 s is exactly representable as an integer while
+0.5 h is only exactly representable as a fraction, so the seconds form is at least
+as accurate as what it replaces. The RESPONSE converts back to HOURS
+(`InterpInfo.time.forecast_hours = fh_secs / 3600`) because spec §7 shows
+`forecast_hours` in hours; `manifest.forecast_hours` and `/v1/inventory` likewise
+print decimal hours (informational only — the filename is the authoritative key).
+
+Per-run offset recomputation: one instant can be run A's `f001.bin` AND run B's
+`f000m30.bin`. `queryapi.answer_param` walks runs newest→oldest and recomputes
+`fh_secs = valid_ep - run_ep` per candidate, so "most recent run covering `valid`"
+is well-defined for non-hourly reference times (spec §6.3).
+
+## Manifest statistical ranges are PER forecast hour
+
+```json
+{"param":"APCP","level_type":"surface","stat_processed":true,"stat_kind":"accumulation",
+ "levels":[0],"forecast_hours":[0.5],
+ "stat_ranges":[{"fh_secs":1800,"begin":"2026-10-19T12:30:00Z",
+                 "end":"2026-10-19T13:00:00Z","step_secs":0}]}
+```
+Two accumulations of ONE (param, level type) have DIFFERENT windows, so the range
+travels with the forecast hour (`fh_secs` is the exact join key), not the field.
+`begin`/`end` are absolute ISO-8601 UTC instants; a warm start restores them via
+`stat_range_for` so the accumulation guard survives restarts.
+
+**Bug found while wiring this:** `store.iso_utc`'s closed-form Hinnant inverse used
+`era = z / 400` instead of `z / 146097` (and a bogus `yoe` expression), producing
+years like `555635-0-6607885-0-26T12:30:00Z`. Replaced with the correct era divisor
+plus a bounded year-of-era search (`yoe ≤ 399`; at `doe = 146096` — a leap year's
+Feb 29 — the naive predicate admits yoe=400 and shifts the date by one day). Runs
+at ingest time only. Pinned by `tests/iso_roundtrip.rs`: 8 known instants plus a
+day-by-day round trip over 1970-01-01…2104-12-31 (leap day, non-leap century 2100).
+
+## wgrib2 renders accumulation ranges differently than we store them
+
+wgrib2 prints an accumulation as `[fc-len, fc]` ("0-30 min acc(30 min fcst)") but
+an average as `[fc, fc+len]`. Our decoder stores `begin = fc_secs`, `end = fc_secs + len`
+uniformly (validated empirically against wgrib2 readback in phase 2 and asserted by
+`tests/stat_pdt.rs`). The guard behaviour is unaffected — it only needs the range to
+exist and be non-degenerate — but anyone diffing manifest JSON against wgrib2 text
+must expect this difference for accumulations.
+
+## Skip-and-NOTE policy (never an error, never silent)
+
+Three structural cases SKIP the message and CONTINUE at `body_end` (the byte length
+declared in section 0), so the rest of the file still ingests:
+* coordinate values after the product-definition template (`SkipReason::CoordLists`),
+* grid templates this decoder does not implement (`SkipReason::Grid(t)`),
+* product-definition templates not implemented (`SkipReason::Pdt(t)`).
+
+They increment `DecodeStats.messages_unsupported` → `IngestCounters.skipped_messages`
+→ Prometheus `wxpoint_skipped_messages_total`, plus a bounded ingest note. Layer/range
+messages (two fixed surfaces) decode fine structurally but cannot answer a point query,
+so the pipeline skips them the same way (`msg.levels.len() != 1`). Fractional
+forecast hours are VALID data and NEVER count as errors; only a NEGATIVE offset
+(corrupt) is skipped. Corrupt or unsupported section 7 (DRT 5.1 dictionary) still
+fails LOUD as an ingest error — that keeps the packing-twin guard (`packing_twins.rs`)
+working: a decoder that silently returns zeros must not look like a skip.
+
+## Durability: real fsync requires libc here
+
+This toolchain's `std::fs::File` exposes only `flush()`; `strace` confirms it emits
+NO `fsync` syscall, and there is no `fd()`/`FileDescriptor`/`flush_sync` accessor
+to reach the descriptor. So `wx_core::storage::fsync_path()` binds libc directly:
+
+```rust
+extern "C" {
+    #[link_name = "open"]  fn libc_open(path: *const i8, flags: i32, ...) -> i32;
+    #[link_name = "fsync"] fn libc_fsync(fd: i32) -> i32;
+    #[link_name = "close"] fn libc_close(fd: i32) -> i32;
+}
+```
+(`extern "C"` block + explicit `#[link_name]` + `*const i8` avoids the suspicious-
+runtime-symbol warning this toolchain emits for an implicit `open`, and keeps the
+declaration from colliding with the runtime's own symbol.) Order per file:
+write → flush → fsync(inode) → rename → **fsync(parent dir)**, so a crash cannot
+resurrect a renamed-but-unlinked name. Errors are surfaced, not swallowed. Used by
+`write_bin_atomic`, the state-file writer, and the manifest/grid writer. The earlier
+README claim "(+dir fsync)" was aspirational; it is now literally true.
+
+`write_bin_atomic`'s error type widened from `&'static str` to `String` (callers
+only match Ok/Err) so fsync messages can carry the path.
+
+## Tests added (names)
+
+* `crates/wx-ingest/tests/fractional_fh.rs`: `fh_filename_scheme_roundtrip_and_backcompat`,
+  `run_dir_names_carry_minutes_without_collisions`, `frac_fixture_decodes_minute_units_as_seconds`,
+  `fractional_hours_storage_and_manifest`, `fractional_hours_queries_and_run_selection`
+* `crates/wx-ingest/tests/robust_skips.rs`: `coord_list_message_is_skipped_and_the_walk_resumes`,
+  `pipeline_skips_are_noted_not_errors`
+* `crates/wx-ingest/tests/iso_roundtrip.rs`: `iso_utc_matches_known_instants`,
+  `iso_utc_parse_round_trips_across_two_centuries`
+* `crates/wx-server/tests/frac_http.rs`: `fractional_hours_over_http` (exact fractional
+  slot, mid-bracket `[0.5,1]`, newest-run-wins vs pinned run, 404 beyond both runs,
+  accumulation guard on a fractional window, `time_interp=none`, inventory hours,
+  `wxpoint_skipped_messages_total 2`), `robust_model_answers_despite_skipped_messages`
+* extended `restart.rs`: manifest `stat_ranges` bytes on disk + warm-boot restore of
+  per-fh begin/end for BOTH accumulations and the 3-hour average.
+
+Fixtures: `tests/fixtures/frac_small.grib2` (CT 4.4 minute units, two runs 12Z and
+12:30Z in ONE file, one 30-minute accumulation) and `robust_small.grib2`
+([good TMP@850][coordinate-list][layer 850-800][good TMP@2m AGL]); both generated
+by `scripts/gen_grib2.py`, probed into `tests/fixtures/expected.json` by
+`scripts/regen_expected.sh` through `tools/wgrib2-full` (values 295/325/355/545/575/80
+at lon 351.5 lat 9.0 for frac; 300 + j*21 + i for robust).
+
+## Gate
+
+`cargo test --workspace`: 80 tests green (was 69). `cargo clippy --workspace -- -D
+warnings`: rc=0. Two pre-existing `format!`-in-`format!` lints in `store.fmt_hours`
+had to be fixed to keep that gate clean. `--all-targets` still reports lints in
+older wx-core test/bench files (pre-existing, untouched by this phase).

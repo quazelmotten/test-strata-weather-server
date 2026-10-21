@@ -5216,6 +5216,272 @@
      "masked": false
     }
    ]
+  },
+  "frac_small.grib2": {
+   "inventory_raw": [
+    "1:0:d=2026101912:TMP:850 mb:anl:",
+    "2:419:d=2026101912:TMP:850 mb:30 min fcst:",
+    "3:838:d=2026101912:TMP:850 mb:60 min fcst:",
+    "4:1257:d=2026101912:TMP:850 mb:anl:",
+    "5:1676:d=2026101912:TMP:850 mb:30 min fcst:",
+    "6:2095:d=2026101912:APCP:surface:0-30 min acc(30 min fcst):"
+   ],
+   "point_checks": [
+    {
+     "record_index": 1,
+     "inv_line": "1:0:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 295.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 2,
+     "inv_line": "2:419:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 325.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 3,
+     "inv_line": "3:838:d=2026101912:TMP:850 mb:60 min fcst:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 355.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 4,
+     "inv_line": "4:1257:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 545.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 5,
+     "inv_line": "5:1676:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 575.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 6,
+     "inv_line": "6:2095:d=2026101912:APCP:surface:0-30 min acc(30 min fcst):",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "snapped_lon": 351.5,
+     "snapped_lat": 9.0,
+     "value": 80.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 1,
+     "inv_line": "1:0:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 250.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 2,
+     "inv_line": "2:419:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 280.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 3,
+     "inv_line": "3:838:d=2026101912:TMP:850 mb:60 min fcst:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 310.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 4,
+     "inv_line": "4:1257:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 500.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 5,
+     "inv_line": "5:1676:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 530.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 6,
+     "inv_line": "6:2095:d=2026101912:APCP:surface:0-30 min acc(30 min fcst):",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "snapped_lon": 350.0,
+     "snapped_lat": 10.0,
+     "value": 35.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 1,
+     "inv_line": "1:0:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 479.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 2,
+     "inv_line": "2:419:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 509.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 3,
+     "inv_line": "3:838:d=2026101912:TMP:850 mb:60 min fcst:",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 539.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 4,
+     "inv_line": "4:1257:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 729.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 5,
+     "inv_line": "5:1676:d=2026101912:TMP:850 mb:30 min fcst:",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 759.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    },
+    {
+     "record_index": 6,
+     "inv_line": "6:2095:d=2026101912:APCP:surface:0-30 min acc(30 min fcst):",
+     "req_lon": 359.5,
+     "req_lat": 5.0,
+     "snapped_lon": 359.5,
+     "snapped_lat": 5.0,
+     "value": 264.0,
+     "analytic_formula": "BASE + j*21 + i + fc_minute"
+    }
+   ]
+  },
+  "robust_small.grib2": {
+   "inventory_raw": [
+    "1:0:d=2026101912:TMP:850 mb:anl:",
+    "2:419:d=2026101912:TMP:925 mb:anl:",
+    "3:842:d=2026101912:TMP:850-800 mb:anl:",
+    "4:1261:d=2026101912:TMP:2 m above ground:anl:"
+   ],
+   "point_checks": [
+    {
+     "record_index": 1,
+     "inv_line": "1:0:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "value": 345.0,
+     "stored_by_our_pipeline": true
+    },
+    {
+     "record_index": 2,
+     "inv_line": "2:419:d=2026101912:TMP:925 mb:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "value": 345.0,
+     "stored_by_our_pipeline": false
+    },
+    {
+     "record_index": 3,
+     "inv_line": "3:842:d=2026101912:TMP:850-800 mb:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "value": 345.0,
+     "stored_by_our_pipeline": false
+    },
+    {
+     "record_index": 4,
+     "inv_line": "4:1261:d=2026101912:TMP:2 m above ground:anl:",
+     "req_lon": 351.5,
+     "req_lat": 9.0,
+     "value": 345.0,
+     "stored_by_our_pipeline": true
+    },
+    {
+     "record_index": 1,
+     "inv_line": "1:0:d=2026101912:TMP:850 mb:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "value": 300.0,
+     "stored_by_our_pipeline": true
+    },
+    {
+     "record_index": 2,
+     "inv_line": "2:419:d=2026101912:TMP:925 mb:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "value": 300.0,
+     "stored_by_our_pipeline": false
+    },
+    {
+     "record_index": 3,
+     "inv_line": "3:842:d=2026101912:TMP:850-800 mb:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "value": 300.0,
+     "stored_by_our_pipeline": false
+    },
+    {
+     "record_index": 4,
+     "inv_line": "4:1261:d=2026101912:TMP:2 m above ground:anl:",
+     "req_lon": 350.0,
+     "req_lat": 10.0,
+     "value": 300.0,
+     "stored_by_our_pipeline": true
+    }
+   ]
   }
  }
 }

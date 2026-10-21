@@ -22,7 +22,12 @@
 //! * Section 4 PDT 4.0 (instantaneous) and 4.8 (statistically processed: CT
 //!   4.6 period indicator + CT 4.11 interval code + time range). Other PDTs
 //!   -> typed `UnsupportedPdt(tmpl)`; coordinate lists after the template ->
-//!   typed `UnsupportedCoordLists`.
+//!   typed `UnsupportedCoordLists`. V1.1 phase 3: the three STRUCTURAL cases
+//!   (coordinate lists, unknown grid template, unknown PDT template) SKIP
+//!   THAT MESSAGE and resume at the next message boundary instead of aborting
+//!   the whole file; they are counted in `DecodeStats.messages_unsupported`
+//!   and NEVER in the ingest error counter (spec §4.2: skip what you cannot
+//!   use). A malformed/corrupt section 7 still fails the decode loudly.
 //! * Section 6 bitmap: indicator 255 = no bitmap, 0/254 = bitmap present
 //!   (bit=1 means the point is DEFINED, matching `missing.c`); masked points
 //!   decode to NaN.
@@ -80,6 +85,28 @@ pub enum GribErr {
     /// The stream parsed but uses a construct the backend deliberately does
     /// not implement (see codecs::rs module docs and docs/DECISIONS.md).
     CodecUnsupported(&'static str),
+}
+
+/// Why a message was SKIPPED for structural reasons (V1.1 phase 3). These
+/// never abort the file: the walk resumes at the next message boundary
+/// (`pos = body_end`, i.e. the length declared in section 0), the message is
+/// counted in `DecodeStats.messages_unsupported`, and the pipeline turns it
+/// into a note + `skipped_messages` increment — NOT an ingest error.
+#[derive(Clone, Debug)]
+pub enum SkipReason {
+    CoordLists, // section 4 carries coordinate values after the template
+    Grid(u16), // section 3 template this decoder does not implement
+    Pdt(u16), // section 4 product-definition template not implemented
+}
+
+pub fn skip_reason_text(r: &SkipReason) -> String {
+    match r {
+        SkipReason::CoordLists => {
+            return "coordinate list after the product-definition template".to_string();
+        }
+        SkipReason::Grid(t) => { return format!("grid template 3.{0}", t); }
+        SkipReason::Pdt(t) => { return format!("product definition template 4.{0}", t); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +172,8 @@ pub struct DecodedMessage {
 pub struct DecodeStats {
     pub messages_total: u32,
     pub messages_decoded: u32,
-    pub messages_skipped: u32,
+    pub messages_skipped: u32, // filtered out by the parameter allow-list
+    pub messages_unsupported: u32, // structurally unparseable: SKIP-AND-NOTE
     pub sec7_bytes_decoded: usize,
     pub sec7_bytes_skipped: usize,
 }
@@ -1015,6 +1043,7 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
         messages_total: 0,
         messages_decoded: 0,
         messages_skipped: 0,
+        messages_unsupported: 0,
         sec7_bytes_decoded: 0,
         sec7_bytes_skipped: 0,
     };
@@ -1045,6 +1074,10 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
         let mut s6: Option<&[u8]> = None;
         let mut s7: Option<&[u8]> = None;
         let mut eof_flag = false;
+        // structural skip reason for THIS message (V1.1 phase 3): when set the
+        // message is counted as unsupported and the walk continues at
+        // `body_end` instead of failing the file.
+        let mut skip: Option<SkipReason> = None;
 
         let mut q = pos + 16;
         while q < body_end {
@@ -1076,15 +1109,35 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
                 3 => {
                     let pg = parse_sec3(payload);
                     match pg {
-                        Err(e) => { return Err(e); }
                         Ok(gd) => { grid = Some(gd); }
+                        Err(e) => {
+                            match e {
+                                GribErr::UnsupportedGrid(t) => {
+                                    skip = Some(SkipReason::Grid(t));
+                                    break;
+                                }
+                                _ => { return Err(e); }
+                            }
+                        }
                     }
                 }
                 4 => {
                     let pp = parse_sec4(payload);
                     match pp {
-                        Err(e) => { return Err(e); }
                         Ok(pi) => { prod = Some(pi); }
+                        Err(e) => {
+                            match e {
+                                GribErr::UnsupportedCoordLists => {
+                                    skip = Some(SkipReason::CoordLists);
+                                    break;
+                                }
+                                GribErr::UnsupportedPdt(t) => {
+                                    skip = Some(SkipReason::Pdt(t));
+                                    break;
+                                }
+                                _ => { return Err(e); }
+                            }
+                        }
                     }
                 }
                 5 => { s5 = Some(payload); }
@@ -1094,6 +1147,23 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
                 _ => {}
             }
             q += ln;
+        }
+        // SKIP-AND-NOTE path: an unparseable-by-design construct makes this
+        // ONE message invisible to storage while the file keeps decoding. The
+        // boundary comes from section 0's declared length, so a skipped message
+        // cannot desynchronize the walk (proof: robust_skips.rs decodes the
+        // messages on BOTH SIDES of a coord-list and a layer message).
+        match skip {
+            Some(_) => {
+                st.messages_total += 1;
+                st.messages_unsupported += 1;
+                pos = body_end;
+                if eof_flag {
+                    break;
+                }
+                continue;
+            }
+            None => {}
         }
         let rt = match run_time {
             Some(x) => { x }

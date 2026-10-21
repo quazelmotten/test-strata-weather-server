@@ -218,7 +218,11 @@ PARAMS = {
 }
 
 
-def sec4(cat, num, level_type, level_value, fcst_hour):
+def sec4(cat, num, level_type, level_value, fcst_hour, fc_unit=1):
+    """`fc_unit` is Code Table 4.4 (1=hour, 0=minute, 13=second, 2=day, ...):
+    `fcst_hour` is expressed IN THOSE UNITS. Default 1 keeps every existing
+    call site byte-identical; unit=0 emits fractional forecast hours (e.g.
+    30 -> 0h30m), which our decoder normalizes to whole SECONDS."""
     p = bytearray()
     p += u2(0)            # number of coordinate values after template
     p += u2(0)            # PDT template 4.0
@@ -229,7 +233,7 @@ def sec4(cat, num, level_type, level_value, fcst_hour):
     p += bytes([0])       # analysis/forecast generating process identifier
     p += u2(0)            # hours of observational data cutoff
     p += bytes([0])       # minutes of observational data cutoff
-    p += bytes([1])       # ct 4.4 unit of time range: hour
+    p += bytes([fc_unit]) # ct 4.4 unit of time range (1=hour, 0=minute, ...)
     p += u4(fcst_hour)    # forecast time in those units
     p += bytes([level_type])   # first fixed surface type (ct 4.5)
     p += bytes([0])            # scale factor
@@ -244,7 +248,7 @@ def sec4(cat, num, level_type, level_value, fcst_hour):
 def sec4_pdt48(cat, num, period_flag, stat_proc, range_unit, range_len,
                step_unit, step_len, fcst_hour, level_type, scale, level_value,
                genproc=2, stat_year=2026, stat_mon=10, stat_day=19,
-               stat_hr=12, stat_min=0, stat_sec=0):
+               stat_hr=12, stat_min=0, stat_sec=0, fc_unit=1):
     """PDT template 4.8 (statistically processed), byte layout validated
     EMPIRICALLY against tools/wgrib2 v3.1.3 readback (see docs/DECISIONS.md):
     prefix identical to PDT 4.0 through the fixed surfaces, then
@@ -266,7 +270,7 @@ def sec4_pdt48(cat, num, period_flag, stat_proc, range_unit, range_len,
     p += bytes([0])       # an/fcst proc id
     p += u2(0)            # obs cutoff hours
     p += bytes([0])       # obs cutoff minutes
-    p += bytes([1])       # ct 4.4 unit of time period: hour
+    p += bytes([fc_unit]) # ct 4.4 unit of time period (1=hour, 0=minute, ...)
     p += u4(fcst_hour)
     p += bytes([level_type])
     p += bytes([scale])
@@ -278,6 +282,46 @@ def sec4_pdt48(cat, num, period_flag, stat_proc, range_unit, range_len,
     p += bytes([0, 0, 0, 0])                     # opaque 4 bytes
     p += bytes([period_flag, stat_proc, range_unit]) + u4(range_len)
     p += bytes([step_unit]) + u4(step_len)
+    return section(4, bytes(p))
+
+
+def sec4_coordlist(cat, num, level_type, level_value, fcst_hour, coord_bytes=b"\x00\x00\x00\x00"):
+    """Section 4 with a NON-ZERO number of coordinate values after the product
+    definition template (what real GRIB2 does for ensemble/soil-layer/etc.
+    constructs this point-query server will never support). Framing stays
+    byte-exact, so a decoder that skips it can resume at the next message."""
+    p = bytearray()
+    p += u2(1)            # ONE coordinate value follows the template
+    p += u2(0)            # PDT template 4.0
+    p += bytes([cat])
+    p += bytes([num])
+    p += bytes([2])       # ct 4.3 generating process type: forecast
+    p += bytes([0])       # background proc id
+    p += bytes([0])       # an/fcst proc id
+    p += u2(0)            # obs cutoff hours
+    p += bytes([0])       # obs cutoff minutes
+    p += bytes([1])       # ct 4.4 unit: hour
+    p += u4(fcst_hour)
+    p += bytes([level_type, 0]) + i4(level_value)
+    p += bytes([255, 255, 255, 255, 255, 255])
+    assert len(p) == 29
+    p += coord_bytes      # the coordinate value(s)
+    return section(4, bytes(p))
+
+
+def sec4_layer(cat, num, ltype1, sf1, val1, ltype2, sf2, val2, fcst_hour):
+    """PDT 4.0 with BOTH fixed surfaces present: a layer/range message (e.g.
+    850-800 hPa). Point queries are out of scope for these (spec §13), so the
+    pipeline must SKIP-AND-NOTE them without failing the file."""
+    p = bytearray()
+    p += u2(0)
+    p += u2(0)
+    p += bytes([cat, num, 2, 0, 0])
+    p += u2(0) + bytes([0])
+    p += bytes([1]) + u4(fcst_hour)
+    p += bytes([ltype1, sf1]) + i4(val1)
+    p += bytes([ltype2, sf2]) + i4(val2)
+    assert len(p) == 29
     return section(4, bytes(p))
 
 
@@ -496,6 +540,73 @@ def main():
         srecs.append(build_record(sth, sgrid, s4, s5b, s7b, None))
     with open(os.path.join(a.out, "stat_small.grib2"), "wb") as f:
         for r in srecs:
+            f.write(r)
+
+    # ------------- FRACTIONAL FORECAST HOURS (V1.1 phase 3) -----------------
+    # CT 4.4 unit = MINUTE (code 0): forecast hours 0h, 0h30m, 1h for run
+    # 2026-10-19T12Z, PLUS a SECOND RUN 12:30Z inside the SAME FILE (the
+    # run-directory collision regression: 12Z and 12:30Z must land in
+    # `2026101912` and `202610191230`), plus one PDT 4.8 accumulation whose
+    # statistical time range is 30 MINUTES. Values are analytic and LINEAR IN
+    # THE FORECAST MINUTE:   value = BASE + j*nx + i + fc_minute
+    # so an on-node probe at any forecast minute (incl. interpolated mid-bracket
+    # ones) is exactly predictable.
+    fnx, fny = 21, 11
+    fgrid = sec3_latlon(fnx, fny, 350.0, 10.0, 0.5, -0.5)
+    t12 = sec1(2026, 10, 19, 12, 0, 0)
+    t1230 = sec1(2026, 10, 19, 12, 30, 0)
+
+    def frac_msg(run_bytes, fc_min, base, cat, num, ltype, lval_raw, pdt48=None):
+        incs = [j * fnx + i + fc_min for j in range(fny) for i in range(fnx)]
+        s5b, s7b, s6b, _ = encode_field(incs, float(base), 0, None)
+        if pdt48 is None:
+            s4b = sec4(cat, num, ltype, lval_raw, fc_min, fc_unit=0)
+        else:
+            s4b = sec4_pdt48(cat, num, pdt48[0], pdt48[1], 0, 30, 0, 0,
+                             fc_min, ltype, 0, lval_raw, genproc=2, fc_unit=0)
+        return build_record(run_bytes, fgrid, s4b, s5b, s7b, s6b)
+
+    frecs = []
+    for fc in (0, 30, 60):                      # run 12Z: f000, f000m30, f001m00
+        frecs.append(frac_msg(t12, fc, 250, PARAMS["TMP"][0], PARAMS["TMP"][1],
+                              LEVEL_ISOBARIC, 850 * 100))
+    for fc in (0, 30):                          # run 12:30Z: distinct run dir
+        frecs.append(frac_msg(t1230, fc, 500, PARAMS["TMP"][0], PARAMS["TMP"][1],
+                              LEVEL_ISOBARIC, 850 * 100))
+    # APCP surface accumulation over the 30-minute window ending at fc 60 min
+    frecs.append(frac_msg(t12, 30, 5, PARAMS["APCP"][0], PARAMS["APCP"][1],
+                          LEVEL_SURFACE, 0, pdt48=(1, 1)))
+    with open(os.path.join(a.out, "frac_small.grib2"), "wb") as f:
+        for r in frecs:
+            f.write(r)
+
+    # ------------- SKIP-AND-NOTE robustness fixture (V1.1 phase 3) ----------
+    # Message order: [good TMP@850] [coordinate-list message] [layer 850-800
+    # message] [good TMP@2m AGL]. The decoder must decode BOTH good messages
+    # byte-perfectly (proving the walk resumed at the right boundary), count
+    # the coord-list message as an unsupported skip, and hand the layer message
+    # to the pipeline, which skips it too. Neither may bump the error counter.
+    rgrid = fgrid
+    rrecs = []
+    rinc = [j * fnx + i for j in range(fny) for i in range(fnx)]
+    r5, r7, r6, _ = encode_field(rinc, 300.0, 0, None)
+    rrecs.append(build_record(t12, rgrid,
+                              sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_ISOBARIC, 850 * 100, 0),
+                              r5, r7, r6))
+    rrecs.append(build_record(t12, rgrid,
+                              sec4_coordlist(PARAMS["TMP"][0], PARAMS["TMP"][1],
+                                             LEVEL_ISOBARIC, 925 * 100, 0),
+                              r5, r7, r6))
+    rrecs.append(build_record(t12, rgrid,
+                              sec4_layer(PARAMS["TMP"][0], PARAMS["TMP"][1],
+                                         LEVEL_ISOBARIC, 0, 850 * 100,
+                                         LEVEL_ISOBARIC, 0, 800 * 100, 0),
+                              r5, r7, r6))
+    rrecs.append(build_record(t12, rgrid,
+                              sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_AGL, 2, 0),
+                              r5, r7, r6))
+    with open(os.path.join(a.out, "robust_small.grib2"), "wb") as f:
+        for r in rrecs:
             f.write(r)
 
     # ------- unsupported representation guard (DRT 5.1 dictionary) ---------

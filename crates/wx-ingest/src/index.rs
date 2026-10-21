@@ -8,7 +8,10 @@
 //! ```text
 //! SharedIndex.get_index() -> Arc<IndexSnapshot>            (arc-swap load)
 //! IndexSnapshot.point_context(model, run?, param, level_code, want_level,
-//!                             want_fh_hours, mode) -> PointQueryContext
+//!                             want_fh_secs, mode) -> PointQueryContext
+//!   (want_fh_secs = valid_time - run_time in SECONDS; every time comparison
+//!   and interpolation happens in seconds, while the REPORTED
+//!   InterpInfo.forecast_hours stay HOURS to match spec §7)
 //! evaluate_point(ctx, lat, lon) -> wx_core QueryResult    (f64 value + InterpInfo)
 //! ```
 
@@ -22,11 +25,18 @@ use wx_core::interp::{
     bilinear4, horiz_nodes, resolve_levels, resolve_times, time_lerp, vertical_at,
 };
 
-/// A forecast-hour slot inside one field entry.
+/// A forecast-hour slot inside one field entry. `fh_secs` is the offset from
+/// the run time IN SECONDS (an exact key for fractional forecast hours); the
+/// PDT 4.8 statistical range for THIS slot travels with it so a restart can
+/// restore it and future endpoints can report it.
 #[derive(Clone)]
 pub struct IdxFh {
-    pub fh_hours: i64,
+    pub fh_secs: i64,
     pub field: Arc<MmapField>, // opened at index build time
+    pub stat_has_range: bool,
+    pub stat_begin_secs: i64, // offsets from the run time
+    pub stat_end_secs: i64,
+    pub stat_step_secs: i64,
 }
 
 #[derive(Clone)]
@@ -34,7 +44,7 @@ pub struct IdxField {
     pub units: String,
     pub stat_processed: bool, // template 4.8 guard input
     pub stat_kind: String,
-    pub fhs: Vec<IdxFh>, // sorted by fh_hours ascending
+    pub fhs: Vec<IdxFh>, // sorted by fh_secs ascending
 }
 
 #[derive(Clone)]
@@ -73,10 +83,11 @@ impl IndexSnapshot {
         return None;
     }
 
-    /// Latest run (or pinned one) whose field covers `want_fh_hours` under
-    /// `mode` (both bracketing fhs present when interpolating — spec §6.3).
+    /// Latest run (or pinned one) whose field covers `want_fh_secs` (offset
+    /// from that run's reference time in SECONDS) under `mode`; both bracketing
+    /// slots must exist when interpolating (spec §6.3).
     pub fn select_run(self: &Self, model: &str, param_key: &str, level_code: u8,
-                      want_fh_hours: f64, mode: TimeInterpMode,
+                      want_fh_secs: f64, mode: TimeInterpMode,
                       pinned_epoch: Option<i64>)
         -> Result<(usize, usize, &IdxRun, &IdxFieldEntry), SelectError> {
         let m = self.find_model(&model);
@@ -96,9 +107,9 @@ impl IndexSnapshot {
                         Some(f) => {
                             let mut fhs: Vec<f64> = Vec::<f64>::new();
                             for e in &f.fd.fhs {
-                                fhs.push(e.fh_hours as f64);
+                                fhs.push(e.fh_secs as f64);
                             }
-                            let pair = resolve_times(&fhs, want_fh_hours, mode, f.fd.stat_processed);
+                            let pair = resolve_times(&fhs, want_fh_secs, mode, f.fd.stat_processed);
                             match pair {
                                 Err(e) => {
                                     match e {
@@ -166,8 +177,8 @@ pub struct PointQueryContext {
     pub run_epoch_secs: i64,
     pub stat_processed: bool,
     pub want_level: f64,
-    pub want_fh_hours: f64,
-    pub fh_hours: (f64, f64),
+    pub want_fh_secs: f64, // offset from run time, SECONDS
+    pub fh_secs: (f64, f64), // chosen slots, SECONDS
     pub slots: [Option<SamplesSlot>; 2],
 }
 
@@ -175,9 +186,9 @@ impl PointQueryContext {
     /// Assemble the up-to-4 (level,time) samples for one point query.
     pub fn build(self: &Self, snapshot: &IndexSnapshot, model: &str,
                  pinned_epoch: Option<i64>, param_key: &str, level_code: u8,
-                 want_level: f64, want_fh_hours: f64, mode: TimeInterpMode)
+                 want_level: f64, want_fh_secs: f64, mode: TimeInterpMode)
         -> Result<PointQueryContext, SelectError> {
-        let sel = snapshot.select_run(&model, &param_key, level_code, want_fh_hours, mode, pinned_epoch);
+        let sel = snapshot.select_run(&model, &param_key, level_code, want_fh_secs, mode, pinned_epoch);
         match sel {
             Err(e) => { return Err(e); }
             Ok(t) => {
@@ -189,8 +200,8 @@ impl PointQueryContext {
                     run_epoch_secs: run.epoch_secs,
                     stat_processed: fe.fd.stat_processed,
                     want_level: want_level,
-                    want_fh_hours: want_fh_hours,
-                    fh_hours: (0.0, 0.0),
+                    want_fh_secs: want_fh_secs,
+                    fh_secs: (0.0, 0.0),
                     slots: [None, None],
                 };
                 let ti = (t.0, t.1);
@@ -198,10 +209,10 @@ impl PointQueryContext {
                 let idxs = |a: usize| -> usize { if a == 0 { return ti.0; } return ti.1; };
                 while k < 2 {
                     let ti_k = idxs(k);
-                    let slot_fh = fe.fd.fhs[ti_k].fh_hours as f64;
+                    let slot_fh = fe.fd.fhs[ti_k].fh_secs as f64;
                     if k == 1 && ti.1 == ti.0 {
                         ctx.slots[1] = ctx.slots[0].clone();
-                        ctx.fh_hours = (slot_fh, slot_fh);
+                        ctx.fh_secs = (slot_fh, slot_fh);
                         return Ok(ctx);
                     }
                     let mf = fe.fd.fhs[ti_k].field.clone();
@@ -219,9 +230,9 @@ impl PointQueryContext {
                                 li1: p.1,
                             });
                             if k == 0 {
-                                ctx.fh_hours = (slot_fh, slot_fh);
+                                ctx.fh_secs = (slot_fh, slot_fh);
                             } else {
-                                ctx.fh_hours = (ctx.fh_hours.0, slot_fh);
+                                ctx.fh_secs = (ctx.fh_secs.0, slot_fh);
                             }
                         }
                     }
@@ -300,15 +311,21 @@ pub fn evaluate_point(ctx: &PointQueryContext, lat: f64, lon: f64) -> QueryResul
                             levels: (l0, l1),
                         });
                     }
-                    let val = if ctx.fh_hours.0 == ctx.fh_hours.1 {
+                    // Time arithmetic runs in SECONDS: whole-second offsets are
+                    // exact integers there (fractional forecast hours like 1800 s
+                    // are not exactly representable as decimal hours), so the
+                    // interpolation is at least as accurate as the hour-based
+                    // form it replaces. The REPORTED bracket converts back to
+                    // HOURS because spec §7 shows forecast_hours in hours.
+                    let val = if ctx.fh_secs.0 == ctx.fh_secs.1 {
                         f0
                     } else {
-                        time_lerp(f0, ctx.fh_hours.0, f1, ctx.fh_hours.1, ctx.want_fh_hours)
+                        time_lerp(f0, ctx.fh_secs.0, f1, ctx.fh_secs.1, ctx.want_fh_secs)
                     };
-                    if ctx.fh_hours.0 != ctx.fh_hours.1 {
+                    if ctx.fh_secs.0 != ctx.fh_secs.1 {
                         info.time = Some(TimeMeta {
                             method: TimeInterpMode::Linear,
-                            forecast_hours: (ctx.fh_hours.0, ctx.fh_hours.1),
+                            forecast_hours: (ctx.fh_secs.0 / 3600.0, ctx.fh_secs.1 / 3600.0),
                         });
                     }
                     return Ok(PointValue { value: val, info: info });

@@ -244,8 +244,8 @@ fn e2e_roundtrip_through_index() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             match lookup_level_type("isobaric") {
@@ -303,7 +303,7 @@ fn e2e_roundtrip_through_index() {
                     }
                     // time: fh 3 between 0 and 6 at same node -> 291.
                     let c_t = seed.build(sref, "gfs", None, "TMP", iso_code,
-                                         1000.0, 3.0, TimeInterpMode::Linear);
+                                         1000.0, 10800.0, TimeInterpMode::Linear);
                     match c_t {
                         Err(_) => { assert!(false); }
                         Ok(ct) => {
@@ -324,7 +324,7 @@ fn e2e_roundtrip_through_index() {
                     }
                     // time_interp=none: fh 3 must be rejected outright.
                     let c_n = seed.build(sref, "gfs", None, "TMP", iso_code,
-                                         1000.0, 3.0, TimeInterpMode::None);
+                                         1000.0, 10800.0, TimeInterpMode::None);
                     match c_n {
                         Err(ne) => {
                             match ne {
@@ -336,7 +336,7 @@ fn e2e_roundtrip_through_index() {
                     }
                     // masked node: TMP @850 f006 k=0 is NaN -> MissingData.
                     let c_m = seed.build(sref, "gfs", None, "TMP", iso_code,
-                                         850.0, 6.0, TimeInterpMode::Linear);
+                                         850.0, 21600.0, TimeInterpMode::Linear);
                     match c_m {
                         Err(_) => { assert!(false); }
                         Ok(cm) => {
@@ -370,8 +370,8 @@ fn e2e_roundtrip_through_index() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             match lookup_level_type("height_above_ground") {
@@ -451,13 +451,13 @@ fn e2e_roundtrip_through_index() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             // APCP accumulation: fh 3 between 0 and 6 must be REJECTED (§9.8).
             let cg = seed.build(sref, "stat", None, "APCP", 1,
-                                0.0, 3.0, TimeInterpMode::Linear);
+                                0.0, 10800.0, TimeInterpMode::Linear);
             match cg {
                 Ok(_) => { assert!(false); }
                 Err(g) => {

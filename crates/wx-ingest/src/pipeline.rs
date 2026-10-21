@@ -9,7 +9,7 @@ use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, 
 use serde_json::from_str;
 use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, now_ns_marker, join_path};
 use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str};
-use crate::store::{write_grid_bin, merge_field, write_field, decode_grid, manifest_field_json, write_bytes_atomic_pub};
+use crate::store::{write_grid_bin, merge_field, write_field, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
 use wx_core::storage::{open_field, MmapField};
 use memmap2::Mmap;
@@ -29,10 +29,20 @@ use serde::Deserialize;
 // mutable registry behind the snapshots
 // ---------------------------------------------------------------------------
 
+/// One forecast-hour slot inside one field entry. The key is an OFFSET IN
+/// SECONDS from the run time (`fh_secs`), so fractional forecast hours
+/// (30-minute HRRR-like products, 15-minute marine models) are exact keys
+/// rather than lossy decimal hours. PDT 4.8 statistical time ranges are
+/// carried PER forecast hour (two accumulations of the same field have
+/// different ranges), stored as offsets in seconds from the run time.
 #[derive(Clone)]
 pub struct RegFh {
-    pub fh_hours: i64,
+    pub fh_secs: i64,
     pub field: Arc<MmapField>,
+    pub stat_has_range: bool,
+    pub stat_begin_secs: i64,
+    pub stat_end_secs: i64,
+    pub stat_step_secs: i64,
 }
 
 #[derive(Clone)]
@@ -85,7 +95,7 @@ pub fn find_field_idx(fs: &Vec<RegField>, fk: &FieldKey) -> Option<usize> {
 
 pub fn find_fh_idx(fs: &Vec<RegFh>, fh: i64) -> Option<usize> {
     for k in 0 .. fs.len() {
-        if fs[k].fh_hours == fh {
+        if fs[k].fh_secs == fh {
             return Some(k);
         }
     }
@@ -95,8 +105,10 @@ pub fn find_fh_idx(fs: &Vec<RegFh>, fh: i64) -> Option<usize> {
 impl RegModel {
     /// Insert/replace one field slot (creates run/field entries as needed).
     pub fn put(self: &mut Self, epoch: i64, dir_name: String, grid: GridDef,
-               fk: FieldKey, fh_hours: i64, field: Arc<MmapField>,
-               units: String, stat_processed: bool, stat_kind: String) {
+               fk: FieldKey, fh_secs: i64, field: Arc<MmapField>,
+               units: String, stat_processed: bool, stat_kind: String,
+               stat_has_range: bool, stat_begin_secs: i64, stat_end_secs: i64,
+               stat_step_secs: i64) {
         let mut ri = find_run_idx(&self.runs, epoch);
         match ri {
             None => {
@@ -158,13 +170,20 @@ impl RegModel {
             Some(_) => {}
         }
         let fi2 = fi.unwrap();
-        let ki = find_fh_idx(&self.runs[ri2].fields[fi2].fhs, fh_hours);
+        let ki = find_fh_idx(&self.runs[ri2].fields[fi2].fhs, fh_secs);
         match ki {
             None => {
-                self.runs[ri2].fields[fi2].fhs.push(RegFh { fh_hours: fh_hours, field: field });
+                self.runs[ri2].fields[fi2].fhs.push(RegFh {
+                    fh_secs: fh_secs,
+                    field: field,
+                    stat_has_range: stat_has_range,
+                    stat_begin_secs: stat_begin_secs,
+                    stat_end_secs: stat_end_secs,
+                    stat_step_secs: stat_step_secs,
+                });
                 for i2 in 1 .. self.runs[ri2].fields[fi2].fhs.len() {
                     let mut j2 = i2;
-                    while j2 > 0 && self.runs[ri2].fields[fi2].fhs[j2].fh_hours < self.runs[ri2].fields[fi2].fhs[j2 - 1].fh_hours {
+                    while j2 > 0 && self.runs[ri2].fields[fi2].fhs[j2].fh_secs < self.runs[ri2].fields[fi2].fhs[j2 - 1].fh_secs {
                         let tv = self.runs[ri2].fields[fi2].fhs[j2].clone();
                         self.runs[ri2].fields[fi2].fhs[j2] = self.runs[ri2].fields[fi2].fhs[j2 - 1].clone();
                         self.runs[ri2].fields[fi2].fhs[j2 - 1] = tv;
@@ -185,6 +204,12 @@ impl RegModel {
 pub struct IngestCounters {
     pub ingested_files: u64,
     pub errors: u64,
+    /// Messages deliberately SKIPPED because they are structurally unusable
+    /// (layer/range levels, coordinate lists, unknown grid/PDT templates).
+    /// Spec §4.2 wants these noted, not failed: they are counted separately
+    /// and NEVER land in `errors` (mirrored to /metrics as
+    /// wxpoint_skipped_messages_total).
+    pub skipped_messages: u64,
     pub last_mtime_ns: i64, // max mtime over ingested files (lag input)
 }
 
@@ -268,6 +293,12 @@ pub fn pad_num(v: i64, w: usize) -> String {
     return format!("{0}{1}", zeros, s);
 }
 
+/// Run-directory name. Base is the classic `YYYYMMDDHH`; when the run MINUTE
+/// is non-zero `mm` is appended, and when the run SECOND is also non-zero
+/// `ss` after that (so 10/12/14-char names, disambiguated by length). This
+/// removes the collision where two runs 12Z and 12:30Z on one day both mapped
+/// to `2026101912` (V1.1 phase 3 bug (a)). Pre-existing 10-char directories
+/// keep parsing exactly as before: minute/second default to 0.
 pub fn run_dir_name(rt: RunTime) -> String {
     let a = pad_num(rt.year as i64, 4);
     let b = pad_num(rt.month as i64, 2);
@@ -275,17 +306,32 @@ pub fn run_dir_name(rt: RunTime) -> String {
     let d = pad_num(rt.hour as i64, 2);
     let ab = format!("{0}{1}", a, b);
     let cd = format!("{0}{1}", c, d);
-    return format!("{0}{1}", ab, cd);
+    let base = format!("{0}{1}", ab, cd);
+    if rt.minute != 0 {
+        let mm = pad_num(rt.minute as i64, 2);
+        let with_mm = format!("{0}{1}", base, mm);
+        if rt.second != 0 {
+            let ss = pad_num(rt.second as i64, 2);
+            return format!("{0}{1}", with_mm, ss);
+        }
+        return with_mm;
+    }
+    return base;
 }
 
+/// Parse a run directory name back into epoch seconds. Accepts the three
+/// canonical lengths (10 = hour only, 12 = +minute, 14 = +minute+second);
+/// anything else is not a run directory.
 pub fn parse_run_dir(name: &str) -> Option<i64> {
-    if name.len() != 10 {
+    if name.len() != 10 && name.len() != 12 && name.len() != 14 {
         return None;
     }
     let y = parse_num(&name, 0, 4);
     let mo = parse_num(&name, 4, 2);
     let da = parse_num(&name, 6, 2);
     let hr = parse_num(&name, 8, 2);
+    let mi = if name.len() >= 12 { parse_num(&name, 10, 2) } else { Some(0) };
+    let sc = if name.len() == 14 { parse_num(&name, 12, 2) } else { Some(0) };
     match y {
         None => { return None; }
         Some(yy) => {
@@ -301,7 +347,23 @@ pub fn parse_run_dir(name: &str) -> Option<i64> {
                                     if mo2 < 1 || mo2 > 12 || da2 < 1 || da2 > 31 || hr2 > 23 {
                                         return None;
                                     }
-                                    return Some(epoch_secs(yy as u16, mo2 as u8, da2 as u8, hr2 as u8, 0, 0));
+                                    match mi {
+                                        None => { return None; }
+                                        Some(mi2) => {
+                                            if mi2 > 59 {
+                                                return None;
+                                            }
+                                            match sc {
+                                                None => { return None; }
+                                                Some(sc2) => {
+                                                    if sc2 > 59 {
+                                                        return None;
+                                                    }
+                                                    return Some(epoch_secs(yy as u16, mo2 as u8, da2 as u8, hr2 as u8, mi2 as u8, sc2 as u8));
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -325,10 +387,40 @@ fn parse_num(s: &str, off: usize, len: usize) -> Option<i64> {
     return Some(v);
 }
 
-pub fn fh_file_name(fh_hours: i64) -> String {
-    return format!("f{0}.bin", pad_num(fh_hours, 3));
+/// Canonical forecast-hour filename for an offset of `fh_secs` SECONDS past
+/// the run time (spec §4.5 storage keys). ONE canonical scheme, documented
+/// in README/docs/DECISIONS.md:
+///
+///   secs % 3600 == 0              -> `f<HHH>.bin`           f000.bin / f006.bin
+///   secs % 60   == 0 (not hour)   -> `f<HHH>m<MM>.bin`      f001m30.bin
+///   whole seconds otherwise       -> `f<HHH>m<MM>s<SS>.bin` f001m00s05.bin
+///
+/// Hours are zero-padded to AT LEAST 3 digits (so every pre-existing
+/// `f006.bin` keeps its exact name and stays readable by older indexes);
+/// minutes and seconds are exactly 2 digits. Trailing components are OMITTED
+/// when zero, never written as `f006m00`, which is what keeps integral hours
+/// byte-identical to the milestone-3 layout (backward compatible).
+///
+/// Sub-second offsets cannot exist: GRIB2 section 4's finest Code Table 4.4
+/// unit is SECOND (code 13), so `fc_secs` is always a whole number of seconds
+/// by construction. A caller passing a negative or sub-second value is
+/// rejected upstream with a typed note (`skipped_messages`, not `errors`).
+pub fn fh_file_name(fh_secs: i64) -> String {
+    let h = fh_secs / 3600;
+    let rem = fh_secs - h * 3600;
+    if rem == 0 {
+        return format!("f{0}.bin", pad_num(h, 3));
+    }
+    if rem % 60 == 0 {
+        return format!("f{0}m{1}.bin", pad_num(h, 3), pad_num(rem / 60, 2));
+    }
+    return format!("f{0}m{1}s{2}.bin", pad_num(h, 3), pad_num(rem / 60, 2), pad_num(rem % 60, 2));
 }
 
+/// Inverse of [`fh_file_name`]: filename -> offset in SECONDS. Strict about
+/// the canonical form (minutes/seconds must be exactly two digits, `m` before
+/// `s`, no trailing empty components) so a stray file like `f001m5.bin` is
+/// ignored rather than silently reinterpreted.
 pub fn parse_fh_name(name: &str) -> Option<i64> {
     if name.len() < 6 {
         return None;
@@ -339,7 +431,62 @@ pub fn parse_fh_name(name: &str) -> Option<i64> {
     if name[name.len() - 4 ..] != *".bin" {
         return None;
     }
-    return parse_num(&name, 1, name.len() - 5);
+    let core = &name[1 .. name.len() - 4];
+    let mut hlen = 0;
+    while hlen < core.len() {
+        match digit_at(&core, hlen) {
+            None => { break; }
+            Some(_) => { hlen += 1; }
+        }
+    }
+    if hlen == 0 {
+        return None;
+    }
+    let hv = parse_num(&core, 0, hlen);
+    match hv {
+        None => { return None; }
+        Some(hv2) => {
+            let mut secs = hv2 * 3600;
+            let mut off = hlen;
+            if off >= core.len() {
+                return Some(secs); // integral hours: f<HHH>.bin
+            }
+            if core[off .. off + 1] != *"m" {
+                return None;
+            }
+            off += 1;
+            if core.len() - off != 2 && core.len() - off != 5 {
+                return None; // m<MM> (2 chars) or m<MM>s<SS> (5 chars)
+            }
+            let mv = parse_num(&core, off, 2);
+            match mv {
+                None => { return None; }
+                Some(mv2) => {
+                    if mv2 > 59 {
+                        return None;
+                    }
+                    secs = secs + mv2 * 60;
+                    let off2 = off + 2;
+                    if off2 >= core.len() {
+                        return Some(secs);
+                    }
+                    if core[off2 .. off2 + 1] != *"s" {
+                        return None;
+                    }
+                    let sv = parse_num(&core, off2 + 1, 2);
+                    match sv {
+                        None => { return None; }
+                        Some(sv2) => {
+                            if sv2 > 59 {
+                                return None;
+                            }
+                            return Some(secs + sv2);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +501,23 @@ pub struct ManifestField {
     pub stat_processed: bool,
     pub stat_kind: String,
     pub levels: Vec<f64>,
-    pub forecast_hours: Vec<i64>,
+    // Human-facing decimal HOURS (0, 0.5, 1): informational only. The
+    // authoritative keys are the on-disk filenames (see fh_file_name), so
+    // rounding here can never corrupt an index entry.
+    pub forecast_hours: Vec<f64>,
+    // PDT 4.8 statistical time range PER forecast hour (spec §4.2: "store
+    // the statistical process type AND time range"). `fh_secs` is the exact
+    // join key against the filename-derived offset; begin/end are absolute
+    // ISO-8601 UTC instants; step_secs is the CT 4.11 step length in seconds.
+    pub stat_ranges: Vec<ManifestStatRange>,
+}
+
+#[derive(Deserialize)]
+pub struct ManifestStatRange {
+    pub fh_secs: i64,
+    pub begin: String,
+    pub end: String,
+    pub step_secs: i64,
 }
 
 #[derive(Deserialize)]
@@ -399,7 +562,7 @@ impl Pipeline {
             stability: StabilityTracker { obs: Vec::<(String, u64, i64, i64)>::new() },
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
-            counters: IngestCounters { ingested_files: 0, errors: 0, last_mtime_ns: 0 },
+            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0 },
             wind_violation: false,
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
@@ -522,10 +685,14 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                                                                                                     Err(_) => { continue; }
                                                                                                     Ok(mfv) => {
                                                                                                         let un = units_for(p, mdl, &param_key, code2);
-                                                                                                        let spc = stat_for(&doc, &param_key, &lvl_dir);
-                                                                                                        p.registry_put(mdl, epoch, dir_name.clone(), grid.clone(),
-                                                                                                            FieldKey { param_key: param_key.clone(), level_code: code2 },
-                                                                                                            fhv, Arc::new(mfv), un, spc.0, spc.1);
+let spc = stat_for(&doc, &param_key, &lvl_dir);
+// restore this forecast hour's 4.8 time range from manifest.json
+// so a restart keeps BOTH the guard and the range metadata.
+let rng = stat_range_for(&doc, &param_key, &lvl_dir, fhv, epoch);
+p.registry_put(mdl, epoch, dir_name.clone(), grid.clone(),
+    FieldKey { param_key: param_key.clone(), level_code: code2 },
+    fhv, Arc::new(mfv), un, spc.0, spc.1,
+    rng.0, rng.1, rng.2, rng.3);
                                                                                                     }
                                                                                                 }
                                                                                             }
@@ -555,8 +722,10 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
 
 impl Pipeline {
     pub fn registry_put(self: &mut Self, mdl: &ResolvedModel, epoch: i64, dir_name: String,
-                        grid: GridDef, fk: FieldKey, fh_hours: i64, field: Arc<MmapField>,
-                        units: String, stat_processed: bool, stat_kind: String) {
+                        grid: GridDef, fk: FieldKey, fh_secs: i64, field: Arc<MmapField>,
+                        units: String, stat_processed: bool, stat_kind: String,
+                        stat_has_range: bool, stat_begin_secs: i64,
+                        stat_end_secs: i64, stat_step_secs: i64) {
         let mut ri = find_model_idx(&self.registry, &mdl.name);
         match ri {
             None => {
@@ -575,7 +744,9 @@ impl Pipeline {
             }
             Some(_) => {}
         }
-        self.registry[ri.unwrap()].put(epoch, dir_name, grid, fk, fh_hours, field, units, stat_processed, stat_kind);
+        self.registry[ri.unwrap()].put(epoch, dir_name, grid, fk, fh_secs, field, units,
+            stat_processed, stat_kind, stat_has_range, stat_begin_secs,
+            stat_end_secs, stat_step_secs);
     }
 }
 
@@ -599,6 +770,61 @@ fn units_for(_p: &Pipeline, mdl: &ResolvedModel, param_key: &str, _code: u8) -> 
         None => { return "".to_string(); }
         Some(u) => { return u.to_string(); }
     }
+}
+
+/// Restore one forecast hour's PDT 4.8 statistical time range from
+/// manifest.json: returns (has_range, begin_secs, end_secs, step_secs) where
+/// begin/end are offsets from the run time (`run_epoch` supplied by the caller)
+/// so they match what the writer stored. Absent or unparsable -> (false,0,0,0)
+/// and the field still gets its `stat_processed` guard from `stat_for`.
+fn stat_range_for(doc: &ManifestDoc, param_key: &str, lvl_dir: &str,
+                  fh_secs: i64, run_epoch: i64) -> (bool, i64, i64, i64) {
+    for f in &doc.fields {
+        if f.param != param_key || f.level_type != lvl_dir {
+            continue;
+        }
+        for r in &f.stat_ranges {
+            if r.fh_secs != fh_secs {
+                continue;
+            }
+            let b = parse_iso_utc(&r.begin);
+            match b {
+                None => { return (true, 0, 0, r.step_secs); }
+                Some(bv) => {
+                    let en = parse_iso_utc(&r.end);
+                    match en {
+                        None => { return (true, bv - run_epoch, 0, r.step_secs); }
+                        Some(ev) => {
+                            return (true, bv - run_epoch, ev - run_epoch, r.step_secs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return (false, 0, 0, 0);
+}
+
+/// Render the per-fh statistical ranges of one field entry as a JSON array
+/// (`[]` when nothing is statistically processed). begin/end are ABSOLUTE
+/// instants in ISO-8601 UTC; `fh_secs` is the exact join key.
+pub fn stat_ranges_json(fhs: &Vec<RegFh>, run_epoch: i64) -> String {
+    let mut out = "[".to_string();
+    let mut first = true;
+    for e in fhs {
+        if !e.stat_has_range {
+            continue;
+        }
+        if !first {
+            out = out + ",";
+        }
+        first = false;
+        let b = iso_utc(run_epoch + e.stat_begin_secs);
+        let en = iso_utc(run_epoch + e.stat_end_secs);
+        out = format!("{0}{{\"fh_secs\":{1},\"begin\":\"{2}\",\"end\":\"{3}\",\"step_secs\":{4}}}",
+            out, e.fh_secs, b, en, e.stat_step_secs);
+    }
+    return out + "]";
 }
 
 fn stat_for(doc: &ManifestDoc, param_key: &str, lvl_dir: &str) -> (bool, String) {
@@ -719,6 +945,14 @@ impl Pipeline {
                         self.counters.errors += 1;
                     }
                     Ok(dr) => {
+                        // structural SKIP-AND-NOTE bookkeeping (spec §4.2):
+                        // coordinate-list / unknown-template messages counted
+                        // separately from errors and logged for operators.
+                        if dr.1.messages_unsupported > 0 {
+                            self.note(format!("{} message(s) skipped as structurally unsupported in {}",
+                                dr.1.messages_unsupported, names[fpos]));
+                            self.counters.skipped_messages += dr.1.messages_unsupported as u64;
+                        }
                         self.ingest_messages(&mdl, dr.0);
                         self.state.upsert(FileRec {
                             path: names[fpos].clone(),
@@ -805,18 +1039,29 @@ impl Pipeline {
                     }
                 }
             }
+            // Layer / range messages (two fixed surfaces, or a coordinate list
+            // that survived decoding) cannot be stored as a single point value:
+            // SKIP-AND-NOTE, counted separately from errors (spec §4.2 spirit:
+            // skipping is not failing). Point queries are out of scope for
+            // layers per spec §13, but the policy must not poison the error
+            // counter nor abort the file.
             if msg.levels.len() != 1 {
-                self.note(format!("message with {} levels skipped (layer ranges unsupported)", msg.levels.len()));
-                self.counters.errors += 1;
+                self.note(format!("message with {} levels skipped (layer/range levels unsupported for point queries)", msg.levels.len()));
+                self.counters.skipped_messages += 1;
                 continue;
             }
-            if msg.fc_secs % 3600 != 0 {
-                self.note(format!("non-integral forecast hour fc_secs={} skipped", msg.fc_secs));
-                self.counters.errors += 1;
+            // Fractional forecast hours are FIRST-CLASS data (V1.1 phase 3):
+            // CT 4.4 units minute/hour/day/3h/6h/12h/second all normalize to
+            // whole SECONDS, so `fc_secs` is the storage key directly. Only a
+            // NEGATIVE offset (unrepresentable in section 4's unsigned field,
+            // i.e. corrupt input) is rejected, and as a skip, not an error.
+            if msg.fc_secs < 0 {
+                self.note(format!("negative forecast offset fc_secs={} skipped", msg.fc_secs));
+                self.counters.skipped_messages += 1;
                 continue;
             }
             let lv = msg.levels[0];
-            let fh = msg.fc_secs / 3600;
+            let fh = msg.fc_secs;
             if is_wind {
                 let key = (msg.run.epoch_secs, fh, lv.0, lv.1);
                 let is_u = param_is_ugrd(&msg);
@@ -924,12 +1169,18 @@ pub fn update_run_manifest(p: &Pipeline, model_name: String, epoch: i64) -> bool
                                 lv.push(*x as f64);
                             }
                         }
-                        let mut fhs: Vec<i64> = Vec::<i64>::new();
+                        // manifest forecast hours are written as decimal HOURS
+                        // (human-facing); the exact keys live in the filenames.
+                        let mut fhs: Vec<f64> = Vec::<f64>::new();
                         for e in &f.fhs {
-                            fhs.push(e.fh_hours);
+                            fhs.push((e.fh_secs as f64) / 3600.0);
                         }
+                        // per-fh PDT 4.8 ranges (spec §4.2): absolute ISO instants
+                        // joined by exact fh_secs, so a restart restores them.
+                        let run_ep = p.registry[mi2].runs[ri2].epoch_secs;
+                        let rng_json = stat_ranges_json(&f.fhs, run_ep);
                         out = format!("{0}{1}", out, manifest_field_json(f.param_key.as_str(), lvl_dir.as_str(),
-                            f.units.as_str(), f.stat_processed, f.stat_kind.clone(), lv, fhs));
+                            f.units.as_str(), f.stat_processed, f.stat_kind.clone(), lv, fhs, rng_json));
                     }
                     out = out + "]}";
                     let mdir = join_path(&p.data_dir, model_name.as_str());
@@ -947,11 +1198,12 @@ pub fn update_run_manifest(p: &Pipeline, model_name: String, epoch: i64) -> bool
 }
 
 impl Pipeline {
-    /// Store one plane under (param, level type, fh), merging any existing
-    /// levels in that file, then PUBLISH (forecast-hour granularity).
+    /// Store one plane under (param, level type, forecast-hour offset in
+    /// SECONDS), merging any existing levels in that file, then PUBLISH
+    /// (forecast-hour granularity, spec §4.5 incremental visibility).
     pub fn store_plane(self: &mut Self, mdl: &ResolvedModel, msg: &DecodedMessage,
                        rp: ResolvedParam, plane: Vec<f32>, level_code: u8,
-                       level_val: f64, fh_hours: i64) {
+                       level_val: f64, fh_secs: i64) {
         if !level_spec_match(&rp, level_code, level_val) {
             return; // configured param but level not requested: skip silently
         }
@@ -986,7 +1238,7 @@ impl Pipeline {
             self.counters.errors += 1;
             return;
         }
-        let fpath = join_path(&fparent, &fh_file_name(fh_hours));
+        let fpath = join_path(&fparent, &fh_file_name(fh_secs));
         let newv: Vec<(f64, Vec<f32>)> = [(level_val, plane)].to_vec();
         let merged = merge_field(fpath.to_string(), level_code, newv);
         match merged {
@@ -1015,9 +1267,13 @@ impl Pipeline {
             }
             Ok(mfv) => {
                 let stp = msg.stat.kind != StatKind::Instantaneous;
+                // PDT 4.8 messages carry their statistical time range (offsets
+                // from the run time in seconds); PDT 4.0 has none.
+                let has_rng = stp;
                 self.registry_put(mdl, epoch, dirn.clone(), msg.grid.clone(),
                     FieldKey { param_key: rp.key, level_code: level_code },
-                    fh_hours, Arc::new(mfv), rp.units, stp, stat_kind_name(msg.stat.kind.clone()));
+                    fh_secs, Arc::new(mfv), rp.units, stp, stat_kind_name(msg.stat.kind.clone()),
+                    has_rng, msg.stat.begin_secs, msg.stat.end_secs, msg.stat.step_secs);
                 let mok = update_run_manifest(self, mdl.name.clone(), epoch);
                 if !mok {
                     self.note(format!("manifest update failed for run {0}", dirn));
@@ -1081,7 +1337,14 @@ pub fn build_snapshot(reg: &Vec<RegModel>) -> IndexSnapshot {
             for rf in &rr.fields {
                 let mut ifs: Vec<IdxFh> = Vec::<IdxFh>::new();
                 for fhv in &rf.fhs {
-                    ifs.push(IdxFh { fh_hours: fhv.fh_hours, field: fhv.field.clone() });
+                    ifs.push(IdxFh {
+                        fh_secs: fhv.fh_secs,
+                        field: fhv.field.clone(),
+                        stat_has_range: fhv.stat_has_range,
+                        stat_begin_secs: fhv.stat_begin_secs,
+                        stat_end_secs: fhv.stat_end_secs,
+                        stat_step_secs: fhv.stat_step_secs,
+                    });
                 }
                 ir.fields.push(IdxFieldEntry {
                     param_key: rf.param_key.clone(),

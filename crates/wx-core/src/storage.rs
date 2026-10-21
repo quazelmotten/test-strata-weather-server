@@ -1,7 +1,14 @@
 //! On-disk storage format (spec §4.5): raw f32 little-endian, layout
 //! `[level][y][x]`, small fixed header per .bin file. Reader side uses memmap2
-//! (zero-copy); writer side goes through a temp file + fsync + atomic rename
-//! so a query never sees a partial file.
+//! (zero-copy); writer side goes through a temp file + REAL fsync + atomic rename
+//! plus a directory fsync, so a query never sees a partial file and a crash
+//! cannot resurrect a renamed-but-unlinked file.
+//!
+//! Durability note (V1.1 phase 3): this toolchain's `std::fs::File` exposes only
+//! `flush()` (userspace buffer flush, NOT fsync — verified with strace: no
+//! `fsync` syscall is emitted), so [`fsync_path`] calls libc `open`/`fsync`/
+//! `close` directly through `extern "C"`. That is the only way to get a genuine
+//! fsync here; the same helper backs the state file and manifest writers.
 //!
 //! ## Header layout (fixed 24 bytes + 4 bytes per level, all little-endian)
 //!
@@ -168,20 +175,66 @@ pub fn expected_size(hdr: &BinHeader) -> usize {
 // write path: temp file in same dir, fsync file+dir, atomic rename (spec §4.5)
 // ---------------------------------------------------------------------------
 
+// Direct libc durability primitives. This std has no fsync surface at all
+// (`File::flush` only flushes the userspace buffer), so we bind the C library
+// functions ourselves. `open` is declared under a Rust-side name with
+// `#[link_name]` so the compiler does not confuse it with the runtime's own
+// `open`. Verified against strace: these emit real `openat`/`fsync`/`close`
+// syscalls, including on a directory fd (Linux accepts fsync on directories).
+extern "C" {
+    #[link_name = "open"]
+    fn libc_open(path: *const i8, flags: i32, ...) -> i32;
+    #[link_name = "fsync"]
+    fn libc_fsync(fd: i32) -> i32;
+    #[link_name = "close"]
+    fn libc_close(fd: i32) -> i32;
+}
+
+/// fsync the inode behind `path` (a regular file OR a directory). O_RDONLY is
+/// enough for fsync. Returns Some(message) on failure (missing path, EACCES,
+/// filesystems that reject directory fsync) so callers can decide whether the
+/// write is good enough.
+pub fn fsync_path(path: &str) -> Result<(), String> {
+    let ub: Vec<u8> = path.as_bytes().to_vec();
+    if ub.is_empty() {
+        return Err("empty path".to_string());
+    }
+    // NUL-terminated C string copy (Rust strings are not NUL-terminated).
+    let mut buf: Vec<i8> = Vec::<i8>::new();
+    for k in 0 .. ub.len() {
+        buf.push(ub[k] as i8);
+    }
+    buf.push(0);
+    let ptr: *const i8 = &buf[0];
+    let fd = unsafe { libc_open(ptr, 0) };
+    if fd < 0 {
+        return Err("open-for-fsync failed".to_string());
+    }
+    let r = unsafe { libc_fsync(fd) };
+    let c = unsafe { libc_close(fd) };
+    if r != 0 {
+        return Err(format!("fsync rc={0}", r));
+    }
+    if c != 0 {
+        return Err(format!("close rc={0}", c));
+    }
+    return Ok(());
+}
+
 /// Write one .bin file atomically: serialize header + planes into `planes`
 /// (each plane is nx*ny f32 in storage order, planes ordered like
 /// `hdr.levels`), write to `<path>.tmp<pid>` in the SAME directory, fsync the
 /// file, rename over the target, then fsync the directory. A reader either
 /// sees the old file or the complete new one. Errors are reported as message
 /// strings (OS error text).
-pub fn write_bin_atomic(path: String, hdr: &BinHeader, planes: &[&[f32]]) -> Result<(), &'static str> {
+pub fn write_bin_atomic(path: String, hdr: &BinHeader, planes: &[&[f32]]) -> Result<(), String> {
     if planes.len() != hdr.levels.len() {
-        return Err("plane count != level count");
+        return Err("plane count != level count".to_string());
     }
     let per_plane = (hdr.nx as usize) * (hdr.ny as usize);
     for li in 0..planes.len() {
         if planes[li].len() != per_plane {
-            return Err("plane length != nx*ny");
+            return Err("plane length != nx*ny".to_string());
         }
     }
 
@@ -198,38 +251,31 @@ pub fn write_bin_atomic(path: String, hdr: &BinHeader, planes: &[&[f32]]) -> Res
     let tmp = format!("{path}.tmp");
     let f = std::fs::File::create(&tmp);
     match f {
-        Err(_) => { return Err("create failed"); }
+        Err(_) => { return Err("create failed".to_string()); }
         Ok(mut h) => {
             let w = h.write_all(&bytes);
             if w.is_err() {
-                return Err("write_all failed");
+                return Err("write_all failed".to_string());
             }
-            // fsync the data+metadata before the rename becomes visible
+            // flush the userspace buffer, then fsync the INODE itself before the
+            // rename makes the name visible (spec §4.5: temp + fsync + rename).
             let fl = h.flush();
             if fl.is_err() {
-                return Err("flush failed");
+                return Err("flush failed".to_string());
             }
         }
     }
+    fsync_path(&tmp)?;
     // resolve the directory before the rename consumes `path`
     let dir = dir_of_path(&path);
     let r = std::fs::rename(&tmp, &path);
     if r.is_err() {
-        return Err("rename failed");
+        return Err("rename failed".to_string());
     }
-    // best-effort directory fsync: after a crash the renamed file must not
-    // appear truncated; on platforms where opening the dir fails we surface
-    // the error so callers can decide.
-    let d = std::fs::File::open(dir);
-    match d {
-        Err(_) => { return Err("dir-open failed"); }
-        Ok(mut dh) => {
-            let df = dh.flush();
-            if df.is_err() {
-                return Err("dir-flush failed");
-            }
-        }
-    }
+    // directory fsync: after a crash the renamed entry must be present, never
+    // a dangling/truncated name. Errors are surfaced (not swallowed) so ingest
+    // can report a durability problem instead of silently claiming durability.
+    fsync_path(&dir)?;
     Ok(())
 }
 

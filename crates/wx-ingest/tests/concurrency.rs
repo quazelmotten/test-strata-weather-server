@@ -151,12 +151,12 @@ fn concurrent_publishers_and_readers_never_tear() {
                                     run_epoch_secs: 0,
                                     stat_processed: false,
                                     want_level: 0.0,
-                                    want_fh_hours: 0.0,
-                                    fh_hours: (0.0, 0.0),
+                                    want_fh_secs: 0.0,
+                                    fh_secs: (0.0, 0.0),
                                     slots: [None, None],
                                 };
                                 let c_r = seed.build(sref, "gfs", None, "TMP", iso,
-                                                      925.0, 3.0, TimeInterpMode::Linear);
+                                                      925.0, 10800.0, TimeInterpMode::Linear);
                                 match c_r {
                                     Err(_) => {
                                         let m = cnt_c.lock();

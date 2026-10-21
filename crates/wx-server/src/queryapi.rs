@@ -283,8 +283,8 @@ fn make_seed(grid: Arc<GridDef>) -> PointQueryContext {
         run_epoch_secs: 0,
         stat_processed: false,
         want_level: 0.0,
-        want_fh_hours: 0.0,
-        fh_hours: (0.0, 0.0),
+        want_fh_secs: 0.0,
+        fh_secs: (0.0, 0.0),
         slots: [None, None],
     };
 }
@@ -325,12 +325,16 @@ pub fn answer_param(snap: &IndexSnapshot, model: &str, pin: Option<i64>, key: &s
                         }
                     }
                 }
-                let fh = ((valid_ep - ep) as f64) / 3600.0;
-                if fh < -1e-9 {
+                // Offset from the run's reference time IN SECONDS (exact for
+                // whole seconds, incl. fractional forecast hours). The API's
+                // `valid` granularity is already per-second (timeparse), so no
+                // precision is lost anywhere on this path.
+                let fh_secs = (valid_ep - ep) as f64;
+                if fh_secs < -1e-9 {
                     continue; // valid time before this run starts: older runs are worse
                 }
                 let seed = make_seed(run.grid.clone());
-                let cb = seed.build(snap, model, Some(ep), key, code, lval, fh, mode);
+                let cb = seed.build(snap, model, Some(ep), key, code, lval, fh_secs, mode);
                 match cb {
                     Ok(ctx) => {
                         let ev = evaluate_point(&ctx, lat, lon);

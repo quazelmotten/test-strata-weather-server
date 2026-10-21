@@ -101,7 +101,8 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
             if n > 0 {
                 println!("scan_round ingested {0} file(s)", n);
             }
-            stats.set_ingest(p.counters.errors, p.counters.ingested_files, p.counters.last_mtime_ns);
+            stats.set_ingest(p.counters.errors, p.counters.ingested_files,
+                        p.counters.skipped_messages, p.counters.last_mtime_ns);
             while printed_logs < p.log.len() {
                 println!("{0}", p.log[printed_logs]);
                 printed_logs += 1;

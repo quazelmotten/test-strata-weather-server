@@ -121,6 +121,8 @@ curl 'http://127.0.0.1:8080/metrics'                      # Prometheus text
 Metrics: `wxpoint_queries_total{status="2xx|4xx|5xx"}`,
 `wxpoint_query_latency_us_{bucket,count,sum}` (µs histogram),
 `wxpoint_ingest_errors_total`, `wxpoint_ingested_files_total`,
+`wxpoint_skipped_messages_total` (structurally unusable messages noted, NOT
+errors: layer/range levels, coordinate lists, unimplemented grid/PDT templates),
 `wxpoint_ingest_lag_seconds` (newest ingested file mtime → now).
 
 ## 4. Storage format (`data_dir`)
@@ -128,12 +130,34 @@ Metrics: `wxpoint_queries_total{status="2xx|4xx|5xx"}`,
 ```
 data_dir/
   state/files.json                 # persistent ingest record
-  <model>/<run YYYYMMDDHH>/
+  <model>/<run>/                     # YYYYMMDDHH, +MM when the run minute != 0,
+                                     # +SS when the run second != 0 (10/12/14 chars)
     grid.bin                       # serialized grid definition
-    manifest.json                  # what is present: params, levels, fhs, units, stat info
+    manifest.json                  # params, levels, fhs, units, stat info + ranges
     <PARAM>/<level_type>/f<FFF>.bin  # e.g. TMP/isobaric/f006.bin
 ```
 
+* **Run directory names** carry the reference time to its finest GRIB2 unit:
+  `2026101912` (hour), `202610191230` (12:30Z), `20261019123015` (12:30:15Z).
+  Length disambiguates, so runs 12Z and 12:30Z on one day no longer collide into
+  one directory. Pre-existing 10-char directories keep parsing unchanged (minute/
+  second default 0).
+* **Forecast-hour filenames** are canonical and ONE scheme only. The join key
+  everywhere internally is integer SECONDS past the run time; the name renders
+  it with trailing zero components omitted:
+
+  | offset | name | example |
+  |---|---|---|
+  | whole hours (`secs % 3600 == 0`) | `f<HHH>.bin` | `f000.bin`, `f006.bin`, `f1000.bin` |
+  | whole minutes (not an hour) | `f<HHH>m<MM>.bin` | `f000m30.bin`, `f001m30.bin` |
+  | whole seconds (not a minute) | `f<HHH>m<MM>s<SS>.bin` | `f001m01s01.bin` |
+
+  Integral hours are byte-identical to the earlier layout, so existing stores
+  stay readable. Hours pad to at least 3 digits (≥1000 h widen instead of breaking
+  the pattern); minutes/seconds are exactly 2 digits. Sub-second offsets cannot
+  exist: Code Table 4.4's finest unit is SECOND. The reader is strict about
+  non-canonical names (`f001m5.bin`, `f001m70.bin` are ignored, not guessed),
+  while tolerating `f006m00.bin` as an alias for `f006.bin`.
 * `<param>/<level_type>/f<FFF>.bin`: magic `WXPTBIN1`, u32 version=1, u32 nx,
   u32 ny, u16 nlevels, flags byte (bit0 scan N→S, bit1 winds-grid-relative),
   then nlevels × f32 level values (pressure-sorted), then raw little-endian
@@ -144,9 +168,24 @@ data_dir/
   dlat,scan,winds; LCC: nx,ny,la1,lo1,lov,lad,latin1,latin2,dx_m,dy_m,proj_flag,
   scan,earth_shape,winds). Precomputed projection constants are rebuilt at read
   time, not stored.
-* Atomicity: every write is temp-file + fsync + rename (+dir fsync); a query
-  never sees a partial file. A run becomes visible forecast-hour by forecast
-  hour as each completes (publish after every field store).
+* Atomicity and durability: every write is temp-file → `flush` → **fsync of the
+  file inode** → atomic rename → **fsync of the parent directory**, so a query
+  never sees a partial file and a crash cannot resurrect a renamed-but-unlinked
+  name. Note on how fsync is obtained here: this toolchain's `std::fs::File`
+  exposes only `flush()` (a userspace buffer flush — verified with `strace`, it
+  emits no `fsync` syscall), so `wx_core::storage::fsync_path()` binds libc
+  `open`/`fsync`/`close` through `extern "C"` and fsyncs by path. Durability
+  failures are surfaced as ingest notes/errors, never swallowed. A run becomes
+  visible forecast-hour by forecast hour as each completes (publish after every
+  field store).
+* `manifest.json` is human-facing inventory; the index is authoritative. Per
+  field it records `units`, `stat_processed`, `stat_kind`, `levels`, decimal
+  `forecast_hours` (informational only — the filename is the exact key) and
+  `stat_ranges`, one entry per statistically processed forecast hour:
+  `{"fh_secs":1800,"begin":"2026-10-19T12:30:00Z","end":"2026-10-19T13:00:00Z",
+  "step_secs":0}`. Two accumulations of ONE parameter have DIFFERENT windows,
+  which is why the range travels with the forecast hour rather than the field;
+  a warm start restores those ranges from this file.
 * Retention: runs beyond `retention_runs` are removed from the in-memory index
   first, then deleted on disk; stale mmap handles stay valid until their last
   `Arc` reference drops (Linux unlink-while-mapped), so in-flight queries never
@@ -175,13 +214,20 @@ return f64.
    spec default). Request outside the stored range → 422 `level_out_of_range`,
    never extrapolated. Configured gaps (850 and 500 only) interpolate ACROSS
    the gap; the response echoes the bracketing levels so users can see it.
-3. **Time — linear between forecast hours of the SAME run.** Default run =
-   most recent run covering `valid` (both bracketing fhs required); `run=` pins
-   exactly. Exact fh match uses it directly. Statistically processed fields
-   (PDT 4.8 accumulations/averages/max/min) NEVER interpolate in time: exact
-   fh required, else 422 `stat_time_guard` — interpolating an accumulation is
-   wrong. `time_interp=none` requires exactness for any field (422
-   `time_exact_only`).
+3. **Time — linear between forecast hours of the SAME run.** Forecast-hour
+   arithmetic happens in integer SECONDS past the run's reference time, so
+   FRACTIONAL forecast hours (`f000m30.bin`, CT 4.4 units minute/hour/day/3h/6h/12h/
+   second) are first-class data, never rounded onto hour slots. Default run =
+   most recent run covering `valid`; the offset is RECOMPUTED per candidate run
+   (one instant can be run A's `f001.bin` AND run B's `f000m30.bin` — the newest
+   run that covers it answers), and `run=` pins one exactly. Both bracketing slots
+   must exist when interpolating. Exact fh match uses it directly (no blending,
+   no `time` object in the response). The reported `forecast_hours` bracket converts
+   back to HOURS per §7 (e.g. `[0.5,1]`). Statistically processed fields (PDT 4.8
+   accumulations/averages/max/min) NEVER interpolate in time: exact fh required,
+   else 422 `stat_time_guard` — interpolating an accumulation is wrong.
+   `time_interp=none` requires exactness for any field (422 `time_exact_only`).
+   A valid time outside every run's stored hours → 404 `no_run_covers`.
 
 ## 6. Ingest pipeline
 
@@ -261,10 +307,16 @@ Files placed cold; scan_interval_secs=1, stable_window_secs=0, ingest_threads=16
 * peak RSS (VmHWM): **372 MB** for the whole dataset indexed
 
 Codec cost at production scale (release build, this machine): decoding one full
-GFS forecast hour (1440 x 720, 22 fields) takes **752 ms** from the simple-packed
-file and **1143 ms** from its JPEG2000 twin (33.9 MB -> 1.0 MB on disk, values
-bit-identical). Both stay far inside the "few seconds" §8 target, and packed
-products cut transfer volume by ~33x.
+GFS forecast hour (1440 x 720, 22 fields) takes **~1.0 s** from the simple-packed
+file (three back-to-back runs: 978 / 987 / 1010 ms) and **~1.14 s** from its
+JPEG2000 twin (1136 / 1143 / 1150 ms, 33.9 MB -> 1.0 MB on disk, values bit-
+identical). An earlier milestone-5 session recorded 752 ms for the simple-packed
+hour; the JPEG path has been stable at ~1.14 s across sessions, so the simple-
+packing spread is treated as unattributed run-to-run variance rather than a
+regression — the V1.1 phase-3 changes touch only ingest-time filename rendering
+and manifest writing (once per field), never the per-message decode loop. Both
+paths stay far inside the "few seconds" §8 target, and packed products cut
+transfer volume by ~33x.
 
 ### 7.4 Profiling pass (`scripts/profile.sh [secs]`, optional `STRACE=1`)
 
@@ -347,9 +399,16 @@ Full log: `docs/DECISIONS.md` (per milestone). Highlights:
   publish granularity is a documented follow-up (see docs/DECISIONS.md).
 * Run-length DRT is 5.200 (task text's "5.1" does not exist in GRIB2); no
   dictionary encoder exists in the ecosystem.
-* Layer-range messages (multi-level single messages) and non-integral forecast
-  seconds are logged, counted as ingest errors, and skipped (fixtures never hit
-  either path).
+* Skip-and-NOTE (never a failure, never silent): layer/range level messages
+  (two fixed surfaces), messages carrying coordinate values after the product-
+  definition template, and unimplemented grid/product-definition templates cannot
+  answer a point query, so they are counted in `wxpoint_skipped_messages_total`
+  and noted in the ingest log while the message walk resumes at the declared
+  byte length — the rest of the file still ingests. Corrupt or undecodable section
+  7 (e.g. DRT 5.1) still fails LOUD as an ingest error, so the packing-twin
+  guard keeps working. Sub-second forecast offsets cannot exist (CT 4.4's finest
+  unit is second); a negative offset is treated as corrupt input and skipped, not
+  stored.
 * Isobaric levels normalized Pa→hPa internally (config/API strings match).
 * Out of scope per §13: slant paths, bounding boxes, soundings, grid
   subsetting, unit conversion, derived quantities, auth, NOAA downloads.

@@ -189,8 +189,8 @@ fn perf_gfs_hour_ingest_and_query() {
                         run_epoch_secs: 0,
                         stat_processed: false,
                         want_level: 0.0,
-                        want_fh_hours: 0.0,
-                        fh_hours: (0.0, 0.0),
+                        want_fh_secs: 0.0,
+                        fh_secs: (0.0, 0.0),
                         slots: [None, None],
                     };
                     let c_r = seed.build(sref, "gfs", None, "TMP", iso,

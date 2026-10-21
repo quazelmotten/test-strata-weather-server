@@ -9,6 +9,7 @@
 
 use serde_json::from_str;
 use memmap2::Mmap;
+use wx_core::storage::{fsync_path};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -208,8 +209,10 @@ pub fn deserialize_text(text: &str) -> Result<StateDoc, String> {
     }
 }
 
-/// Atomic byte writer: `<path>.tmp` in same dir, write, flush(=fsync),
-/// rename, fsync dir — same pattern as wx-core storage.rs.
+/// Atomic byte writer: `<path>.tmp` in same dir, write, flush, REAL fsync of
+/// the temp inode, rename, then REAL fsync of the parent directory. Uses
+/// `wx_core::storage::fsync_path` because this toolchain's std has no fsync
+/// API (`File::flush` is only a userspace-buffer flush).
 pub fn write_bytes_atomic(path: &str, text: &str) -> Result<(), String> {
     let tmp = format!("{}.tmp", path);
     let f = File::create(&tmp);
@@ -226,20 +229,18 @@ pub fn write_bytes_atomic(path: &str, text: &str) -> Result<(), String> {
             }
         }
     }
+    match fsync_path(&tmp) {
+        Err(e) => { return Err(format!("file fsync: {0}", e)); }
+        Ok(_) => {}
+    }
     let r = std::fs::rename(&tmp, &path);
     if r.is_err() {
         return Err("rename failed".to_string());
     }
     let dir = parent_dir(&path);
-    let d = File::open(&dir);
-    match d {
-        Err(_) => { return Err("dir-open failed".to_string()); }
-        Ok(mut dh) => {
-            let df = dh.flush();
-            if df.is_err() {
-                return Err("dir-flush failed".to_string());
-            }
-        }
+    match fsync_path(&dir) {
+        Err(e) => { return Err(format!("dir fsync: {0}", e)); }
+        Ok(_) => {}
     }
     return Ok(());
 }

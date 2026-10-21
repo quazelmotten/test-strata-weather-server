@@ -25,6 +25,11 @@ pub struct QueryStats {
     pub c4xx: AtomicU64,
     pub c5xx: AtomicU64,
     pub ingest_errors: AtomicU64, // mirrored from Pipeline.counters by the ingest thread
+    /// Structurally-unusable messages deliberately skipped (layer/range levels,
+    /// coordinate lists, unknown grid/PDT templates): spec §4.2 wants them noted
+    /// rather than failed, so they get their own counter and never inflate
+    /// wxpoint_ingest_errors_total.
+    pub skipped_messages: AtomicU64,
     pub ingested_files: AtomicU64,
     pub last_mtime_ns: AtomicI64, // max mtime (epoch ns) over ingested files
 }
@@ -55,8 +60,9 @@ impl QueryStats {
     }
 
     /// Mirror ingest-side counters (single writer: the ingest thread).
-    pub fn set_ingest(self: &Self, errors: u64, files: u64, mtime_ns: i64) {
+    pub fn set_ingest(self: &Self, errors: u64, files: u64, skipped: u64, mtime_ns: i64) {
         self.ingest_errors.store(errors, Ordering::Relaxed);
+        self.skipped_messages.store(skipped, Ordering::Relaxed);
         self.ingested_files.store(files, Ordering::Relaxed);
         self.last_mtime_ns.store(mtime_ns, Ordering::Relaxed);
     }
@@ -75,6 +81,8 @@ impl QueryStats {
         out = format!("{0}{1}", out, self.ingest_errors.load(Ordering::Relaxed));
         out = format!("{0}{1}", out, "\nwxpoint_ingested_files_total ");
         out = format!("{0}{1}", out, self.ingested_files.load(Ordering::Relaxed));
+        out = format!("{0}{1}", out, "\nwxpoint_skipped_messages_total ");
+        out = format!("{0}{1}", out, self.skipped_messages.load(Ordering::Relaxed));
         // ingest lag: file mtime -> now, seconds (mtime is epoch ns).
         let mtime = self.last_mtime_ns.load(Ordering::Relaxed);
         let mut lag = 0.0;
@@ -126,6 +134,7 @@ pub fn new_stats() -> Arc<QueryStats> {
         c4xx: AtomicU64::new(0),
         c5xx: AtomicU64::new(0),
         ingest_errors: AtomicU64::new(0),
+        skipped_messages: AtomicU64::new(0),
         ingested_files: AtomicU64::new(0),
         last_mtime_ns: AtomicI64::new(0),
     };

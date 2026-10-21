@@ -16,7 +16,7 @@
 //! via GridLambert::new (which calls prepare()), keeping one source of truth.
 
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
-use wx_core::storage::{write_bin_atomic, open_field, BinHeader};
+use wx_core::storage::{write_bin_atomic, open_field, BinHeader, fsync_path};
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
@@ -272,14 +272,18 @@ pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
     }
 }
 
-/// Public alias of state.rs atomic byte writer (grid.bin/manifest.json).
+/// Public alias of the atomic byte writer used for grid.bin/manifest.json:
+/// temp file in the SAME directory, write, flush, REAL fsync of the temp inode
+/// (libc via `wx_core::storage::fsync_path`; this std has no fsync API), atomic
+/// rename, then REAL fsync of the parent directory so the rename survives a
+/// crash. Durability failures are reported, not swallowed.
 pub fn write_bytes_atomic_pub(path: &str, bytes: &[u8]) -> Result<(), String> {
-            let tmp = format!("{}.tmp", path);
+    let tmp = format!("{0}.tmp", path);
     let f = std::fs::File::create(&tmp);
     match f {
         Err(_) => { return Err("create failed".to_string()); }
         Ok(mut h) => {
-            let w = h.write_all(&bytes);
+            let w = h.write_all(bytes);
             if w.is_err() {
                 return Err("write_all failed".to_string());
             }
@@ -289,21 +293,48 @@ pub fn write_bytes_atomic_pub(path: &str, bytes: &[u8]) -> Result<(), String> {
             }
         }
     }
+    match fsync_path(&tmp) {
+        Err(e) => { return Err(format!("file fsync: {0}", e)); }
+        Ok(_) => {}
+    }
     let r = std::fs::rename(&tmp, &path);
     if r.is_err() {
         return Err("rename failed".to_string());
     }
+    match fsync_path(&parent_dir_pub(&path)) {
+        Err(e) => { return Err(format!("dir fsync: {0}", e)); }
+        Ok(_) => {}
+    }
     return Ok(());
+}
+
+/// Parent-directory portion of a path (split at the last '/').
+fn parent_dir_pub(path: &str) -> String {
+    let mut last: Option<usize> = None;
+    for k in 0 .. path.len() {
+        if path[k .. k + 1] == *"/" {
+            last = Some(k);
+        }
+    }
+    match last {
+        None => { return ".".to_string(); }
+        Some(0) => { return "/".to_string(); }
+        Some(k) => { return path[0 .. k].to_string(); }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // manifest.json (human-facing inventory; index is authoritative)
 // ---------------------------------------------------------------------------
 
-/// One field entry line for the manifest.
+/// One field entry for the manifest. `fhs` are decimal HOURS (human-facing);
+/// `stat_ranges_json` is the pre-rendered per-fh statistical range array
+/// (`[]` when nothing is statistically processed) — spec §4.2 requires the
+/// PDT 4.8 time RANGE to be stored, and this is where it lands on disk.
 pub fn manifest_field_json(param: &str, level_dir: &str, units: &str,
                            stat_processed: bool, stat_kind: String,
-                           levels: Vec<f64>, fhs: Vec<i64>) -> String {
+                           levels: Vec<f64>, fhs: Vec<f64>,
+                           stat_ranges_json: String) -> String {
     let mut lv = "".to_string();
     for k in 0 .. levels.len() {
         if k > 0 {
@@ -316,14 +347,185 @@ pub fn manifest_field_json(param: &str, level_dir: &str, units: &str,
         if k > 0 {
             fh = fh + ",";
         }
-        fh = format!("{0}{1}", fh, fhs[k]);
+        fh = format!("{0}{1}", fh, fmt_hours(fhs[k]));
     }
     let mut st = "false";
     if stat_processed {
         st = "true";
     }
-    return format!("{{\"param\":\"{0}\",\"level_type\":\"{1}\",\"units\":\"{2}\",\"stat_processed\":{3},\"stat_kind\":\"{4}\",\"levels\":[{5}],\"forecast_hours\":[{6}]}}",
-        param, level_dir, units, st, stat_kind, lv, fh);
+    return format!("{{\"param\":\"{0}\",\"level_type\":\"{1}\",\"units\":\"{2}\",\"stat_processed\":{3},\"stat_kind\":\"{4}\",\"levels\":[{5}],\"forecast_hours\":[{6}],\"stat_ranges\":{7}}}",
+        param, level_dir, units, st, stat_kind, lv, fh, stat_ranges_json);
+}
+
+/// Decimal-hour rendering for manifest/inventory lists: integral values print
+/// without a fraction (0, 6), fractional ones with trimmed decimals (0.5,
+/// 1.25). Same shape as wx-core tables.fmt_num but local to avoid a
+/// dependency edge from the storage writer.
+fn fmt_hours(v: f64) -> String {
+    let ip = v.trunc();
+    if ip == v {
+        return format!("{}", ip);
+    }
+    let mut digits: String = "".to_string();
+    let mut fr = v - ip;
+    let mut k = 0;
+    while k < 6 {
+        fr = fr * 10.0;
+        let d = fr.trunc();
+        fr = fr - d;
+        digits = format!("{0}{1}", digits, d);
+        k += 1;
+    }
+    while digits.len() > 0 && digits[digits.len() - 1 ..] == *"0" {
+        digits = digits[0 .. digits.len() - 1].to_string();
+    }
+    return format!("{0}.{1}", ip, digits);
+}
+
+// ---------------------------------------------------------------------------
+// ISO-8601 UTC <-> epoch seconds (manifest stat ranges, spec §4.2/§7)
+// ---------------------------------------------------------------------------
+
+/// `YYYY-MM-DDTHH:MM:SSZ` for an epoch-seconds instant (Howard Hinnant civil
+/// date from days, Gregorian proleptic, non-negative epochs only). Returns
+/// the empty string for negative input (pre-1970 GRIB products do not exist
+/// here; callers treat "" as "no range").
+pub fn iso_utc(epoch: i64) -> String {
+    if epoch < 0 {
+        return "".to_string();
+    }
+    let days = epoch / 86400;
+    let rem = epoch - days * 86400;
+    let hh = rem / 3600;
+    let mm = (rem - hh * 3600) / 60;
+    let ss = rem - hh * 3600 - mm * 60;
+    // Shift so era boundaries line up with 0000-03-01 (the Hinnant convention
+    // that makes the 400-year cycle exactly 146097 days).
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097; // [0, 146096]
+    // Year-of-era: the largest yoe in [0, 399] whose era-relative day count
+    // (365*yoe + yoe/4 - yoe/100) does not exceed `doe`. `doe / 365` is always
+    // >= the true value (365 <= 365.2425), so one correction loop suffices.
+    // The upper bound matters: at doe = 146096 (era end, i.e. a leap year's
+    // Feb 29) the formula for yoe = 400 matches exactly, so the search must
+    // stop at 399 instead of stepping into the next era. This runs at INGEST
+    // time only (manifest writing), so the loops cost nothing measurable.
+    let mut yoe = doe / 365; // never below the true value (365 <= 365.2425)
+    if yoe > 399 {
+        yoe = 399; // year-of-era is bounded at 399 by construction
+    }
+    while yoe < 399 && 365 * (yoe + 1) + (yoe + 1) / 4 - (yoe + 1) / 100 <= doe {
+        yoe += 1;
+    }
+    while yoe > 0 && 365 * yoe + yoe / 4 - yoe / 100 > doe {
+        yoe -= 1;
+    }
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yy = y + (if m <= 2 { 1 } else { 0 });
+    return format!("{0}-{1}-{2}T{3}:{4}:{5}Z", pad4(yy), pad2(m), pad2(d), pad2(hh), pad2(mm), pad2(ss));
+}
+
+/// Strict parse of `YYYY-MM-DDTHH:MM:SSZ` back to epoch seconds (inverse of
+/// [`iso_utc`); None on any deviation from the canonical form.
+pub fn parse_iso_utc(t: &str) -> Option<i64> {
+    if t.len() != 20 {
+        return None;
+    }
+    if t[4 .. 5] != *"-" || t[7 .. 8] != *"-" || t[10 .. 11] != *"T" ||
+       t[13 .. 14] != *":" || t[16 .. 17] != *":" || t[19 .. 20] != *"Z" {
+        return None;
+    }
+    let yv = num_at(&t, 0, 4);
+    let mo = num_at(&t, 5, 2);
+    let da = num_at(&t, 8, 2);
+    let hh = num_at(&t, 11, 2);
+    let mi = num_at(&t, 14, 2);
+    let ss = num_at(&t, 17, 2);
+    match yv {
+        None => { return None; }
+        Some(y) => {
+            match mo {
+                None => { return None; }
+                Some(mo2) => {
+                    match da {
+                        None => { return None; }
+                        Some(da2) => {
+                            match hh {
+                                None => { return None; }
+                                Some(hh2) => {
+                                    match mi {
+                                        None => { return None; }
+                                        Some(mi2) => {
+                                            match ss {
+                                                None => { return None; }
+                                                Some(ss2) => {
+                                                    if mo2 < 1 || mo2 > 12 || da2 < 1 || da2 > 31 || hh2 > 23 || mi2 > 59 || ss2 > 59 {
+                                                        return None;
+                                                    }
+                                                    return Some(days_from_civil(y, mo2, da2) * 86400 + hh2 * 3600 + mi2 * 60 + ss2);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn num_at(t: &str, off: usize, len: usize) -> Option<i64> {
+    let ub: Vec<u8> = t.as_bytes().to_vec();
+    if off + len > ub.len() {
+        return None;
+    }
+    let mut v: i64 = 0;
+    for k in 0 .. len {
+        let b = ub[off + k];
+        if b < 48 || b > 57 {
+            return None;
+        }
+        v = v * 10 + ((b as i64) - 48);
+    }
+    return Some(v);
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant days_from_civil).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = (if yy < 0 { (yy / 400) - 1 } else { yy / 400 }) as i64;
+    let yoe = yy - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+fn pad4(v: i64) -> String {
+    let s = format!("{}", v);
+    if s.len() >= 4 {
+        return s;
+    }
+    let mut zeros = "".to_string();
+    for _ in 0 .. (4 - s.len()) {
+        zeros = zeros + "0";
+    }
+    return format!("{0}{1}", zeros, s);
+}
+
+fn pad2(v: i64) -> String {
+    if v < 10 {
+        return format!("0{0}", v);
+    }
+    return format!("{0}", v);
 }
 
 fn fmt_level(v: f64) -> String {

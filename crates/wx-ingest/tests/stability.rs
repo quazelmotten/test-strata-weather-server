@@ -159,8 +159,8 @@ fn window_strategy_skips_half_written() {
                         run_epoch_secs: 0,
                         stat_processed: false,
                         want_level: 0.0,
-                        want_fh_hours: 0.0,
-                        fh_hours: (0.0, 0.0),
+                        want_fh_secs: 0.0,
+                        fh_secs: (0.0, 0.0),
                         slots: [None, None],
                     };
                     let c_r = seed.build(sref, "gfs", None, "TMP", iso,

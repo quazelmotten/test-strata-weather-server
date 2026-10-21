@@ -108,8 +108,8 @@ pub fn bench_query(c: &mut Criterion) {
         units: "K".to_string(),
         stat_processed: false,
         stat_kind: "instantaneous".to_string(),
-        fhs: [IdxFh { fh_hours: 0i64, field: fh0.clone() },
-              IdxFh { fh_hours: 6i64, field: fh6.clone() }].to_vec(),
+        fhs: [IdxFh { fh_secs: 0i64, field: fh0.clone(), stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 },
+              IdxFh { fh_secs: 21600i64, field: fh6.clone(), stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 }].to_vec(),
     };
     let run = IdxRun {
         epoch_secs: 1761105600i64,
@@ -134,8 +134,8 @@ pub fn bench_query(c: &mut Criterion) {
         run_epoch_secs: 0i64,
         stat_processed: false,
         want_level: 0.0,
-        want_fh_hours: 0.0,
-        fh_hours: (0.0, 0.0),
+        want_fh_secs: 0.0,
+        fh_secs: (0.0, 0.0),
         slots: [None, None],
     };
 
@@ -155,7 +155,7 @@ pub fn bench_query(c: &mut Criterion) {
         let mut k = 0usize;
         b.iter(|| {
             let ctx_r = seed.build(&snap, "gfs", None, "TMP", 100u8,
-                                   775.0, 3.0, TimeInterpMode::Linear);
+                                   775.0, 10800.0, TimeInterpMode::Linear);
             match ctx_r {
                 Err(_) => {
                     k = (k + 1) % lats.len();

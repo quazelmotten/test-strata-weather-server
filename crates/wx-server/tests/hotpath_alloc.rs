@@ -179,8 +179,8 @@ fn hot_path_allocation_count_and_latency() {
                         run_epoch_secs: 0,
                         stat_processed: false,
                         want_level: 0.0,
-                        want_fh_hours: 0.0,
-                        fh_hours: (0.0, 0.0),
+                        want_fh_secs: 0.0,
+                        fh_secs: (0.0, 0.0),
                         slots: [None, None],
                     };
                     // mid-cell query: bilinear + seam wrap at lon 359.9

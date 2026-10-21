@@ -278,7 +278,9 @@ pub async fn inventory_handler(st: State<ServerState>, req: Request) -> Response
                     if kh > 0 {
                         out = format!("{0}{1}", out, ",");
                     }
-                    out = format!("{0}{1}", out, fe.fd.fhs[kh].fh_hours);
+                    // decimal HOURS in the inventory (fractional forecast
+                    // hours print as 0.5, integral ones stay 0/6/12)
+                    out = format!("{0}{1}", out, fmt_num(fe.fd.fhs[kh].fh_secs as f64 / 3600.0));
                 }
                 out = format!("{0}{1}", out, "]");
                 // levels of the newest fh file for this field (informational,

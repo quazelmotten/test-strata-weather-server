@@ -57,6 +57,25 @@ fn write_bytes(path: &str, bytes: &[u8]) {
     }
 }
 
+fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
+    if pat.len() > hay.len() {
+        return false;
+    }
+    for s in 0 .. (hay.len() - pat.len() + 1) {
+        let mut ok = true;
+        for k in 0 .. pat.len() {
+            if hay[s + k] != pat[k] {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn rm_tree(dir: &str) {
     match read_dir(&dir) {
         Err(_) => {}
@@ -121,6 +140,17 @@ fn restart_no_reingest_and_content_change_redelivers() {
     assert!(n == 3);
     assert!(p1.counters.errors == 0);
 
+    // ---- PDT 4.8 statistical TIME RANGES must be on disk (spec §4.2) ------
+    // Two accumulations of ONE field have DIFFERENT ranges, so the range travels
+    // with each forecast hour (`stat_ranges` keyed by exact fh_secs), rendered as
+    // absolute ISO-8601 UTC instants. The 3-hour TMP average proves the same
+    // machinery covers non-accumulation statistics.
+    let stat_run = join_path(&join_path(&data, "stat"), "2026101912");
+    let man = read_bytes(&join_path(&stat_run, "manifest.json"));
+    assert!(bytes_contains(&man, "\"fh_secs\":0,\"begin\":\"2026-10-19T12:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\",\"step_secs\":0".as_bytes()));
+    assert!(bytes_contains(&man, "\"fh_secs\":21600,\"begin\":\"2026-10-19T18:00:00Z\",\"end\":\"2026-10-20T00:00:00Z\",\"step_secs\":0".as_bytes()));
+    assert!(bytes_contains(&man, "\"fh_secs\":10800,\"begin\":\"2026-10-19T15:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\"".as_bytes()));
+
     // ---- simulated restart ---------------------------------------------
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
@@ -143,8 +173,8 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             match lookup_level_type("isobaric") {
@@ -175,15 +205,39 @@ fn restart_no_reingest_and_content_change_redelivers() {
         None => { assert!(false); return; }
         Some(m) => {
             let mut found = false;
+            let mut apcp_r0 = (false, 0, 0);
+            let mut apcp_r6 = (false, 0, 0);
+            let mut tmp_r3 = (false, 0, 0);
             for fe in &m.runs[0].fields {
                 if fe.param_key == "APCP" {
                     found = true;
                     // manifest.json round-trip restored the accumulation guard.
                     assert!(fe.fd.stat_processed);
                     assert!(fe.fd.stat_kind == "accumulation".to_string());
+                    // ...and the PER-fh statistical ranges survived the restart
+                    // (offsets from the run time, exactly as written).
+                    assert!(fe.fd.fhs.len() == 2);
+                    for sl in &fe.fd.fhs {
+                        if sl.fh_secs == 0 {
+                            apcp_r0 = (sl.stat_has_range, sl.stat_begin_secs, sl.stat_end_secs);
+                        }
+                        if sl.fh_secs == 21600 {
+                            apcp_r6 = (sl.stat_has_range, sl.stat_begin_secs, sl.stat_end_secs);
+                        }
+                    }
+                }
+                if fe.param_key == "TMP" && fe.level_code == 103 {
+                    for sl in &fe.fd.fhs {
+                        if sl.fh_secs == 10800 {
+                            tmp_r3 = (sl.stat_has_range, sl.stat_begin_secs, sl.stat_end_secs);
+                        }
+                    }
                 }
             }
             assert!(found);
+            assert!(apcp_r0.0 && apcp_r0.1 == 0 && apcp_r0.2 == 21600);
+            assert!(apcp_r6.0 && apcp_r6.1 == 21600 && apcp_r6.2 == 43200);
+            assert!(tmp_r3.0 && tmp_r3.1 == 10800 && tmp_r3.2 == 21600);
         }
     }
 
@@ -211,8 +265,8 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             match lookup_level_type("height_above_ground") {
@@ -267,15 +321,15 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 run_epoch_secs: 0,
                 stat_processed: false,
                 want_level: 0.0,
-                want_fh_hours: 0.0,
-                fh_hours: (0.0, 0.0),
+                want_fh_secs: 0.0,
+                fh_secs: (0.0, 0.0),
                 slots: [None, None],
             };
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso) => {
                     let c_r = seed.build(s2, "gfs", None, "TMP", iso,
-                                         850.0, 6.0, TimeInterpMode::Linear);
+                                         850.0, 21600.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_) => { assert!(false); return; }
                         Ok(c) => {
