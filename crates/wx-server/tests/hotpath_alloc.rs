@@ -1,11 +1,13 @@
 // Spec §5 hot-path rules, proven empirically: a COUNTING global allocator
-// wraps libc malloc/free, and we bracket the query hot path
-// (arc-swap snapshot load -> PointQueryContext.build -> evaluate_point) on the
-// full-GFS perf fixture. evaluate_point alone must allocate ZERO heap blocks;
-// build() carries only the tiny inherited contract allocations (units String
-// + level/fh scratch), which we document rather than hide. The test also
-// prints debug-build ns/query for the README ballpark numbers (release
-// numbers come from scripts/smoke.sh via /metrics).
+// wraps libc malloc/free, and we bracket the query hot path (snapshot load
+// -> build_context -> evaluate_point) on the full-GFS perf fixture. V1.1
+// phase 5: BOTH stages must allocate ZERO heap blocks over 20k queries
+// (contexts borrow grid/units/mmap handles from the snapshot; selection
+// resolves forecast hours and levels without scratch vectors). The
+// companion test hotpath_full_alloc.rs extends the same harness to the FULL
+// handler lookup path (query-string parse through entry structuring). This
+// test also prints debug-build ns/query for the README ballpark numbers
+// (release numbers come from cargo bench and scripts/loadtest.sh via /metrics).
 
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
@@ -15,7 +17,7 @@ use libc::free;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use wx_ingest::pipeline::Pipeline;
-use wx_ingest::index::{PointQueryContext, evaluate_point};
+use wx_ingest::index::{build_context, evaluate_point};
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
 use wx_server::stats::{mono_ns};
@@ -169,29 +171,21 @@ fn hot_path_allocation_count_and_latency() {
     let gm = sref.find_model("gfs");
     match gm {
         None => { assert!(false); return; }
-        Some(mm) => {
+        Some(_mm) => {
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso) => {
-                    let seed = PointQueryContext {
-                        grid: mm.runs[0].grid.clone(),
-                        units: "".to_string(),
-                        run_epoch_secs: 0,
-                        stat_processed: false,
-                        want_level: 0.0,
-                        want_fh_secs: 0.0,
-                        fh_secs: (0.0, 0.0),
-                        slots: [None, None],
-                    };
                     // mid-cell query: bilinear + seam wrap at lon 359.9
                     let nq = 20000;
 
-                    // ---- build+evaluate per-query allocation count -------
+                    // ---- build+evaluate per-query allocation count (V1.1 phase 5:
+                    // MUST BE ZERO; the old units-String/scratch-Vec allocations are
+                    // gone, contexts borrow everything from the snapshot) -------
                     let a0 = n_alloc.load(Ordering::Relaxed);
                     let f0 = n_free.load(Ordering::Relaxed);
                     let t0 = mono_ns();
                     for _k in 0 .. nq {
-                        let cr = seed.build(sref, "gfs", None, "TMP", iso,
+                        let cr = build_context(sref, "gfs", None, "TMP", iso,
                                            1000.0, 0.0, TimeInterpMode::Linear);
                         match cr {
                             Err(_e) => { assert!(false); return; }
@@ -211,11 +205,13 @@ fn hot_path_allocation_count_and_latency() {
                     let f1 = n_free.load(Ordering::Relaxed);
                     let alloc_total = a1 - a0;
                     let dealloc_total = f1 - f0;
-                    let per_q = alloc_total / nq as u64;
+                    // V1.1 phase 5 hard gate: selection+assembly allocate NOTHING.
+                    assert!(alloc_total == 0);
+                    assert!(dealloc_total == 0);
                     let ns_q = (t1 - t0) / nq as i64;
 
                     // ---- evaluate_point alone: ZERO allocations ---------
-                    let cr2 = seed.build(sref, "gfs", None, "TMP", iso,
+                    let cr2 = build_context(sref, "gfs", None, "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match cr2 {
                         Err(_e) => { assert!(false); return; }
@@ -237,20 +233,17 @@ fn hot_path_allocation_count_and_latency() {
                             assert!(a3 == a2);
                             assert!(f3 == f2);
                             let ns_ev = (t3 - t2) / nq as i64;
-                            println!("hotpath debug: build+eval {0} ns/q ({1} allocs/q), eval-only {2} ns/q (0 allocs)",
-                                     ns_q, per_q, ns_ev);
+                            println!("hotpath debug: build+eval {0} ns/q (0 allocs), eval-only {1} ns/q (0 allocs)",
+                                     ns_q, ns_ev);
                             let mut msg = "build+eval ".to_string();
                             msg = format!("{0}{1}", msg, ns_q);
-                            msg = format!("{0}{1}", msg, " ns/q (");
-                            msg = format!("{0}{1}", msg, per_q);
-                            msg = format!("{0}{1}", msg, " allocs/q), eval-only ");
+                            msg = format!("{0}{1}", msg, " ns/q (0 allocs), eval-only ");
                             msg = format!("{0}{1}", msg, ns_ev);
                             msg = format!("{0}{1}", msg, " ns/q (0 allocs)");
                             write_text("/tmp/opencode/hotpath_debug.txt", msg);
                         }
                     }
-                    assert!(dealloc_total <= alloc_total);
-                }
+                                    }
             }
         }
     }

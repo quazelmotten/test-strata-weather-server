@@ -11,14 +11,12 @@
 // (295/325/355/545/575/80 at lon 351.5 lat 9.0).
 
 use wx_ingest::pipeline::{Pipeline, fh_file_name, parse_fh_name, run_dir_name, parse_run_dir, level_dir_name};
-use wx_ingest::index::{PointQueryContext, evaluate_point, SelectError};
+use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_ingest::grib2::{decode_file, ParamFilter, StatKind, RunTime, epoch_secs};
 use wx_ingest::state::{join_path};
 use wx_ingest::discovery::{path_to_str};
 use wx_core::interp::{TimeInterpMode, HorizMethod};
 use wx_core::tables::{lookup_level_type};
-use wx_core::grid::{GridDef};
-use std::sync::Arc;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io::Write;
@@ -144,21 +142,6 @@ fn file_exists(path: String) -> bool {
         Err(_) => { return false; }
         Ok(_) => { return true; }
     }
-}
-
-// Seed context for the index-level queries below (same shape pipeline_e2e
-// uses; `want_fh_secs` is SECONDS past the run time).
-fn seed_ctx(grid: Arc<GridDef>) -> PointQueryContext {
-    return PointQueryContext {
-        grid: grid,
-        units: "".to_string(),
-        run_epoch_secs: 0,
-        stat_processed: false,
-        want_level: 0.0,
-        want_fh_secs: 0.0,
-        fh_secs: (0.0, 0.0),
-        slots: [None, None],
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -438,7 +421,7 @@ fn fractional_hours_queries_and_run_selection() {
                     // exact fractional forecast hour: run A + 30 min at node
                     // (lat 9.0, lon 351.5) -> 250 + 45 + 30 = 325 exactly, no
                     // blending of any kind.
-                    let cx = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cx = build_context(sref, "frac",
                         Some(m.runs[0].epoch_secs), "TMP", iso_code, 850.0, 1800.0,
                         TimeInterpMode::Linear);
                     match cx {
@@ -467,7 +450,7 @@ fn fractional_hours_queries_and_run_selection() {
                     // mid-bracket between f000m30 and f001m00 at fc 45 min:
                     // linear in the minute coordinate -> 340, bracket reported
                     // back in HOURS per spec §7.
-                    let cb = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cb = build_context(sref, "frac",
                         Some(m.runs[0].epoch_secs), "TMP", iso_code, 850.0, 2700.0,
                         TimeInterpMode::Linear);
                     match cb {
@@ -493,7 +476,7 @@ fn fractional_hours_queries_and_run_selection() {
                         }
                     }
                     // time_interp=none at a NON-stored fractional fh is rejected
-                    let cn = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cn = build_context(sref, "frac",
                         Some(m.runs[0].epoch_secs), "TMP", iso_code, 850.0, 2700.0,
                         TimeInterpMode::None);
                     match cn {
@@ -510,7 +493,7 @@ fn fractional_hours_queries_and_run_selection() {
                     }
                     // accumulation guard still fires for a FRACTIONAL range: APCP
                     // at fc 45 min must be refused, at fc 30 min answered 80.
-                    let cg = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cg = build_context(sref, "frac",
                         Some(m.runs[0].epoch_secs), "APCP", 1, 0.0, 2700.0,
                         TimeInterpMode::Linear);
                     match cg {
@@ -525,7 +508,7 @@ fn fractional_hours_queries_and_run_selection() {
                             }
                         }
                     }
-                    let ce = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let ce = build_context(sref, "frac",
                         Some(m.runs[0].epoch_secs), "APCP", 1, 0.0, 1800.0,
                         TimeInterpMode::Linear);
                     match ce {
@@ -550,7 +533,7 @@ fn fractional_hours_queries_and_run_selection() {
                     // the valid time (spec §6.3); that walk lives in
                     // queryapi.answer_param and is exercised in the wx-server
                     // fractional-hour test.
-                    let cb_now = seed_ctx(m.runs[1].grid.clone()).build(sref, "frac",
+                    let cb_now = build_context(sref, "frac",
                         Some(m.runs[1].epoch_secs), "TMP", iso_code, 850.0, 1800.0,
                         TimeInterpMode::Linear);
                     match cb_now {
@@ -565,7 +548,7 @@ fn fractional_hours_queries_and_run_selection() {
                         }
                     }
                     // pinning run A answers from run A's f001m00 slot instead
-                    let cp = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cp = build_context(sref, "frac",
                         Some(ep_a), "TMP", iso_code, 850.0, 3600.0, TimeInterpMode::Linear);
                     match cp {
                         Err(_) => { assert!(false); }
@@ -580,7 +563,7 @@ fn fractional_hours_queries_and_run_selection() {
                     }
                     // 13:15Z is beyond BOTH runs' last stored slot (run A tops
                     // out at f001m00, run B at f000m30): no run covers it.
-                    let cno = seed_ctx(m.runs[0].grid.clone()).build(sref, "frac",
+                    let cno = build_context(sref, "frac",
                         None, "TMP", iso_code, 850.0, 4500.0, TimeInterpMode::Linear);
                     match cno {
                         Err(ne) => {

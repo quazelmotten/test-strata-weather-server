@@ -1,25 +1,41 @@
 //! /v1/point request parsing, run selection over the arc-swap snapshot and
 //! response JSON rendering (spec §7 + §6 semantics via the milestone-3 index
-//! contract). HOT PATH RULES (spec §5): the lookup path (snapshot load ->
-//! PointQueryContext.build -> evaluate_point) performs no locks beyond the
-//! arc-swap load, no file I/O beyond mmap page faults and no per-request
-//! memmap open; the only allocations are tiny Vec/String clones inherited
-//! from the milestone-3 contract (units string + level/fh scratch vectors),
-//! measured and documented in tests/hotpath_alloc.rs. Response body
-//! construction (render_point_json) allocates freely, which the spec allows.
+//! contract). HOT PATH RULES (spec §5, V1.1 phase 5): the ENTIRE lookup path
+//! (query-string parse -> snapshot walk -> PointQueryContext assembly ->
+//! evaluate_point -> per-parameter entry structuring) performs ZERO heap
+//! allocations, no locks beyond the arc-swap load, no file I/O beyond mmap
+//! page faults and no per-request memmap open. ParsedArgs borrows its strings
+//! from the request query string; QueryEntry borrows units/param names from
+//! the snapshot and the request respectively; params/entries live in fixed
+//! inline arrays (cap 8 each, docs/DECISIONS.md) with a documented heap
+//! fallback ONLY for requests exceeding the cap. Proven by tests/hotpath_alloc.rs
+//! (evaluate_point AND build_context zero-alloc) and tests/hotpath_full_alloc.rs
+//! (full handler path up to, EXCLUDING, JSON body string construction).
+//! Response body construction (render_point_json/render_entry/make_response)
+//! allocates freely, which the spec allows and the measurement boundary excludes.
 
 use crate::timeparse::{parse_iso_z};
-use wx_ingest::index::{IndexSnapshot, PointQueryContext, evaluate_point, SelectError};
+use wx_ingest::index::{IndexSnapshot, build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode, HorizMethod, PointError, InterpInfo, LevelInterpMethod};
 use wx_core::tables::{parse_level_str, format_level_str, parse_f64, fmt_num};
-use wx_core::grid::{GridDef};
-use std::sync::Arc;
 
-/// One parsed /v1/point request (spec §7 parameter table).
+/// Inline capacity for parsed parameter tokens AND per-request result entries
+/// (V1.1 phase 5). 8 covers every realistic multi-param query (spec §7 shows
+/// `TMP,HGT`; operational mixes stay well under 8); requests beyond the cap
+/// fall back to a heap Vec ONCE per request and are OUT OF THE ZERO-ALLOC
+/// GUARANTEE (documented in docs/DECISIONS.md).
+pub const MAX_INLINE_PARAMS: usize = 8;
+pub const MAX_INLINE_ENTRIES: usize = 8;
+
+/// One parsed /v1/point request (spec §7 parameter table). V1.1 phase 5:
+/// BORROWS every string from the query string it parsed (lifetime 'q), so
+/// parsing allocates nothing on the success path.
 #[derive(Clone, Debug)]
-pub struct ParsedArgs {
-    pub model: String,
-    pub params: Vec<String>, // csv split, order preserved
+pub struct ParsedArgs<'q> {
+    pub model: &'q str, // "" when absent (required-key check below)
+    pub n_params: usize, // total csv tokens (inline + extra)
+    pub params: [Option<&'q str>; MAX_INLINE_PARAMS], // first N tokens, order preserved
+    pub extra_params: Vec<&'q str>, // tokens beyond the inline cap (rare; allocates)
     pub level_code: u8, // CT 4.5
     pub level_val: f64, // numeric coordinate (0 for bare `surface`)
     pub lat: f64,
@@ -44,7 +60,7 @@ pub enum ArgTok {
 #[derive(Clone, Debug)]
 pub struct ParseFail {
     pub tok: ArgTok,
-    pub detail: String, // offending key/value text for the message
+    pub detail: String, // offending key/value text (error path only: allocates)
 }
 
 /// Stable machine tokens (documented in docs/DECISIONS.md).
@@ -62,12 +78,16 @@ pub fn arg_token(t: ArgTok) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// query-string parsing (manual walk: keys compared as slices, values owned)
+// query-string parsing (manual walk: keys AND values borrowed as slices of
+// qs; the success path touches the allocator exactly zero times — error
+// paths may allocate their message text, which is response-body territory)
 // ---------------------------------------------------------------------------
 
-pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
-    let mut model = "".to_string();
-    let mut params: Vec<String> = Vec::<String>::new();
+pub fn parse_query<'q>(qs: &'q str) -> Result<ParsedArgs<'q>, ParseFail> {
+    let mut model: &'q str = "";
+    let mut pa_params: [Option<&'q str>; MAX_INLINE_PARAMS] = [None, None, None, None, None, None, None, None];
+    let mut pa_extra: Vec<&'q str> = Vec::<&'q str>::new();
+    let mut pa_n = 0;
     let mut has_level = false;
     let mut level_code = 0;
     let mut level_val = 0.0;
@@ -101,12 +121,12 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                 break;
             }
             let key = &seg[0 .. eq];
-            let val = if eq < seg.len() { seg[eq + 1 .. seg.len()].to_string() } else { "".to_string() };
+            let val = if eq < seg.len() { &seg[eq + 1 .. seg.len()] } else { &seg[0 .. 0] };
             if *key == *"model" {
                 if val.is_empty() {
                     return Err(ParseFail { tok: ArgTok::EmptyValue, detail: "model".to_string() });
                 }
-                model = val.to_string();
+                model = val;
             } else if *key == *"param" {
                 if val.is_empty() {
                     return Err(ParseFail { tok: ArgTok::EmptyValue, detail: "param".to_string() });
@@ -120,7 +140,12 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     }
                     let tok = &val[ppos .. pend];
                     if !tok.is_empty() {
-                        params.push(tok.to_string());
+                        if pa_n < MAX_INLINE_PARAMS {
+                            pa_params[pa_n] = Some(tok);
+                        } else {
+                            pa_extra.push(tok);
+                        }
+                        pa_n += 1;
                     }
                     if pend >= plen {
                         break;
@@ -128,7 +153,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     ppos = pend + 1;
                 }
             } else if *key == *"level" {
-                let lv = parse_level_str(&val);
+                let lv = parse_level_str(val);
                 match lv {
                     None => { return Err(ParseFail { tok: ArgTok::BadLevel, detail: val.to_string() }); }
                     Some(p) => {
@@ -138,7 +163,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     }
                 }
             } else if *key == *"lat" {
-                let v = parse_f64(&val);
+                let v = parse_f64(val);
                 match v {
                     None => { return Err(ParseFail { tok: ArgTok::BadLat, detail: val.to_string() }); }
                     Some(x) => {
@@ -150,7 +175,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     }
                 }
             } else if *key == *"lon" {
-                let v = parse_f64(&val);
+                let v = parse_f64(val);
                 match v {
                     None => { return Err(ParseFail { tok: ArgTok::BadLon, detail: val.to_string() }); }
                     Some(x) => {
@@ -162,7 +187,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     }
                 }
             } else if *key == *"valid" {
-                let v = parse_iso_z(&val);
+                let v = parse_iso_z(val);
                 match v {
                     None => { return Err(ParseFail { tok: ArgTok::BadTime, detail: val.to_string() }); }
                     Some(x) => {
@@ -171,7 +196,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
                     }
                 }
             } else if *key == *"run" {
-                let v = parse_iso_z(&val);
+                let v = parse_iso_z(val);
                 match v {
                     None => { return Err(ParseFail { tok: ArgTok::BadTime, detail: val.to_string() }); }
                     Some(x) => { pin = Some(x); }
@@ -194,7 +219,7 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
     if model.is_empty() {
         return Err(ParseFail { tok: ArgTok::MissingRequired, detail: "model".to_string() });
     }
-    if params.is_empty() {
+    if pa_n == 0 {
         return Err(ParseFail { tok: ArgTok::MissingRequired, detail: "param".to_string() });
     }
     if !has_level {
@@ -211,7 +236,9 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
     }
     return Ok(ParsedArgs {
         model: model,
-        params: params,
+        n_params: pa_n,
+        params: pa_params,
+        extra_params: pa_extra,
         level_code: level_code,
         level_val: level_val,
         lat: lat,
@@ -220,6 +247,20 @@ pub fn parse_query(qs: &str) -> Result<ParsedArgs, ParseFail> {
         pin_epoch: pin,
         mode: mode,
     });
+}
+
+/// k-th parameter token in request order (inline first, heap tail after).
+pub fn param_at<'q>(pa: &ParsedArgs<'q>, k: usize) -> &'q str {
+    if k >= pa.n_params {
+        return "";
+    }
+    if k < MAX_INLINE_PARAMS {
+        match pa.params[k] {
+            Some(s) => { return s; }
+            None => { return ""; }
+        }
+    }
+    return pa.extra_params[k - MAX_INLINE_PARAMS];
 }
 
 // ---------------------------------------------------------------------------
@@ -263,34 +304,21 @@ pub fn fail_token(t: FailTok) -> String {
 }
 
 /// One parameter's answer entry (masked data is NOT an error: value null +
-/// reason missing_data per spec §7).
-#[derive(Clone, Debug)]
-pub struct QueryEntry {
-    pub param: String,
-    pub units: String,
+/// reason missing_data per spec §7). V1.1 phase 5: fully borrowed + Copy —
+/// constructing it allocates nothing (param name comes from the request,
+/// units from the snapshot).
+#[derive(Clone, Copy, Debug)]
+pub struct QueryEntry<'r> {
+    pub param: &'r str,
+    pub units: &'r str,
     pub run_epoch: i64, // selected run (echoed at top level)
     pub masked: bool,
     pub value: f64,
     pub info: Option<InterpInfo>,
 }
 
-/// Seed context whose fields build() overwrites entirely (milestone-3
-/// contract takes a seed only as a type template).
-fn make_seed(grid: Arc<GridDef>) -> PointQueryContext {
-    return PointQueryContext {
-        grid: grid,
-        units: "".to_string(),
-        run_epoch_secs: 0,
-        stat_processed: false,
-        want_level: 0.0,
-        want_fh_secs: 0.0,
-        fh_secs: (0.0, 0.0),
-        slots: [None, None],
-    };
-}
-
-pub fn answer_param(snap: &IndexSnapshot, model: &str, pin: Option<i64>, key: &str, code: u8, lval: f64, valid_ep: i64, mode: TimeInterpMode, lat: f64, lon: f64)
-    -> Result<QueryEntry, FailTok> {
+pub fn answer_param<'r>(snap: &'r IndexSnapshot, model: &'r str, pin: Option<i64>, key: &'r str, code: u8, lval: f64, valid_ep: i64, mode: TimeInterpMode, lat: f64, lon: f64)
+    -> Result<QueryEntry<'r>, FailTok> {
     let gm = snap.find_model(model);
     match gm {
         None => { return Err(FailTok::UnknownModel); }
@@ -333,15 +361,14 @@ pub fn answer_param(snap: &IndexSnapshot, model: &str, pin: Option<i64>, key: &s
                 if fh_secs < -1e-9 {
                     continue; // valid time before this run starts: older runs are worse
                 }
-                let seed = make_seed(run.grid.clone());
-                let cb = seed.build(snap, model, Some(ep), key, code, lval, fh_secs, mode);
+                let cb = build_context(snap, model, Some(ep), key, code, lval, fh_secs, mode);
                 match cb {
                     Ok(ctx) => {
                         let ev = evaluate_point(&ctx, lat, lon);
                         match ev {
                             Ok(pv) => {
                                 return Ok(QueryEntry {
-                                    param: key.to_string(),
+                                    param: key,
                                     units: ctx.units,
                                     run_epoch: ctx.run_epoch_secs,
                                     masked: false,
@@ -349,11 +376,11 @@ pub fn answer_param(snap: &IndexSnapshot, model: &str, pin: Option<i64>, key: &s
                                     info: Some(pv.info),
                                 });
                             }
-                            Err(pe) => {
-                                match pe {
+                            Err(pe2) => {
+                                match pe2 {
                                     PointError::MissingData => {
                                         return Ok(QueryEntry {
-                                            param: key.to_string(),
+                                            param: key,
                                             units: ctx.units,
                                             run_epoch: ctx.run_epoch_secs,
                                             masked: true,
@@ -394,6 +421,80 @@ pub fn answer_param(snap: &IndexSnapshot, model: &str, pin: Option<i64>, key: &s
             return Err(FailTok::NoRunCovers);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// per-request entry buffer + lookup driver (the ZERO-ALLOC measurement window:
+// everything up to but EXCLUDING JSON body string construction)
+// ---------------------------------------------------------------------------
+
+/// Fixed-inline result buffer for one /v1/point request. Entries are Copy
+/// borrows; the inline array covers <= MAX_INLINE_ENTRIES params (heap tail
+/// only beyond the cap, documented). `fail_param` records the offending param
+/// when lookup_entries fails so the error message can name it without an
+/// allocation on the success path.
+#[derive(Debug)]
+pub struct PointEntries<'r> {
+    pub n: usize,
+    pub inline: [Option<QueryEntry<'r>>; MAX_INLINE_ENTRIES],
+    pub extra: Vec<QueryEntry<'r>>,
+}
+
+/// Which parameter failed a lookup (token + borrowed param name).
+#[derive(Debug)]
+pub struct FailInfo<'q> {
+    pub tok: FailTok,
+    pub param: &'q str,
+}
+
+pub fn new_entries<'r>() -> PointEntries<'r> {
+    return PointEntries {
+        n: 0,
+        inline: [None, None, None, None, None, None, None, None],
+        extra: Vec::<QueryEntry<'r>>::new(),
+    };
+}
+
+pub fn entries_push<'r>(eb: &mut PointEntries<'r>, e: QueryEntry<'r>) {
+    if eb.n < MAX_INLINE_ENTRIES {
+        eb.inline[eb.n] = Some(e);
+    } else {
+        eb.extra.push(e);
+    }
+    eb.n += 1;
+}
+
+pub fn entries_at<'r>(eb: &PointEntries<'r>, k: usize) -> QueryEntry<'r> {
+    if k < MAX_INLINE_ENTRIES {
+        match eb.inline[k] {
+            Some(e) => { return e; }
+            None => {}
+        }
+    }
+    return eb.extra[k - MAX_INLINE_ENTRIES];
+}
+
+/// Resolve EVERY parameter of the request against the shared point/level/time
+/// and structure the result entries. This is the hot path proper: zero
+/// allocations, zero locks beyond the caller's snapshot load. Decision (spec
+/// ambiguous for multi-param errors): the FIRST failing parameter decides the
+/// error status; masked points are not errors. On failure the offending
+/// parameter name travels back in [`FailInfo`] (borrowed from the request).
+pub fn lookup_entries<'q: 'r, 'r>(snap: &'r IndexSnapshot, pa: &ParsedArgs<'q>, eb: &mut PointEntries<'r>) -> Result<(), FailInfo<'q>> {
+    let np = pa.n_params;
+    let mut k = 0;
+    while k < np {
+        let key = param_at(pa, k);
+        let one = answer_param(snap, pa.model, pa.pin_epoch, key, pa.level_code, pa.level_val, pa.valid_epoch, pa.mode, pa.lat, pa.lon);
+        match one {
+            Err(ft) => {
+                return Err(FailInfo { tok: ft, param: key });
+            }
+            Ok(entry) => { entries_push(eb, entry); }
+        }
+        k += 1;
+    }
+    return Ok(());
 }
 
 // ---------------------------------------------------------------------------
@@ -450,17 +551,19 @@ fn render_entry(e: QueryEntry) -> String {
 
 /// Top-level /v1/point success body, spec §7 example shape (values in native
 /// GRIB units; `run` echoes the selected run, `level` the canonical level).
-pub fn render_point_json(model: &str, run_epoch: i64, valid_epoch: i64, lat: f64, lon: f64, code: u8, val: f64, entries: &[QueryEntry]) -> String {
+/// V1.1 phase 5: takes the PointEntries buffer instead of a Vec — byte-identical
+/// output to the old renderer (same field order, same fmt_num behavior).
+pub fn render_point_json(model: &str, run_epoch: i64, valid_epoch: i64, lat: f64, lon: f64, code: u8, val: f64, eb: &PointEntries) -> String {
     use crate::timeparse::format_iso_z;
     let run_s = format_iso_z(run_epoch);
     let valid_s = format_iso_z(valid_epoch);
     let lvl_s = format_level_str(code, val);
     let mut out = format!("{{\"model\":\"{0}\",\"run\":\"{1}\",\"valid\":\"{2}\",\"lat\":{3},\"lon\":{4},\"level\":\"{5}\",\"results\":[", model, run_s, valid_s, lat, lon, lvl_s);
-    for k in 0 .. entries.len() {
+    for k in 0 .. eb.n {
         if k > 0 {
             out = format!("{0}{1}", out, ",");
         }
-        out = format!("{0}{1}", out, render_entry(entries[k].clone()));
+        out = format!("{0}{1}", out, render_entry(entries_at(eb, k)));
     }
     out = format!("{0}{1}", out, "]}");
     return out;

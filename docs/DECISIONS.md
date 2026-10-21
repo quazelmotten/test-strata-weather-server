@@ -1044,3 +1044,88 @@ Decisions worth recording:
 
 `cargo test --workspace`: green (10 new tests over phase 3's count).
 `cargo clippy --workspace -- -D warnings`: rc=0.
+
+# V1.1 phase 5 — allocation-free query path (spec §5)
+
+Spec §5 demands the query hot path does NO heap allocation apart from
+building the response body. Milestone 4 left three inherited allocations
+per query (`units` String clone, per-slot level `Vec<f64>`, forecast-hour
+scratch `Vec<f64>`); phase 5 removes them AND extends the proof to the
+whole handler lookup path.
+
+## Interning strategy: borrow-from-snapshot, not interned tables
+
+Chosen: **lifetimes tied to the snapshot Arc**, not a global string table.
+The handler pins `Arc<IndexSnapshot>` for the whole request, so every
+display string a query needs already lives either in the snapshot
+(`units`, param keys) or in the request itself (query string). Making
+`PointQueryContext<'s>` hold `&'s GridDef`, `&'s str` units and `&'s
+MmapField` slot handles (instead of `Arc` clones + `String` clone) costs
+zero at query time and zero extra memory at index-build time. A shared
+interning table would have added snapshot-build cost and a second source
+of truth for units strings for no measured gain (the allocator was never
+reached by those fields after this change). The old `seed.build(...)`
+contract lost its seed entirely: `build_context(snapshot, ...)` is a free
+function; the seed literal was pure ceremony (build overwrote every field)
+and its owned `units: ""` was part of the alloc count.
+
+## Inline caps: 8 params, 8 entries (documented fallback)
+
+`ParsedArgs.params` and `PointEntries.inline` are fixed arrays of 8
+(`MAX_INLINE_PARAMS` / `MAX_INLINE_ENTRIES`). Operational multi-param
+queries stay far below 8 (spec §7 shows two). Requests beyond the cap
+fall back to a heap tail (`extra_params` / `extra`) allocated ONCE per
+request; such requests are explicitly OUT of the zero-alloc guarantee and
+the boundary is asserted nowhere weaker than the docs claim. No silent
+truncation: all params are always answered.
+
+## Error paths still allocate (deliberate)
+
+`ParseFail.detail`, `arg_token`, `fail_token`, `error_message` build
+Strings — they exist only to render error bodies, which the spec allows.
+The zero-alloc gate measures success-class queries only.
+
+## Measurement boundary (hotpath_full_alloc.rs)
+
+Counting allocator wraps the FULL handler lookup: `parse_query` ->
+`lookup_entries` (selection + evaluation + entry structuring incl. masked
+entries) -> `entries_at`. EXCLUDED by design: `render_point_json` /
+`render_entry` / `make_response` (response-body construction, spec allows)
+and the axum router dispatch around the handler (not our code path). The
+test asserts ZERO allocations AND ZERO frees across 20k mixed success
+queries (exact node, seam, vertical, integral+fractional time interp,
+multi-param, run-pinned, wind pair, HRRR LCC exact/vertical/time) plus
+2000 masked-point queries on the small fixture.
+
+## Bit-exactness of the refactor (spec §8 rule)
+
+Nothing about arithmetic moved, but two kernels were re-shaped to read
+different containers, so equivalence tests pin them:
+* `resolve_levels_f32` (wx-core) vs `resolve_levels(Vec<f64>)`: identical
+  bracket selection AND identical widened doubles over 4000 randomized
+  level sets incl. eps-boundary wants, duplicates, gaps
+  (`crates/wx-core/tests/alloc_free_kernels.rs`).
+* `resolve_field_times` (index) vs materialized-`Vec<f64>` `resolve_times`:
+  identical `Result` incl. guard order over 3000 randomized slot lists x
+  both modes x stat flag (`crates/wx-ingest/tests/alloc_free_select.rs`).
+* Response bytes: unchanged renderer (same field order, same `fmt_num`);
+  existing HTTP-level golden assertions (point_http/meta_json/frac_http)
+  pass untouched, and `hotpath_full_alloc.rs` re-asserts probes.tsv values
+  (450 / 1642.5 / 480 / 1640) through the new path.
+
+## Measured deltas (AMD EPYC 7402, portable build)
+
+| Path | allocs/q before | allocs/q after | ns/q before | ns/q after |
+|---|---|---|---|---|
+| evaluate_point | 0 | 0 | ~330 | ~135 (bench ladder 354.6 -> 135.0) |
+| build_context (was seed.build) | ~3 | 0 | included above | included above |
+| full handler lookup (parse..entries) | ~6-7 | 0 | bench 828.8 | bench 694.3 |
+| load test server-side mean | 12.5 us | 10.0 us | p50 bucket <=20 -> <=10 us | client R/s 286.9k -> 286.9k (kernel-I/O-bound, expected) |
+
+Snapshot-build cost delta: none measurable (borrowing removes work; no
+interning tables added). Retention/index semantics untouched.
+
+## Gate
+
+`cargo test --workspace`: green (95 tests; +4 over phase 4's 91).
+`cargo clippy --workspace -- -D warnings`: rc=0.

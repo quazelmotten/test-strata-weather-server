@@ -15,7 +15,7 @@
 // Analytic field: value = 300 + j*21 + i (wgrib2-verified by scripts/regen_expected.sh).
 
 use wx_ingest::pipeline::{Pipeline, level_dir_name};
-use wx_ingest::index::{PointQueryContext, evaluate_point, SelectError};
+use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_ingest::grib2::{decode_file, ParamFilter, SkipReason, skip_reason_text};
 use wx_ingest::state::{join_path};
 use wx_ingest::discovery::{path_to_str};
@@ -236,20 +236,10 @@ fn pipeline_skips_are_noted_not_errors() {
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 2);
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso_code) => {
-                    let c8 = seed.build(sref, "robust", None, "TMP", iso_code,
+                    let c8 = build_context(sref, "robust", None, "TMP", iso_code,
                                         850.0, 0.0, TimeInterpMode::Linear);
                     match c8 {
                         Err(_) => { assert!(false); }
@@ -266,7 +256,7 @@ fn pipeline_skips_are_noted_not_errors() {
                     }
                     // the LAYER level type was never indexed: asking for 825mb
                     // has no field to bracket between (only 850 exists).
-                    let cl = seed.build(sref, "robust", None, "TMP", iso_code,
+                    let cl = build_context(sref, "robust", None, "TMP", iso_code,
                                         825.0, 0.0, TimeInterpMode::Linear);
                     match cl {
                         Err(ne) => {
@@ -285,7 +275,7 @@ fn pipeline_skips_are_noted_not_errors() {
             match lookup_level_type("height_above_ground") {
                 None => { assert!(false); return; }
                 Some(hag_code) => {
-                    let c2 = seed.build(sref, "robust", None, "TMP", hag_code,
+                    let c2 = build_context(sref, "robust", None, "TMP", hag_code,
                                         2.0, 0.0, TimeInterpMode::Linear);
                     match c2 {
                         Err(_) => { assert!(false); }

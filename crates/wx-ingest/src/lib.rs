@@ -229,5 +229,7 @@ pub use pipeline::Pipeline;
 pub use index::SharedIndex;
 pub use index::IndexSnapshot;
 pub use index::PointQueryContext;
+pub use index::build_context;
+pub use index::resolve_field_times;
 pub use index::evaluate_point;
 pub use index::SelectError;

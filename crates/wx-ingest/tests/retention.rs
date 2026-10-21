@@ -7,7 +7,7 @@
 
 use wx_ingest::pipeline::Pipeline;
 use wx_ingest::pipeline::{build_snapshot};
-use wx_ingest::index::{PointQueryContext, evaluate_point, SelectError};
+use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
 use wx_ingest::grib2::{epoch_secs};
@@ -183,18 +183,8 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
         Some(iso) => {
             match gm2 {
                 None => { assert!(false); return; }
-                Some(m) => {
-                    let seed = PointQueryContext {
-                        grid: m.runs[0].grid.clone(),
-                        units: "".to_string(),
-                        run_epoch_secs: 0,
-                        stat_processed: false,
-                        want_level: 0.0,
-                        want_fh_secs: 0.0,
-                        fh_secs: (0.0, 0.0),
-                        slots: [None, None],
-                    };
-                    let c_r = seed.build(sref_old, "gfs", Some(epA), "TMP", iso,
+                Some(_m) => {
+                    let c_r = build_context(sref_old, "gfs", Some(epA), "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_) => { assert!(false); return; }
@@ -207,7 +197,7 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
                         }
                     }
                     // The NEW snapshot can no longer pin the evicted run.
-                    let cn = seed.build(sref_new, "gfs", Some(epA), "TMP", iso,
+                    let cn = build_context(sref_new, "gfs", Some(epA), "TMP", iso,
                                         1000.0, 0.0, TimeInterpMode::Linear);
                     match cn {
                         Err(e2) => {
@@ -219,7 +209,7 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
                         Ok(_) => { assert!(false); }
                     }
                     // Unpinned queries on the new snapshot answer from D.
-                    let cd = seed.build(sref_new, "gfs", None, "TMP", iso,
+                    let cd = build_context(sref_new, "gfs", None, "TMP", iso,
                                         1000.0, 0.0, TimeInterpMode::Linear);
                     match cd {
                         Err(_) => { assert!(false); return; }

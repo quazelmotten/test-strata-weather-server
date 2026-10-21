@@ -261,10 +261,15 @@ The grib-rs crate was evaluated and rejected (capability gaps documented in
 docs/DECISIONS.md); the decoder is purpose-built against wgrib2 behavior.
 
 Concurrency: read-mostly index published atomically with `arc-swap`; query
-threads take zero locks, zero heap allocations beyond the response body, zero
-file I/O beyond page-faulting mmapped pages (all mmaps opened at index-build
-time). Proven by `hotpath_alloc.rs` (counting allocator: ZERO allocations in
-`evaluate_point` over 20k queries).
+threads take zero locks, ZERO heap allocations anywhere on the lookup path
+(V1.1 phase 5: not just `evaluate_point` — from query-string parse through
+interpolation-metadata structuring; only JSON body construction allocates),
+and zero file I/O beyond page-faulting mmapped pages (all mmaps opened at
+index-build time). Proven by `hotpath_alloc.rs` (counting allocator: ZERO
+allocations for `build_context` + `evaluate_point` over 20k queries) and
+`hotpath_full_alloc.rs` (ZERO allocations across 20k mixed success-class
+queries + 2000 masked queries, boundary = everything up to, EXCLUDING,
+response-body string construction).
 
 ## 7. Performance (measured on this machine)
 
@@ -275,34 +280,51 @@ GFS geometry (1440×720, 22 msgs/file ~34 MB ×2 files) + HRRR-like LCC
 
 ### 7.1 Criterion benches (`cargo bench`, bench profile = release minus panic)
 
-| Kernel | median |
-|---|---|
-| regular lat/lon project (per point) | **20.6 ns** |
-| LCC project, precomputed consts | **84.7 ns** |
-| bilinear over heap f32 slab | **30.7 ns** |
-| bilinear over mmap field (server h_at pattern) | **32.5 ns** |
-| full vertical+time point query via index accessor | **364.5 ns** |
-| `/v1/point` handler: parse + lookup + render | **879.2 ns** |
+V1.1 phase 5 re-measured the whole ladder back-to-back (before/after the
+allocation-free query-path refactor). Milestone-5 numbers are kept for
+reference; session variance on the pure kernels is ~±2%.
+
+| Kernel | milestone-5 | phase 5 before | phase 5 after |
+|---|---|---|---|
+| regular lat/lon project (per point) | 20.6 ns | 20.5 ns | **20.5 ns** (unchanged) |
+| LCC project, precomputed consts | 84.7 ns | 86.4 ns | **86.5 ns** (unchanged) |
+| bilinear over heap f32 slab | 30.7 ns | 30.9 ns | **31.0 ns** (unchanged) |
+| bilinear over mmap field (server h_at pattern) | 32.5 ns | 33.1 ns | **33.0 ns** (unchanged) |
+| full vertical+time point query via index accessor | 364.5 ns | **354.6 ns → 135.0 ns (−62%)** |
+| `/v1/point` handler: parse + lookup + render | 879.2 ns | **828.8 ns → 694.3 ns (−16%)** |
+
+The −62% on the index accessor is the removal of the per-query units `String`
+clone, the per-slot level `Vec<f64>`, the forecast-hour scratch `Vec<f64>` and
+the two `Arc` refcount round-trips (contexts now borrow grid defs, units
+strings and mmap handles straight out of the snapshot). The handler delta
+adds `parse_query` borrowing its strings from the request (no per-key
+`to_string()`, no params `Vec`) plus the fixed-inline entry buffer.
 
 ### 7.2 Load test (`scripts/loadtest.sh [secs]`, `NATIVE=1` variant)
 
 oha mix: 8 URLs (exact-node GFS, seam, vertical interp, time interp,
 multi-param, HRRR LCC, 404 unknown model, 422 bad level), `--worker-threads 8
--c 64 -z 15s --no-tui --urls-from-file`, keep-alive.
+-c 64 -z 20s --no-tui --urls-from-file`, keep-alive.
 
-| Metric | portable | target-cpu=native |
-|---|---|---|
-| throughput (client, 8 workers) | **286,868 req/s** | 275,293 req/s |
-| server-side mean latency (/metrics delta) | 12.9 µs | 13.4 µs |
-| server-side p50 / p99 (histogram buckets) | **≤20 µs / ≤50 µs** | ≤20 µs / ≤50 µs |
-| client p50 / p99 (oha) | 0.21 ms / 0.44 ms | similar |
+| Metric | portable (phase 5 before) | portable (phase 5 after) | target-cpu=native (pre-phase-5) |
+|---|---|---|---|
+| throughput (client, 8 workers) | 286,868 req/s | **286,872 req/s** | 275,293 req/s |
+| server-side mean latency (/metrics delta) | 12.5 µs | **10.0 µs** | 13.4 µs |
+| server-side p50 / p99 (histogram buckets) | ≤20 µs / ≤50 µs | **≤10 µs / ≤50 µs** | ≤20 µs / ≤50 µs |
+| client p50 / p99 (oha) | 0.21 ms / 0.42 ms | 0.21 ms / 0.42 ms | similar |
 
-§8 targets: **p50 < 50 µs MET** (≤20 µs), **p99 < 250 µs MET** (≤50 µs),
-**≥50k req/s on 8 cores MET ×5.7**. No gap analysis needed: first measurement
-hit all targets, so NO bit-risky bounded optimizations were attempted at all
-(deliberate decision recorded in docs/DECISIONS.md — nothing here needs an
-extra bit-exactness test beyond the existing suite). `target-cpu=native` was
-measured and is WORSE (−4%); shipped build stays portable.
+§8 targets: **p50 < 50 µs MET** (≤10 µs), **p99 < 250 µs MET** (≤50 µs),
+**≥50k req/s on 8 cores MET ×5.7**. Client-side throughput did NOT move
+(expected): §7.4 profiling showed the sustained path is kernel-I/O-bound
+(one `writev` per response dominates); the allocation removal shows up where
+it belongs — server-side mean latency down 12.5→10.0 µs and the p50 bucket
+tightening ≤20→≤10 µs. No gap analysis needed: first measurement hit all
+targets, so NO bit-risky bounded optimizations were attempted at all
+(deliberate decision recorded in docs/DECISIONS.md). Phase 5 changed only
+WHERE values are read from, never arithmetic; equivalence is pinned by
+`alloc_free_kernels.rs` + `alloc_free_select.rs` + the probes.tsv value
+assertions inside `hotpath_full_alloc.rs`. `target-cpu=native` was measured
+and is WORSE (−4%); shipped build stays portable.
 
 ### 7.3 Ingest → queryable (`scripts/ingestbench.sh`)
 

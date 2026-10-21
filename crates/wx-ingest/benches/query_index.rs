@@ -1,5 +1,5 @@
 // Milestone-5 criterion bench: the FULL point query through the arc-swap
-// index accessor (PointQueryContext.build + evaluate_point) against warm
+// index accessor (build_context + evaluate_point) against warm
 // mmapped perf-sized fields with vertical (level 775 between 850/700) AND
 // time (fh 3 between 0/6) interpolation active — spec §8 "full query
 // function". Run: cargo bench -p wx-ingest.
@@ -8,7 +8,7 @@ use wx_core::grid::{GridDef, GridRegular};
 use wx_core::storage::{BinHeader, MmapField, open_field, write_bin_atomic};
 use wx_core::interp::{TimeInterpMode, PointError};
 use wx_ingest::index::{IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField,
-                       IdxFh, PointQueryContext, evaluate_point};
+                       IdxFh, build_context, evaluate_point};
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 
@@ -128,16 +128,6 @@ pub fn bench_query(c: &mut Criterion) {
         }].to_vec(),
     };
 
-    let seed = PointQueryContext {
-        grid: grid.clone(),
-        units: "".to_string(),
-        run_epoch_secs: 0i64,
-        stat_processed: false,
-        want_level: 0.0,
-        want_fh_secs: 0.0,
-        fh_secs: (0.0, 0.0),
-        slots: [None, None],
-    };
 
     // exact-node lat/lon probes (dyadic -> no projection noise)
     let mut lats: Vec<f64> = Vec::new();
@@ -154,7 +144,7 @@ pub fn bench_query(c: &mut Criterion) {
     gq.bench_function("gfs point (vertical+time, warm mmap)", |b| {
         let mut k = 0usize;
         b.iter(|| {
-            let ctx_r = seed.build(&snap, "gfs", None, "TMP", 100u8,
+            let ctx_r = build_context(&snap, "gfs", None, "TMP", 100u8,
                                    775.0, 10800.0, TimeInterpMode::Linear);
             match ctx_r {
                 Err(_) => {

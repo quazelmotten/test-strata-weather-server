@@ -5,7 +5,7 @@
 // trips the PDT 4.8 stat guard across a restart.
 
 use wx_ingest::pipeline::Pipeline;
-use wx_ingest::index::{PointQueryContext, evaluate_point};
+use wx_ingest::index::{build_context, evaluate_point};
 use wx_core::interp::{TimeInterpMode, HorizMethod};
 use wx_core::tables::{lookup_level_type};
 use wx_core::grid::{GridDef};
@@ -167,20 +167,10 @@ fn restart_no_reingest_and_content_change_redelivers() {
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 6);
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso) => {
-                    let c_r = seed.build(sref, "gfs", None, "TMP", iso,
+                    let c_r = build_context(sref, "gfs", None, "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_) => { assert!(false); return; }
@@ -259,20 +249,10 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 }
                 GridDef::Regular(_) => { assert!(false); }
             }
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             match lookup_level_type("height_above_ground") {
                 None => { assert!(false); return; }
                 Some(hgt) => {
-                    let c_r = seed.build(sref, "hrrr", None, "TMP", hgt,
+                    let c_r = build_context(sref, "hrrr", None, "TMP", hgt,
                                          2.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_) => { assert!(false); return; }
@@ -314,21 +294,11 @@ fn restart_no_reingest_and_content_change_redelivers() {
     let gm2 = s2.find_model("gfs");
     match gm2 {
         None => { assert!(false); return; }
-        Some(m) => {
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
+        Some(_m) => {
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso) => {
-                    let c_r = seed.build(s2, "gfs", None, "TMP", iso,
+                    let c_r = build_context(s2, "gfs", None, "TMP", iso,
                                          850.0, 21600.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_) => { assert!(false); return; }

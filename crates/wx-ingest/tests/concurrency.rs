@@ -5,7 +5,7 @@
 
 use wx_ingest::pipeline::Pipeline;
 use wx_ingest::pipeline::{build_snapshot};
-use wx_ingest::index::{SharedIndex, PointQueryContext, evaluate_point};
+use wx_ingest::index::{SharedIndex, build_context, evaluate_point};
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
 use wx_ingest::state::{join_path};
@@ -141,21 +141,11 @@ fn concurrent_publishers_and_readers_never_tear() {
                             }
                         }
                     }
-                    Some(mm) => {
+                    Some(_mm) => {
                         match lookup_level_type("isobaric") {
                             None => {}
                             Some(iso) => {
-                                let seed = PointQueryContext {
-                                    grid: mm.runs[0].grid.clone(),
-                                    units: "".to_string(),
-                                    run_epoch_secs: 0,
-                                    stat_processed: false,
-                                    want_level: 0.0,
-                                    want_fh_secs: 0.0,
-                                    fh_secs: (0.0, 0.0),
-                                    slots: [None, None],
-                                };
-                                let c_r = seed.build(sref, "gfs", None, "TMP", iso,
+                                let c_r = build_context(sref, "gfs", None, "TMP", iso,
                                                       925.0, 10800.0, TimeInterpMode::Linear);
                                 match c_r {
                                     Err(_) => {

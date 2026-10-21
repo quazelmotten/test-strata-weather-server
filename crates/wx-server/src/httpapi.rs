@@ -18,7 +18,7 @@ use wx_ingest::pipeline::{level_dir_name};
 use wx_core::tables::{fmt_num};
 use wx_core::grid::{GridDef};
 use crate::stats::{mono_ns, QueryStats};
-use crate::queryapi::{parse_query, answer_param, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, QueryEntry, FailTok};
+use crate::queryapi::{parse_query, lookup_entries, new_entries, entries_at, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
 use crate::timeparse::{format_iso_z};
 
 // ---------------------------------------------------------------------------
@@ -91,23 +91,24 @@ pub async fn point_handler(st: State<ServerState>, req: Request) -> Response {
     }
 }
 
-/// Per-parameter selection over the shared point/level/time. Decision (spec
-/// ambiguous for multi-param errors): the FIRST failing parameter decides the
-/// error status; masked points are not errors. Returns (status, body).
+/// Per-parameter selection over the shared point/level/time. V1.1 phase 5:
+/// the ZERO-ALLOC lookup is queryapi.lookup_entries (parse already done;
+/// entries structured into a fixed-inline buffer); only the body render after
+/// it allocates. Decision (spec ambiguous for multi-param errors): the FIRST
+/// failing parameter decides the error status; masked points are not errors.
+/// Returns (status, body).
 pub fn answer_all(snap: Arc<IndexSnapshot>, pa: &ParsedArgs) -> (u16, String) {
-    let mut entries: Vec<QueryEntry> = Vec::<QueryEntry>::new();
     let sref = &*snap;
-    for key in &pa.params {
-        let one = answer_param(sref, &pa.model, pa.pin_epoch, key, pa.level_code, pa.level_val, pa.valid_epoch, pa.mode, pa.lat, pa.lon);
-        match one {
-            Err(ft) => {
-                return (fail_http_status(ft), render_error_json(fail_token(ft), error_message(ft, &pa.model, key)));
-            }
-            Ok(entry) => { entries.push(entry); }
+    let mut eb = new_entries();
+    let lr = lookup_entries(sref, &pa, &mut eb);
+    match lr {
+        Err(fi) => {
+            return (fail_http_status(fi.tok), render_error_json(fail_token(fi.tok), error_message(fi.tok, pa.model, fi.param)));
         }
+        Ok(_) => {}
     }
-    let run_ep = entries[0].run_epoch;
-    return (200, render_point_json(&pa.model, run_ep, pa.valid_epoch, pa.lat, pa.lon, pa.level_code, pa.level_val, &entries));
+    let run_ep = entries_at(&eb, 0).run_epoch;
+    return (200, render_point_json(pa.model, run_ep, pa.valid_epoch, pa.lat, pa.lon, pa.level_code, pa.level_val, &eb));
 }
 
 fn error_message(ft: FailTok, model: &str, key: &str) -> String {

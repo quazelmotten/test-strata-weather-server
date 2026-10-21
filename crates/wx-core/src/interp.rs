@@ -50,7 +50,7 @@ pub enum TimeInterpMode {
 /// Bracketing levels reported in the response (`"vertical": {"method":
 /// "linear", "levels": [850, 800]}`); `None` when the exact stored level was
 /// used. Levels are reported in stored order.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VertMeta {
     pub method: LevelInterpMethod,
     pub levels: (f64, f64),
@@ -59,14 +59,14 @@ pub struct VertMeta {
 /// Bracketing forecast hours reported in the response
 /// (`"time": {"method": "linear", "forecast_hours": [6, 9]}`); `None` when
 /// the exact forecast hour was used.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TimeMeta {
     pub method: TimeInterpMode,
     pub forecast_hours: (f64, f64),
 }
 
 /// What the interpolation did, exactly shaped for the API response.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InterpInfo {
     pub horizontal: HorizMethod,
     pub vertical: Option<VertMeta>,
@@ -86,7 +86,7 @@ pub enum PointError {
 }
 
 /// A successful point value plus its interpolation metadata.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointValue {
     pub value: f64,
     pub info: InterpInfo,
@@ -213,6 +213,34 @@ pub fn resolve_levels(levels: &[f64], want: f64) -> Option<(usize, usize)> {
     for k in 1..levels.len() {
         let a = levels[k - 1];
         let b = levels[k];
+        if a != b && (a - want) * (b - want) <= 0.0 {
+            return Some((k - 1, k));
+        }
+    }
+    None
+}
+
+/// Slice-typed twin of [`resolve_levels`] for levels stored as f32 in a .bin
+/// header (V1.1 phase 5: the query path resolves directly against the mmapped
+/// header without materializing an f64 Vec, so the hot path allocates nothing;
+/// each element is widened exactly once, which makes the result bit-identical
+/// to `resolve_levels(vec_of_f64)` — proven by tests/alloc_free_kernels.rs).
+pub fn resolve_levels_f32(levels: &[f32], want: f64) -> Option<(usize, usize)> {
+    if levels.is_empty() {
+        return None;
+    }
+    for k in 0..levels.len() {
+        let lv = levels[k] as f64;
+        if (lv - want).abs() <= LEVEL_MATCH_EPS {
+            return Some((k, k));
+        }
+    }
+    if levels.len() == 1 {
+        return None; // single stored level: must match exactly
+    }
+    for k in 1..levels.len() {
+        let a = levels[k - 1] as f64;
+        let b = levels[k] as f64;
         if a != b && (a - want) * (b - want) <= 0.0 {
             return Some((k - 1, k));
         }

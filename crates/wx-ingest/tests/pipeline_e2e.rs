@@ -10,7 +10,7 @@ use wx_ingest::pipeline::{level_dir_name};
 use wx_ingest::store::{decode_grid};
 use wx_ingest::state::{join_path};
 use wx_ingest::discovery::{path_to_str};
-use wx_ingest::index::{PointQueryContext, evaluate_point, SelectError};
+use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode, PointError, HorizMethod};
 use wx_core::tables::{lookup_level_type};
 use memmap2::Mmap;
@@ -238,21 +238,11 @@ fn e2e_roundtrip_through_index() {
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 6);
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             match lookup_level_type("isobaric") {
                 None => { assert!(false); return; }
                 Some(iso_code) => {
                     // exact node: TMP @1000 f000 at (lat 10, lon 350) = 250.
-                    let c_r = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_r = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
                         Err(_se) => { assert!(false); }
@@ -268,7 +258,7 @@ fn e2e_roundtrip_through_index() {
                         }
                     }
                     // off-node bilinear: mid of (0,0)..(1,1) -> mean 252.5.
-                    let c_b = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_b = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_b {
                         Err(_) => { assert!(false); }
@@ -281,7 +271,7 @@ fn e2e_roundtrip_through_index() {
                         }
                     }
                     // vertical: 925 between 1000 and 850 at node j=2,i=3.
-                    let c_v = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_v = build_context(sref, "gfs", None, "TMP", iso_code,
                                          925.0, 0.0, TimeInterpMode::Linear);
                     match c_v {
                         Err(_) => { assert!(false); }
@@ -302,7 +292,7 @@ fn e2e_roundtrip_through_index() {
                         }
                     }
                     // time: fh 3 between 0 and 6 at same node -> 291.
-                    let c_t = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_t = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 10800.0, TimeInterpMode::Linear);
                     match c_t {
                         Err(_) => { assert!(false); }
@@ -323,7 +313,7 @@ fn e2e_roundtrip_through_index() {
                         }
                     }
                     // time_interp=none: fh 3 must be rejected outright.
-                    let c_n = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_n = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 10800.0, TimeInterpMode::None);
                     match c_n {
                         Err(ne) => {
@@ -335,7 +325,7 @@ fn e2e_roundtrip_through_index() {
                         Ok(_) => { assert!(false); }
                     }
                     // masked node: TMP @850 f006 k=0 is NaN -> MissingData.
-                    let c_m = seed.build(sref, "gfs", None, "TMP", iso_code,
+                    let c_m = build_context(sref, "gfs", None, "TMP", iso_code,
                                          850.0, 21600.0, TimeInterpMode::Linear);
                     match c_m {
                         Err(_) => { assert!(false); }
@@ -364,20 +354,10 @@ fn e2e_roundtrip_through_index() {
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 3);
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             match lookup_level_type("height_above_ground") {
                 None => { assert!(false); }
                 Some(hag_code) => {
-                    let c5 = seed.build(sref, "hrrr", None, "TMP", hag_code,
+                    let c5 = build_context(sref, "hrrr", None, "TMP", hag_code,
                                         2.0, 0.0, TimeInterpMode::Linear);
                     match c5 {
                         Err(_) => { assert!(false); }
@@ -392,9 +372,9 @@ fn e2e_roundtrip_through_index() {
                     // grid winds were U=5260 V=9260 at this node (fh 0); the
                     // stored earth pair must preserve magnitude exactly (f32
                     // rotation rounding aside).
-                    let cu = seed.build(sref, "hrrr", None, "UGRD", hag_code,
+                    let cu = build_context(sref, "hrrr", None, "UGRD", hag_code,
                                         10.0, 0.0, TimeInterpMode::Linear);
-                    let cv = seed.build(sref, "hrrr", None, "VGRD", hag_code,
+                    let cv = build_context(sref, "hrrr", None, "VGRD", hag_code,
                                         10.0, 0.0, TimeInterpMode::Linear);
                     match cu {
                         Err(_) => { assert!(false); }
@@ -445,18 +425,8 @@ fn e2e_roundtrip_through_index() {
                 }
             }
             assert!(found);
-            let seed = PointQueryContext {
-                grid: m.runs[0].grid.clone(),
-                units: "".to_string(),
-                run_epoch_secs: 0,
-                stat_processed: false,
-                want_level: 0.0,
-                want_fh_secs: 0.0,
-                fh_secs: (0.0, 0.0),
-                slots: [None, None],
-            };
             // APCP accumulation: fh 3 between 0 and 6 must be REJECTED (§9.8).
-            let cg = seed.build(sref, "stat", None, "APCP", 1,
+            let cg = build_context(sref, "stat", None, "APCP", 1,
                                 0.0, 10800.0, TimeInterpMode::Linear);
             match cg {
                 Ok(_) => { assert!(false); }
@@ -469,7 +439,7 @@ fn e2e_roundtrip_through_index() {
                 }
             }
             // APCP exact fh 0 answers with the analytic value 10 at (240,20).
-            let ce = seed.build(sref, "stat", None, "APCP", 1,
+            let ce = build_context(sref, "stat", None, "APCP", 1,
                                 0.0, 0.0, TimeInterpMode::Linear);
             match ce {
                 Err(_) => { assert!(false); }
