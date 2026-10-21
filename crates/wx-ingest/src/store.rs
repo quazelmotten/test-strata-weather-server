@@ -22,7 +22,9 @@
 //! source of truth for both the projection and the wind-rotation angle.
 
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
-use wx_core::storage::{write_bin_atomic, open_field, BinHeader, fsync_path};
+use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, fsync_path,
+                       PlaneSource, count_rename, count_bytes_written, le_u32, bits_to_f32,
+                       unique_tmp_path};
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
@@ -204,68 +206,113 @@ fn level_better(code: u8, a: f64, b: f64) -> bool {
     return a < b;
 }
 
-pub fn merge_field(path: String, code: u8, new: Vec<(f64, Vec<f32>)>)
+/// Canonical LEVEL KEY. The on-disk coordinate is an f32 (`BinHeader.levels`),
+/// so two requests whose f64 values round to the SAME f32 ARE THE SAME LEVEL
+/// and must REPLACE each other. The old code compared the f64 EXACTLY, so a
+/// level that is not exactly representable in f32 (e.g. 837.55 hPa, stored as
+/// 837.5498...) failed to match its own stored value on re-ingest and got APPENDED
+/// as a DUPLICATE plane. Rounding both sides to f32 is exact, cheap, and matches
+/// what the format can actually DISTINGUISH.
+fn level_key_eq(a: f64, b: f64) -> bool {
+    return (a as f32) == (b as f32);
+}
+
+/// Decode one mmap plane (raw little-endian f32 bytes from
+/// `MmapField.plane_bytes`) into owned f32 values. Bulk slice walk: replaces the
+/// old per-element `mf.value(li, j, i)` triple-indexed reads (audit fix).
+fn plane_from_bytes(b: &[u8]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::<f32>::new();
+    let n = b.len() / 4;
+    for k in 0 .. n {
+        out.push(bits_to_f32(le_u32(b, k * 4)));
+    }
+    return out;
+}
+
+/// Merge one field file: existing planes (read back through `plane_bytes` slices
+/// from its current .bin, if any) plus `new` (level value -> plane), NEW VALUES
+/// WINNING on collision. Returns the merged `(level, plane)` pairs in CANONICAL
+/// ORDER, ready to write ONCE. Cost: O(L+K) passes over L existing + K new
+/// planes and ZERO plane CLONES (planes are MOVED into the result). Duplicate
+/// keys inside `new` resolve to the FIRST entry in the caller's order (same rule
+/// as V1.1).
+pub fn merge_field(path: String, code: u8, mut new: Vec<(f64, Vec<f32>)>)
     -> Result<Vec<(f64, Vec<f32>)>, String> {
-    let mut levels: Vec<f64> = Vec::<f64>::new();
-    let mut planes: Vec<Vec<f32 >> = Vec::<Vec<f32>>::new();
-    // seed from existing file when present
+    let mut pairs: Vec<(f64, Vec<f32>)> = Vec::<(f64, Vec<f32>)>::new();
+    // seed from the existing file when present (slice readback, no scalar loop)
     match open_field(path) {
         Err(_) => {}
         Ok(mf) => {
             for li in 0 .. mf.header.levels.len() {
-                let lv = mf.header.levels[li] as f64;
-                levels.push(lv);
-                let mut pl: Vec<f32> = Vec::<f32>::new();
-                for j in 0 .. mf.header.ny as usize {
-                    for i in 0 .. mf.header.nx as usize {
-                        pl.push(mf.value(li, j, i));
+                pairs.push((mf.header.levels[li] as f64,
+                            plane_from_bytes(&mf.plane_bytes(li))));
+            }
+        }
+    }
+    // Move the new planes in. `pop()` walks `new` BACKWARDS, which keeps the
+    // "first entry wins" rule for duplicates inside one batch (the earlier entry
+    // is applied LAST, so it overwrites the later one).
+    while !new.is_empty() {
+        let item = new.pop();
+        match item {
+            None => { break; }
+            Some(pair) => {
+                let v = pair.0;
+                let mut hit: Option<usize> = None;
+                for k in 0 .. pairs.len() {
+                    if level_key_eq(pairs[k].0, v) {
+                        hit = Some(k);
+                        break;
                     }
                 }
-                planes.push(pl);
+                match hit {
+                    Some(k) => { pairs[k].1 = pair.1; }
+                    None => { pairs.push((v, pair.1)); }
+                }
             }
         }
     }
-    for ni in 0 .. new.len() {
-        let v = new[ni].0;
-        let mut found = false;
-        for k in 0 .. levels.len() {
-            if levels[k] == v {
-                planes[k] = new[ni].1.clone();
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            levels.push(v);
-            planes.push(new[ni].1.clone());
-        }
-    }
-    // canonical order (stable permutation of levels+planes together)
-    let mut idx: Vec<usize> = Vec::<usize>::new();
-    for k in 0 .. levels.len() {
-        idx.push(k);
-    }
-    for i in 0 .. idx.len() {
+    // canonical order: selection sort IN PLACE over the pairs (swap MOVES the
+    // plane vectors instead of copying them), same predicate as before.
+    let n = pairs.len();
+    for i in 0 .. n {
         let mut best = i;
-        for j in i + 1 .. idx.len() {
-            let aj = levels[idx[j]];
-            let ab = levels[idx[best]];
-            if level_better(code, aj, ab) {
+        for j in i + 1 .. n {
+            if level_better(code, pairs[j].0, pairs[best].0) {
                 best = j;
             }
         }
-        let t = idx[i];
-        idx[i] = idx[best];
-        idx[best] = t;
+        if best != i {
+            pairs.swap(i, best);
+        }
     }
-    let mut out: Vec<(f64, Vec<f32>)> = Vec::<(f64, Vec<f32>)>::new();
-    for k in 0 .. idx.len() {
-        out.push((levels[idx[k]], planes[idx[k]].clone()));
-    }
-    return Ok(out);
+    return Ok(pairs);
 }
 
-/// Serialize merged planes and write atomically through wx-core's writer.
+/// Plane source over a merged `(level, plane)` vector: yields the planes BORROWED
+/// from the caller's vector in canonical order, so the streaming writer never
+/// copies them and never sees the level coordinates.
+struct MergedPlanes<'a> {
+    pub items: &'a Vec<(f64, Vec<f32>)>,
+    pub idx: usize
+}
+
+impl<'a> PlaneSource for MergedPlanes<'a> {
+    fn next_plane(self: &mut Self) -> Option<&[f32]> {
+        if self.idx >= self.items.len() {
+            return None;
+        }
+        let r = &self.items[self.idx].1[..];
+        self.idx += 1;
+        return Some(r);
+    }
+}
+
+/// Serialize merged planes and write atomically through wx-core's STREAMING
+/// writer (header + planes through a 256 KiB chunk buffer, NO whole-file byte
+/// vector). The parent-directory fsync stays HERE for now: the primitive dropped
+/// it (Phase B batches those with `TouchedDirs`), and the crash rule is unchanged
+/// because the FILE fsync still happens before the rename.
 pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
                    winds_grid: bool, merged: Vec<(f64, Vec<f32>)>) -> Result<(), String> {
     let mut hdr = BinHeader {
@@ -275,54 +322,103 @@ pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
         scan_ns: scan_ns,
         winds_grid: winds_grid,
     };
-    let mut refs: Vec<&[f32]> = Vec::<&[f32]>::new();
     for m in &merged {
         hdr.levels.push(m.0 as f32);
     }
-    for m in &merged {
-        refs.push(&m.1);
-    }
-    let w = write_bin_atomic(path, &hdr, &refs);
+    let dir = parent_dir_pub(&path);
+    let w = write_bin_atomic_stream(path, &hdr, merged.len(),
+                                    MergedPlanes { items: &merged, idx: 0 });
     match w {
         Err(e) => { return Err(e.to_string()); }
-        Ok(_) => { return Ok(()); }
-    }
-}
-
-/// Public alias of the atomic byte writer used for grid.bin/manifest.json:
-/// temp file in the SAME directory, write, flush, REAL fsync of the temp inode
-/// (libc via `wx_core::storage::fsync_path`; this std has no fsync API), atomic
-/// rename, then REAL fsync of the parent directory so the rename survives a
-/// crash. Durability failures are reported, not swallowed.
-pub fn write_bytes_atomic_pub(path: &str, bytes: &[u8]) -> Result<(), String> {
-    let tmp = format!("{0}.tmp", path);
-    let f = std::fs::File::create(&tmp);
-    match f {
-        Err(_) => { return Err("create failed".to_string()); }
-        Ok(mut h) => {
-            let w = h.write_all(bytes);
-            if w.is_err() {
-                return Err("write_all failed".to_string());
-            }
-            let fl = h.flush();
-            if fl.is_err() {
-                return Err("flush failed".to_string());
-            }
-        }
-    }
-    match fsync_path(&tmp) {
-        Err(e) => { return Err(format!("file fsync: {0}", e)); }
         Ok(_) => {}
     }
-    let r = std::fs::rename(&tmp, &path);
-    if r.is_err() {
-        return Err("rename failed".to_string());
-    }
-    match fsync_path(&parent_dir_pub(&path)) {
+    match fsync_path(&dir) {
         Err(e) => { return Err(format!("dir fsync: {0}", e)); }
         Ok(_) => {}
     }
     return Ok(());
+}
+
+/// BATCH PATH: merge a GROUP of K levels into ONE field file and write it ONCE
+/// (ONE temp file, ONE rename, O(L+K) passes over planes). Returns the resulting
+/// LEVEL COUNT. `store_plane` still drives the single-level path until the Phase
+/// B pipeline restructure groups messages per (param, level type, forecast hour).
+pub fn merge_write_field(path: String, code: u8, nx: u32, ny: u32, scan_ns: bool,
+                         winds_grid: bool, new: Vec<(f64, Vec<f32>)>) -> Result<usize, String> {
+    let mut count: usize = 0;
+    let mut err = "".to_string();
+    match merge_field(path.to_string(), code, new) {
+        Err(e) => { err = e; }
+        Ok(pairs) => {
+            count = pairs.len();
+            match write_field(path, code, nx, ny, scan_ns, winds_grid, pairs) {
+                Err(e) => { err = e; }
+                Ok(_) => {}
+            }
+        }
+    }
+    if err.len() > 0 {
+        return Err(err);
+    }
+    return Ok(count);
+}
+
+/// Public alias of the atomic byte writer used for grid.bin/manifest.json:
+/// UNIQUE temp file (`<path>.tmp.<pid>.<seq>`, shared naming with the .bin writer)
+/// in the SAME directory, write, flush, REAL fsync of the temp inode (libc via
+/// `wx_core::storage::fsync_path`; this std has no fsync API), atomic rename, then
+/// REAL fsync of the parent directory so the rename survives a crash. ANY failure
+/// path unlinks the temp file. These writers keep their OWN directory fsync: they
+/// publish SINGLE small files, not the multi-megabyte field planes the batching
+/// work targets. Durability failures are reported, not swallowed. All actions
+/// feed the wx-core counters (`count_rename` / `count_bytes_written` /
+/// `fsync_path`).
+pub fn write_bytes_atomic_pub(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let tmp = unique_tmp_path(path);
+    let mut err = "".to_string();
+    let f = std::fs::File::create(&tmp);
+    match f {
+        Err(_) => { err = format!("create failed: {0}", tmp); }
+        Ok(mut h) => {
+            let w = h.write_all(bytes);
+            if w.is_err() {
+                err = "write_all failed".to_string();
+            } else {
+                let fl = h.flush();
+                if fl.is_err() {
+                    err = "flush failed".to_string();
+                }
+            }
+            if err.len() == 0 {
+                match fsync_path(&tmp) {
+                    Err(e) => { err = format!("file fsync: {0}", e); }
+                    Ok(_) => {}
+                }
+            }
+            if err.len() == 0 {
+                count_bytes_written(bytes.len() as u64);
+            }
+        }
+    }
+    if err.len() == 0 {
+        let r = std::fs::rename(&tmp, &path);
+        if r.is_ok() {
+            count_rename();
+            match fsync_path(&parent_dir_pub(&path)) {
+                Err(e) => { err = format!("dir fsync: {0}", e); }
+                Ok(_) => {}
+            }
+            if err.len() == 0 {
+                return Ok(());
+            }
+        } else {
+            err = "rename failed".to_string();
+        }
+    }
+    // unlink-on-any-failure (the tmp is already gone after a successful rename;
+    // removing a missing path is ignored)
+    let _rm = std::fs::remove_file(&tmp);
+    return Err(err);
 }
 
 /// Parent-directory portion of a path (split at the last '/').

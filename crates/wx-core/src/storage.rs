@@ -10,6 +10,28 @@
 //! `close` directly through `extern "C"`. That is the only way to get a genuine
 //! fsync here; the same helper backs the state file and manifest writers.
 //!
+//! ## V1.2 phase A: streaming writer + batched directory fsync
+//!
+//! [`write_bin_atomic_stream`] serializes header + planes THROUGH a fixed
+//! [`WRITE_CHUNK_BYTES`] buffer straight into the temp file, so peak writer
+//! memory is ONE chunk instead of the whole file (a GFS field file used to be
+//! materialized a second time as a `Vec<u8>` before `write_all`). Planes arrive
+//! as BORROWED slices through [`PlaneSource`], which lets a merge of L existing
+//! levels plus K new ones cost O(L+K) passes and produce ONE rename instead of
+//! K. Output bytes are BIT-IDENTICAL to the pre-change writer (pinned by
+//! `tests/fixtures/writer_golden_v1.bin`).
+//!
+//! The field-bin writer no longer fsyncs the parent DIRECTORY (that was one
+//! `fsync(2)` per rename). Callers record the directories they touched in a
+//! [`TouchedDirs`] and `flush()` them ONCE — same crash rule (temp -> fsync file
+//! -> rename, spec Sec 4.5), fewer syscalls. `write_bytes_atomic_pub` in wx-ingest
+//! still fsyncs its own directory: it writes SINGLE small files (grid.bin,
+//! manifest.json), where the extra fsync is not on the amplification path.
+//!
+//! Every durability-relevant action bumps a module counter
+//! ([`counters_snapshot`]: renames, bytes written, fsyncs). Relaxed atomics:
+//! cheap, and OUTSIDE the query hot path.
+//!
 //! ## Header layout (fixed 24 bytes + 4 bytes per level, all little-endian)
 //!
 //! ```text
@@ -45,6 +67,8 @@
 
 use memmap2::Mmap;
 use std::io::Write;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// Magic bytes of every .bin file ("WXPTBIN1").
 pub const BIN_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x42, 0x49, 0x4E, 0x31];
@@ -190,6 +214,59 @@ extern "C" {
     fn libc_close(fd: i32) -> i32;
 }
 
+// ---------------------------------------------------------------------------
+// instrumentation counters (regression gates now, /metrics later)
+// ---------------------------------------------------------------------------
+
+// Module-level relaxed atomics. They count DURABILITY ACTIONS performed by THIS
+// library: successful atomic renames, bytes handed to the writer, and fsync
+// syscalls attempted through [`fsync_path`] (file AND directory). wx-ingest's
+// `write_bytes_atomic_pub` routes its rename/bytes/fsync accounting through the
+// same accessors; `state.rs` keeps its own writer and is NOT counted (documented
+// limitation of phase A). Tests read DELTAS around their own operations; the
+// accessors below also serve /metrics later.
+static RENAMES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BYTES_WRITTEN_TOTAL: AtomicU64 = AtomicU64::new(0);
+static FSYNCS_TOTAL: AtomicU64 = AtomicU64::new(0);
+// per-process sequence appended to temp names for thread-safe uniqueness.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+pub struct StorageCounters {
+    pub renames: u64,
+    pub bytes_written: u64,
+    pub fsyncs: u64
+}
+
+/// Read the three counters as a consistent-enough snapshot (relaxed reads: fine
+/// for metrics and for test deltas taken around single-threaded operations).
+pub fn counters_snapshot() -> StorageCounters {
+    return StorageCounters {
+        renames: RENAMES_TOTAL.load(Ordering::Relaxed),
+        bytes_written: BYTES_WRITTEN_TOTAL.load(Ordering::Relaxed),
+        fsyncs: FSYNCS_TOTAL.load(Ordering::Relaxed),
+    };
+}
+
+/// Zero the counters (test helper; production code never calls it).
+pub fn counters_reset() {
+    RENAMES_TOTAL.store(0, Ordering::Relaxed);
+    BYTES_WRITTEN_TOTAL.store(0, Ordering::Relaxed);
+    FSYNCS_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Count an atomic rename performed OUTSIDE this module (wx-ingest's byte
+/// writer for grid.bin / manifest.json), so the metrics and the regression
+/// gates stay honest about total write traffic.
+pub fn count_rename() {
+    let _r = RENAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count bytes handed to a writer outside this module.
+pub fn count_bytes_written(n: u64) {
+    let _b = BYTES_WRITTEN_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+
 /// fsync the inode behind `path` (a regular file OR a directory). O_RDONLY is
 /// enough for fsync. Returns Some(message) on failure (missing path, EACCES,
 /// filesystems that reject directory fsync) so callers can decide whether the
@@ -210,6 +287,9 @@ pub fn fsync_path(path: &str) -> Result<(), String> {
     if fd < 0 {
         return Err("open-for-fsync failed".to_string());
     }
+    // Count the fsync we are about to attempt (the open already happened; a
+    // failed open costs no fsync syscall).
+    let _fc = FSYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
     let r = unsafe { libc_fsync(fd) };
     let c = unsafe { libc_close(fd) };
     if r != 0 {
@@ -221,62 +301,244 @@ pub fn fsync_path(path: &str) -> Result<(), String> {
     return Ok(());
 }
 
-/// Write one .bin file atomically: serialize header + planes into `planes`
-/// (each plane is nx*ny f32 in storage order, planes ordered like
-/// `hdr.levels`), write to `<path>.tmp<pid>` in the SAME directory, fsync the
-/// file, rename over the target, then fsync the directory. A reader either
-/// sees the old file or the complete new one. Errors are reported as message
-/// strings (OS error text).
-pub fn write_bin_atomic(path: String, hdr: &BinHeader, planes: &[&[f32]]) -> Result<(), String> {
-    if planes.len() != hdr.levels.len() {
+// ---------------------------------------------------------------------------
+// streaming atomic writer (V1.2 phase A): header + planes go THROUGH a fixed
+// chunk buffer straight into the temp file; NO whole-file Vec<u8> is ever built.
+// ---------------------------------------------------------------------------
+
+/// Bytes buffered per `write_all` by the streaming writer. 256 KiB keeps the
+/// writer's peak memory FLAT regardless of grid size (one GFS plane alone is
+/// 4.1 MB) while staying far above the per-syscall break-even point.
+pub const WRITE_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Borrowed source of the planes for [`write_bin_atomic_stream`]: yields the
+/// planes in canonical level order (parallel to `hdr.levels`), each exactly
+/// `nx*ny` f32 values, WITHOUT copying anything. This is what lets a merge of L
+/// existing levels plus K new ones stream out in O(L+K) passes; wx-ingest
+/// implements it over its merged `(level, plane)` vector, and
+/// [`write_bin_atomic`] uses the built-in adapter over borrowed slices.
+pub trait PlaneSource {
+    /// Next plane, or None when exhausted. The writer stops after `count`
+    /// planes and REJECTS a source that yields more or fewer.
+    fn next_plane(self: &mut Self) -> Option<&[f32]>;
+}
+
+struct RefPlanes<'a> {
+    pub planes: &'a [&'a [f32]],
+    pub idx: usize
+}
+
+impl<'a> PlaneSource for RefPlanes<'a> {
+    fn next_plane(self: &mut Self) -> Option<&[f32]> {
+        if self.idx >= self.planes.len() {
+            return None;
+        }
+        let r = self.planes[self.idx];
+        self.idx += 1;
+        return Some(r);
+    }
+}
+
+/// Unique temp name `<path>.tmp.<pid>.<seq>`: pid separates PROCESSES, the
+/// process-local sequence separates THREADS/retries, so concurrent writers of
+/// the same field can never collide on the temp path (the old plain `.tmp`
+/// could, and its doc even promised a pid it never appended). PUBLIC because
+/// wx-ingest's byte writer (grid.bin / manifest.json) shares the scheme.
+pub fn unique_tmp_path(path: &str) -> String {
+    let n = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    return format!("{0}.tmp.{1}.{2}", path, std::process::id(), n);
+}
+
+/// Write one .bin file atomically from a streaming plane source: header +
+/// planes written through a [`WRITE_CHUNK_BYTES`] buffer into
+/// `<path>.tmp.<pid>.<seq>` in the SAME directory, flush, REAL fsync of the
+/// temp inode, then rename over the target. A reader either sees the OLD file
+/// or the COMPLETE new one (spec Sec 4.5). Output bytes are BIT-IDENTICAL to
+/// the pre-change whole-buffer writer (golden fixture test).
+///
+/// ANY failure path unlinks the temp file, so no `.tmp` litter survives a
+/// failed write (create error, short/extra plane, write error, flush error,
+/// fsync error, rename error).
+///
+/// NO parent-directory fsync here any more: callers batch those with
+/// [`TouchedDirs`] (one fsync per touched directory instead of one per rename).
+pub fn write_bin_atomic_stream<S: PlaneSource>(path: String, hdr: &BinHeader,
+                                               count: usize, src: S) -> Result<(), String> {
+    if count != hdr.levels.len() {
         return Err("plane count != level count".to_string());
     }
     let per_plane = (hdr.nx as usize) * (hdr.ny as usize);
-    for li in 0..planes.len() {
-        if planes[li].len() != per_plane {
-            return Err("plane length != nx*ny".to_string());
-        }
-    }
-
-    let mut bytes: Vec<u8> = encode_header(hdr);
-    for li in 0..planes.len() {
-        for k in 0..per_plane {
-            push_le_f32(&mut bytes, planes[li][k]);
-        }
-    }
-
-    // unique-enough temp name in the same directory. One writer per .bin
-    // path at a time is assumed (the ingest pipeline guarantees this; two
-    // processes must never ingest the same field concurrently).
-    let tmp = format!("{path}.tmp");
+    let tmp = unique_tmp_path(&path);
+    // empty `err` means success; every failure branch sets it and the tail
+    // below does the unlink-on-failure + error return in ONE place.
+    let mut err: String = "".to_string();
+    let head = encode_header(hdr);
     let f = std::fs::File::create(&tmp);
     match f {
-        Err(_) => { return Err("create failed".to_string()); }
+        Err(_) => { err = format!("create failed: {0}", tmp); }
         Ok(mut h) => {
-            let w = h.write_all(&bytes);
-            if w.is_err() {
-                return Err("write_all failed".to_string());
+            let mut ok = true;
+            let mut written: u64 = 0;
+            let w1 = h.write_all(&head);
+            if w1.is_err() {
+                err = "write_all failed".to_string();
+                ok = false;
+            } else {
+                written += head.len() as u64;
             }
-            // flush the userspace buffer, then fsync the INODE itself before the
-            // rename makes the name visible (spec §4.5: temp + fsync + rename).
-            let fl = h.flush();
-            if fl.is_err() {
-                return Err("flush failed".to_string());
+            let mut buf: Vec<u8> = Vec::<u8>::new();
+            let mut q = src;
+            let mut nplanes: usize = 0;
+            while ok && nplanes < count {
+                let p = q.next_plane();
+                match p {
+                    None => {
+                        err = "source yielded fewer planes than declared".to_string();
+                        ok = false;
+                        break;
+                    }
+                    Some(plane) => {
+                        if plane.len() != per_plane {
+                            err = "plane length != nx*ny".to_string();
+                            ok = false;
+                            break;
+                        }
+                        for k in 0 .. per_plane {
+                            let bits = plane[k].to_bits();
+                            buf.push((bits & 0xFF) as u8);
+                            buf.push(((bits >> 8) & 0xFF) as u8);
+                            buf.push(((bits >> 16) & 0xFF) as u8);
+                            buf.push(((bits >> 24) & 0xFF) as u8);
+                            if buf.len() >= WRITE_CHUNK_BYTES {
+                                let wf = h.write_all(&buf);
+                                if wf.is_err() {
+                                    err = "write_all failed".to_string();
+                                    ok = false;
+                                    break;
+                                }
+                                written += buf.len() as u64;
+                                buf.clear();
+                            }
+                        }
+                        nplanes += 1;
+                    }
+                }
+            }
+            // a source that keeps going past `count` is a contract violation:
+            // refuse rather than append stray planes.
+            if ok {
+                let extra = q.next_plane();
+                if extra.is_some() {
+                    err = "source yielded more planes than declared".to_string();
+                    ok = false;
+                }
+            }
+            if ok && !buf.is_empty() {
+                let wf = h.write_all(&buf);
+                if wf.is_err() {
+                    err = "write_all failed".to_string();
+                } else {
+                    written += buf.len() as u64;
+                    buf.clear();
+                }
+            }
+            if err.is_empty() {
+                // flush the userspace buffer, then fsync the INODE itself BEFORE
+                // the rename makes the name visible (spec Sec 4.5).
+                let fl = h.flush();
+                if fl.is_err() {
+                    err = "flush failed".to_string();
+                }
+            }
+            if err.is_empty() {
+                if let Err(e) = fsync_path(&tmp) {
+                    err = format!("file fsync: {0}", e);
+                }
+            }
+            if err.is_empty() {
+                let _bw = BYTES_WRITTEN_TOTAL.fetch_add(written, Ordering::Relaxed);
             }
         }
     }
-    fsync_path(&tmp)?;
-    // resolve the directory before the rename consumes `path`
-    let dir = dir_of_path(&path);
-    let r = std::fs::rename(&tmp, &path);
-    if r.is_err() {
-        return Err("rename failed".to_string());
+    if err.is_empty() {
+        let r = std::fs::rename(&tmp, &path);
+        if r.is_ok() {
+            let _rn = RENAMES_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        err = "rename failed".to_string();
     }
-    // directory fsync: after a crash the renamed entry must be present, never
-    // a dangling/truncated name. Errors are surfaced (not swallowed) so ingest
-    // can report a durability problem instead of silently claiming durability.
-    fsync_path(&dir)?;
-    Ok(())
+    // unlink-on-any-failure (best effort: nothing to remove if create failed)
+    let _rm = std::fs::remove_file(&tmp);
+    return Err(err);
+}
+
+/// Thin wrapper over [`write_bin_atomic_stream`] keeping the historical
+/// signature (`planes: &[&[f32]]`) so existing callers compile UNCHANGED.
+/// NOTE behaviour change vs V1.1: no parent-directory fsync (callers batch it)
+/// and the temp name now carries pid + sequence.
+pub fn write_bin_atomic(path: String, hdr: &BinHeader, planes: &[&[f32]]) -> Result<(), String> {
+    return write_bin_atomic_stream(path, hdr, planes.len(), RefPlanes { planes: planes, idx: 0 });
+}
+
+// ---------------------------------------------------------------------------
+// directory fsync batching (V1.2 phase A)
+// ---------------------------------------------------------------------------
+
+/// Collects the DIRECTORIES touched by atomic writes so the caller fsyncs each
+/// ONE exactly once instead of once per rename. `note` records the parent
+/// directory of a written path (duplicates collapse); `flush` fsyncs every
+/// distinct directory ONCE, clears the list, and reports the FIRST error.
+/// Durability rule unchanged: file data is fsynced before its rename by the
+/// writer; the directory fsync only has to happen before the process crashes.
+pub struct TouchedDirs {
+    pub dirs: Vec<String>
+}
+
+impl TouchedDirs {
+    /// Record the parent directory of `file_path` (the file just written).
+    pub fn note(self: &mut Self, file_path: String) {
+        self.push_dir(dir_of_path(&file_path));
+    }
+
+    /// Record a directory directly (caller already knows it).
+    pub fn note_dir(self: &mut Self, dir: String) {
+        self.push_dir(dir);
+    }
+
+    /// How many DISTINCT directories are pending.
+    pub fn pending_count(self: &Self) -> usize {
+        return self.dirs.len();
+    }
+
+    /// fsync every pending directory ONCE (relaxed counter increments inside
+    /// [`fsync_path`]), then clear the list. Returns the first error if any
+    /// directory refused (e.g. a filesystem that rejects directory fsync).
+    pub fn flush(self: &mut Self) -> Result<(), String> {
+        let mut first: Option<String> = None;
+        for k in 0 .. self.dirs.len() {
+            let d = &self.dirs[k];
+            if let Err(e) = fsync_path(d) {
+                if first.is_none() {
+                    first = Some(format!("dir fsync {0}: {1}", d, e));
+                }
+            }
+        }
+        self.dirs.clear();
+        if let Some(e) = first {
+            return Err(e);
+        }
+        return Ok(());
+    }
+
+    fn push_dir(self: &mut Self, dir: String) {
+        for k in 0 .. self.dirs.len() {
+            if self.dirs[k] == dir {
+                return;
+            }
+        }
+        self.dirs.push(dir);
+    }
 }
 
 /// Parent-directory portion of a path (split at the last '/'), as a copy.

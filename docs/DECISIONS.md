@@ -1234,3 +1234,142 @@ Tag: `v1.1`.
 | 10 | Suggested workspace layout with async/HTTP-free `wx-core`, benches/, tests/, config.example.toml, README | `crates/wx-core` (memmap2 only; rayon/serde confined to tests/benches), `crates/wx-ingest`, `crates/wx-server`, `benches` inside each crate, `tests/`, `config.example.toml`, this README |
 | 11 | Each milestone leaves `cargo test` and `cargo clippy -- -D warnings` passing | every phase gate above records rc=0; phase 6 sweep re-confirms 95 tests green and clippy clean |
 | 12 | Deliverables: building workspace, example config, README covering setup/config/API/storage/interpolation/benchmarks/limitations, list of ambiguity decisions | this repo: builds on stable rustc 1.99.1; `config.example.toml` covers GFS + HRRR; README §§1–10; ambiguities in docs/DECISIONS.md (per phase) + README §10 |
+
+# V1.2 phase A decisions — storage WRITER PRIMITIVES
+
+Scope: ONLY `crates/wx-core/src/storage.rs` + `crates/wx-ingest/src/store.rs`
+(+ new tests and one golden fixture/script). The ingest PIPELINE FLOW
+(`scan_round` / `ingest_messages` / `store_plane`) is UNTOUCHED: grouping
+messages per (param, level type, forecast hour) is Phase B's job.
+
+## Streaming atomic writer (audit fix: whole-file `Vec<u8>` materialization)
+
+* New `write_bin_atomic_stream<S: PlaneSource>(path: String, hdr: &BinHeader, count: usize, src: S)`:
+  header + planes are serialized THROUGH a fixed `WRITE_CHUNK_BYTES` = 256 KiB
+  buffer straight into the temp file. Peak writer memory is ONE chunk instead of
+  the whole file (a single GFS plane is already 4.1 MB, and pre-change the file
+  existed THREE times: merged planes, `refs`, then the full byte buffer).
+* `PlaneSource` (`fn next_plane(self: &mut Self) -> Option<&[f32]>`) yields
+  BORROWED planes; wx-core has a private `RefPlanes` adapter over
+  `&[&[f32]]`, wx-ingest has `MergedPlanes` over its merged `(level, plane)`
+  vector. Planes are never copied by the writer.
+* `write_bin_atomic(path, hdr, planes: &[&[f32]])` KEPT as a THIN WRAPPER over
+  the streaming path, so every pre-existing caller (pipeline, restart, benches)
+  compiles UNCHANGED.
+* Source CONTRACT enforced: fewer than `count` planes → error; an EXTRA plane
+  after `count` → error (never appends stray planes); plane length != nx*ny →
+  error. All before the rename, so a bad source can never publish anything.
+
+## Golden-byte proof (output format unchanged, bit for bit)
+
+Expected bytes were captured FROM the V1.1 implementation BEFORE the change:
+`tests/fixtures/writer_golden_v1.bin` (456 B, sha256 `161f4fc1…`), reproduced
+independently by `scripts/gen_writer_golden.py` (Python `struct.pack` of the
+documented layout — identical bytes, idempotent across re-runs). The test ALSO
+embeds those bytes as hex and keeps a RETAINED REFERENCE IMPLEMENTATION of the
+OLD algorithm (serialize the WHOLE file, then `write_all`), so FOUR things are
+compared byte-for-byte: committed fixture, embedded hex, wrapper output,
+streaming output, reference-impl output. A second test uses a 700×600 grid
+(1.68 MB of planes ⇒ MANY internal flushes) to prove multi-chunk writes stay
+bit-identical.
+
+## Batch merge (audit fix: K writes + double clone)
+
+* `merge_field` keeps its public signature (only adds `mut` to the parameter,
+  source-compatible): existing levels are read back through
+  `MmapField.plane_bytes` SLICES via `plane_from_bytes` (no per-element
+  `mf.value(li, j, i)`), planes are MOVED into the result (ZERO clones), and
+  canonical order is applied by selection sort IN PLACE using `Vec::swap`.
+* New `merge_write_field(path, code, nx, ny, scan_ns, winds_grid, new) ->
+  Result<usize, String>` merges a GROUP ONCE and writes ONCE (returns the
+  resulting LEVEL COUNT): O(L+K) passes over L existing + K new planes, ONE
+  temp file, ONE rename. `store_plane` still drives the single-level path until
+  Phase B groups messages, so today's behavior is unchanged where K == 1.
+
+## Level dedup fix (audit bug: f64-exact comparison)
+
+Canonical LEVEL KEY = compare as f32: `(a as f64) as f32 == (b as f64) as f32`,
+because the on-disk coordinate IS an f32 (`BinHeader.levels`). Pre-change the
+code seeded from `mf.header.levels[li] as f64` and compared f64 EXACTLY, so a
+level that is NOT exactly representable in f32 (e.g. 837.55 hPa, stored as
+837.5498…) failed to match its own stored value and was APPENDED as a DUPLICATE
+plane on every re-ingest. Note on the task text: its example 837.5 IS exactly
+representable in f32, so the bug does not reproduce there; the test pins BOTH
+(837.55 reproduces the duplication class, 837.5 covers the named path).
+Ordering rule PRESERVED: isobaric DESCENDING, every other level type ASCENDING.
+Duplicate keys inside ONE batch resolve to the FIRST entry in caller order
+(same rule as V1.1; implemented with `pop()`-backwards + documented).
+
+## Temp-file hygiene + directory-fsync batching
+
+* `<path>.tmp.<pid>.<seq>` from PUBLIC `unique_tmp_path` (pid separates
+  PROCESSES, a process-local atomic sequence separates THREADS/retries); shared
+  by the .bin writer AND wx-ingest's byte writer. The old doc comment promised a
+  pid the code never appended — now literally true.
+* UNLINK ON ANY FAILURE: one tail in the writer removes the temp file for EVERY
+  failure class (create error, short/extra plane, write error, flush error,
+  fsync error, rename error). This dialect has NO user-defined destructor, so
+  cleanup is explicit and centralized rather than RAII.
+* `write_bin_atomic*` NO LONGER fsyncs the parent DIRECTORY (that was one
+  `fsync(2)` per rename). NEW `TouchedDirs` collector (`note` / `note_dir` /
+  `pending_count` / `flush`; duplicates collapse, list clears after flush) lets
+  callers fsync each DISTINCT directory ONCE. For now `write_field` and
+  `write_bytes_atomic_pub` still fsync their OWN directory, so crash durability
+  of field files / grid.bin / manifest.json is UNCHANGED today; Phase B will
+  batch them across a forecast-hour group. README claim update deferred to Phase
+  D; noted in code comments now.
+* Still plain `.tmp` and NOT counted: `state.rs`'s state-file writer (out of
+  phase-A scope; named follow-up).
+
+## Instrumentation counters
+
+Module statics in wx-core storage — UPPER-CASE because this toolchain enforces
+static naming — `RENAMES_TOTAL`, `BYTES_WRITTEN_TOTAL`, `FSYNCS_TOTAL` (+
+`TMP_SEQ` for temp-name sequencing), all relaxed atomics. Accessors:
+`counters_snapshot() -> StorageCounters { renames, bytes_written, fsyncs }`,
+`counters_reset()`, plus `count_rename()` / `count_bytes_written(n)` so wx-ingest's
+byte writer feeds the SAME totals. `fsync_path` counts every fsync it performs
+(file AND directory); a failed `open` costs no fsync. Not wired into `/metrics`
+yet (later phase).
+
+## Tests added (names)
+
+* `crates/wx-core/tests/writer_golden.rs`: `streaming_writer_output_is_byte_identical_to_golden`,
+  `streaming_writer_chunks_across_the_buffer_boundary_identically`
+* `crates/wx-core/tests/writer_counters.rs`: `writer_counters_and_batched_dir_fsync`
+  (4 writes ⇒ renames 4, fsyncs 4 — NO dir fsync per rename —, bytes == 4 ×
+  `expected_size`; `TouchedDirs.flush` over 2 distinct directories adds EXACTLY
+  2 fsyncs and a second flush costs 0; contract violations rename NOTHING, leave
+  no `.tmp.` litter and no target file)
+* `crates/wx-core/tests/writer_failures.rs`: `failed_writes_leave_no_temp_litter_and_keep_the_original`
+  (read-only directory via libc `chmod`; mid-write plane-length failure; original
+  values intact value-for-value; temp-name uniqueness + pid tag asserted)
+* `crates/wx-ingest/tests/store_batch.rs`: `batch_merge_of_k_levels_onto_l_existing_costs_one_write`
+  (K=2 onto L=3 ⇒ ONE rename, bytes delta == EXACT resulting file size and ≤
+  (L+K)·plane + header slack; colliding level REPLACED not duplicated; `merge_field`
+  alone performs no write at all)
+* `crates/wx-ingest/tests/store_dedup.rs`: `reingesting_a_level_replaces_it_instead_of_duplicating`,
+  `duplicates_inside_one_batch_resolve_first_entry_wins`,
+  `slice_readback_matches_scalar_readback_and_order_survives_merges`
+
+Counter-sensitive gates live in their OWN test binaries (ONE test each) because
+the counters are process-wide while cargo runs tests INSIDE one binary
+concurrently; scratch trees are wiped first so the gates are repeatable (a
+leftover field file changed the expected LEVEL COUNT on the second run — caught
+during development).
+
+## Call-site adaptations
+
+None beyond compilation-neutral ones: `merge_field` gained `mut` on its parameter;
+`write_field` keeps its signature (streams instead of building `refs`, does its own
+directory fsync); `pipeline.rs` is untouched.
+
+## Gate
+
+`cargo test --workspace`: green **103 tests / 43 binaries** (95/38 baseline + 8
+new across 5 new binaries), executed TWICE back-to-back with identical results.
+`cargo clippy --workspace -- -D warnings`: rc=0, zero lint diagnostics (only the
+vendored-`bitflags` future-incompat NOTE). `--all-targets` still carries the
+pre-existing test-code lint debt documented at phase 6 (now 138 diagnostics
+including the new test files, same categories: `needless_return`,
+`assertions_on_constants`, index-loops); PRODUCT code (lib+bin) is clean.
