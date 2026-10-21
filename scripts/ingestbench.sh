@@ -37,6 +37,7 @@ scan_interval_secs = $SCAN
 retention_runs = 4
 stable_window_secs = 0
 ingest_threads = 16
+decode_batch_files = ${BATCH:-4}
 
 [[models]]
 name = "gfs"

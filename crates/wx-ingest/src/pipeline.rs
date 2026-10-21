@@ -4,20 +4,23 @@
 //! reconcile with a full recursive scan (authoritative on network mounts).
 
 use wx_core::grid::{GridDef};
-use crate::grib2::{DecodeStats, decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, GribErr, grid_winds, epoch_secs};
-use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS};
+use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs};
+use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES};
 use serde_json::from_str;
-use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, join_path};
+use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, join_path};
 use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str, MonoClock};
-use crate::store::{write_grid_bin, merge_field, write_field, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc, le_u32_at, GRID_VERSION};
+use crate::store::{write_grid_bin, merge_write_field_batch, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc, le_u32_at, GRID_VERSION};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
-use wx_core::storage::{open_field, MmapField};
+use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot};
 use memmap2::Mmap;
 use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::fs::create_dir_all;
 use std::fs::remove_file;
 use std::fs::remove_dir;
@@ -205,12 +208,126 @@ pub struct IngestCounters {
     pub ingested_files: u64,
     pub errors: u64,
     /// Messages deliberately SKIPPED because they are structurally unusable
-    /// (layer/range levels, coordinate lists, unknown grid/PDT templates).
-    /// Spec §4.2 wants these noted, not failed: they are counted separately
-    /// and NEVER land in `errors` (mirrored to /metrics as
+    /// (layer/range levels, coordinate lists, unknown grid/PDT templates) AND,
+    /// since V1.2 phase B, wind components DROPPED by the pair rule or ORPHANED
+    /// inside one file. Spec §4.2 wants these noted, not failed: they are counted
+    /// separately and NEVER land in `errors` (mirrored to /metrics as
     /// wxpoint_skipped_messages_total).
     pub skipped_messages: u64,
     pub last_mtime_ns: i64, // max mtime over ingested files (lag input)
+    /// Files whose FIRST FOUR BYTES are not `GRIB`: never decoded, recorded
+    /// kind=IGNORED, logged ONCE (phase B poison quarantine).
+    pub ignored_files: u64,
+    /// Decode failures recorded as kind=FAILED with their content hash: retried
+    /// only when the content changes, so `errors` advances ONCE per new/changed
+    /// corrupt file instead of once per scan round.
+    pub quarantined_files: u64,
+    /// Field files written (the write-once grouping unit; compare with a
+    /// message count to see the amplification removed by phase B).
+    pub groups_written: u64,
+}
+
+/// Live mirror of the ingest counters (V1.2 phase B). The pipeline updates this
+/// after EVERY consumed FILE, so `/metrics` (ingest lag, error count, file/group
+/// counts) moves DURING a long scan round instead of only after it, and the
+/// server binary can print per-file progress while ingest is still running.
+/// Relaxed atomics: single writer (the ingest thread), lock-free readers.
+/// NOT `Clone`/`Debug` (atomics are neither): it is shared through `Arc`.
+pub struct LiveCounters {
+    pub errors: AtomicU64,
+    pub ingested_files: AtomicU64,
+    pub skipped_messages: AtomicU64,
+    pub ignored_files: AtomicU64,
+    pub quarantined_files: AtomicU64,
+    pub groups_written: AtomicU64,
+    pub last_mtime_ns: AtomicI64,
+    /// Bumped once per consumed file; the printer side compares it against the
+    /// last value it saw to decide whether a fresh progress line exists.
+    pub progress_seq: AtomicU64,
+    /// Newest per-file progress line ("ingested <file>: G groups, W bytes, X ms"
+    /// or a failure/quarantine note), published together with `progress_seq`.
+    pub last_msg: Mutex<String>,
+}
+
+impl LiveCounters {
+    pub fn new_live() -> LiveCounters {
+        return LiveCounters {
+            errors: AtomicU64::new(0),
+            ingested_files: AtomicU64::new(0),
+            skipped_messages: AtomicU64::new(0),
+            ignored_files: AtomicU64::new(0),
+            quarantined_files: AtomicU64::new(0),
+            groups_written: AtomicU64::new(0),
+            last_mtime_ns: AtomicI64::new(0),
+            progress_seq: AtomicU64::new(0),
+            last_msg: Mutex::<String>::new("".to_string()),
+        };
+    }
+
+    /// Add deltas for every counter in ONE logical step (relaxed: single writer).
+    pub fn add(self: &Self, errors: u64, files: u64, skipped: u64, ignored: u64,
+               quarantined: u64, groups: u64) {
+        let _a = self.errors.fetch_add(errors, Ordering::Relaxed);
+        let _b = self.ingested_files.fetch_add(files, Ordering::Relaxed);
+        let _c = self.skipped_messages.fetch_add(skipped, Ordering::Relaxed);
+        let _d = self.ignored_files.fetch_add(ignored, Ordering::Relaxed);
+        let _e = self.quarantined_files.fetch_add(quarantined, Ordering::Relaxed);
+        let _f = self.groups_written.fetch_add(groups, Ordering::Relaxed);
+    }
+
+    /// Track the newest mtime seen (lag input for /metrics).
+    pub fn note_mtime(self: &Self, ns: i64) {
+        let cur = self.last_mtime_ns.load(Ordering::Relaxed);
+        if ns > cur {
+            self.last_mtime_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Monotone merge of ABSOLUTE values (used by `QueryStats.set_ingest`, which
+    /// stores whole-counter values rather than deltas). Compare-store keeps this
+    /// safe even when the pipeline has already advanced past the caller's snapshot
+    /// mid-round: a mirror never moves BACKWARDS.
+    pub fn merge_abs(self: &Self, errors: u64, files: u64, skipped: u64, ignored: u64,
+                     quarantined: u64, groups: u64, mtime_ns: i64) {
+        let mut cur = self.errors.load(Ordering::Relaxed);
+        if errors > cur {
+            self.errors.store(errors, Ordering::Relaxed);
+        }
+        cur = self.ingested_files.load(Ordering::Relaxed);
+        if files > cur {
+            self.ingested_files.store(files, Ordering::Relaxed);
+        }
+        cur = self.skipped_messages.load(Ordering::Relaxed);
+        if skipped > cur {
+            self.skipped_messages.store(skipped, Ordering::Relaxed);
+        }
+        cur = self.ignored_files.load(Ordering::Relaxed);
+        if ignored > cur {
+            self.ignored_files.store(ignored, Ordering::Relaxed);
+        }
+        cur = self.quarantined_files.load(Ordering::Relaxed);
+        if quarantined > cur {
+            self.quarantined_files.store(quarantined, Ordering::Relaxed);
+        }
+        cur = self.groups_written.load(Ordering::Relaxed);
+        if groups > cur {
+            self.groups_written.store(groups, Ordering::Relaxed);
+        }
+        self.note_mtime(mtime_ns);
+    }
+
+    /// Snapshot into the plain counter shape (used by the Prometheus mirror).
+    pub fn snapshot(self: &Self) -> IngestCounters {
+        return IngestCounters {
+            ingested_files: self.ingested_files.load(Ordering::Relaxed),
+            errors: self.errors.load(Ordering::Relaxed),
+            skipped_messages: self.skipped_messages.load(Ordering::Relaxed),
+            last_mtime_ns: self.last_mtime_ns.load(Ordering::Relaxed),
+            ignored_files: self.ignored_files.load(Ordering::Relaxed),
+            quarantined_files: self.quarantined_files.load(Ordering::Relaxed),
+            groups_written: self.groups_written.load(Ordering::Relaxed),
+        };
+    }
 }
 
 pub struct Pipeline {
@@ -219,6 +336,9 @@ pub struct Pipeline {
     pub retention_runs: u32,
     pub scan_interval_secs: u32,
     pub stable_window_ns: i64,
+    // V1.2 phase B: how many candidate files are DECODED as one chunk before
+    // ANY of them is written ([ingest].decode_batch_files, default 4, >= 1).
+    pub decode_batch_files: usize,
     pub state: StateStore,
     pub stability: StabilityTracker,
     // V1.2 phase B0: monotonic clock for the stability WINDOW (see
@@ -229,6 +349,8 @@ pub struct Pipeline {
     // ArcSwap while the Pipeline itself lives on the ingest thread.
     pub shared: Arc<SharedIndex>,
     pub counters: IngestCounters,
+    // Live per-FILE mirror shared with the HTTP side (phase B).
+    pub live: Arc<LiveCounters>,
     pub wind_violation: bool,
     pub queue: WatchQueue,
     pub watchers: Vec<RecommendedWatcher>,
@@ -242,6 +364,23 @@ impl Pipeline {
         if self.log.len() < 512 {
             self.log.push(msg);
         }
+    }
+
+    /// Record ONE per-FILE progress line (V1.2 phase B): appended to the bounded
+    /// ingest log (which `main` streams), emitted through `tracing` for operators
+    /// who installed a backend, and mirrored into [`LiveCounters`] so the server
+    /// binary can print it WHILE the scan round is still running.
+    pub fn progress(self: &mut Self, msg: String) {
+        tracing::info!("{0}", msg);
+        if self.log.len() < 512 {
+            self.log.push(msg.clone());
+        }
+        let m = self.live.last_msg.lock();
+        match m {
+            Err(_) => {}
+            Ok(mut g) => { *g = msg; }
+        }
+        let _q = self.live.progress_seq.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -554,6 +693,10 @@ impl Pipeline {
             None => { DEFAULT_STABLE_WINDOW_SECS }
             Some(w) => { w }
         };
+        let kb = match cfg.ingest.decode_batch_files {
+            None => { DEFAULT_DECODE_BATCH_FILES }
+            Some(k) => { k }
+        };
         let q = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut p = Pipeline {
             models: models,
@@ -561,12 +704,14 @@ impl Pipeline {
             retention_runs: cfg.ingest.retention_runs,
             scan_interval_secs: cfg.ingest.scan_interval_secs,
             stable_window_ns: (window as i64) * 1000000000,
+            decode_batch_files: kb as usize,
             state: st.unwrap(),
             stability: StabilityTracker { obs: Vec::<(String, u64, i64, i64)>::new() },
             clock: MonoClock::new_clock(),
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
-            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0 },
+            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0 },
+            live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
@@ -957,49 +1102,155 @@ impl Pipeline {
             for rp in &mdl.params {
                 triples.push((rp.disc, rp.cat, rp.num));
             }
-            let mut names: Vec<String> = Vec::<String>::new();
-            for rdy in &ready {
-                names.push(rdy.0.clone());
-            }
-            let results = self.pool.install(|| decode_files_parallel(names.clone(), ParamFilter::Only(triples.clone())));
-            let mut rlist: Vec<Result<(Vec<DecodedMessage>, DecodeStats), GribErr>> = Vec::<Result<(Vec<DecodedMessage>, DecodeStats), GribErr>>::new();
-            for rr in results {
-                rlist.push(rr);
-            }
-            let mut fpos = 0;
-            while !rlist.is_empty() {
-                let one = rlist.remove(0);
-                match one {
-                    Err(e) => {
-                        self.note(format!("grib decode {}: {:?}", names[fpos], e));
-                        self.counters.errors += 1;
-                    }
-                    Ok(dr) => {
-                        // structural SKIP-AND-NOTE bookkeeping (spec §4.2):
-                        // coordinate-list / unknown-template messages counted
-                        // separately from errors and logged for operators.
-                        if dr.1.messages_unsupported > 0 {
-                            self.note(format!("{} message(s) skipped as structurally unsupported in {}",
-                                dr.1.messages_unsupported, names[fpos]));
-                            self.counters.skipped_messages += dr.1.messages_unsupported as u64;
+            // ---- V1.2 phase B: CHUNKED DECODE + PER-FILE CONSUMPTION ----------
+            // K candidate files are decoded together (cross-file parallelism
+            // preserved, peak RAM ~K files), then EACH file is consumed IMMEDIATELY:
+            // group -> write ONCE per group -> registry update -> state upsert+save
+            // -> publish -> progress line. So the FIRST queryable output lands after
+            // the first file of the first chunk, not after the slowest file of the
+            // whole directory.
+            let kchunk = self.decode_batch_files;
+            let mut ci = 0;
+            while ci < ready.len() {
+                let mut cend = ci + kchunk;
+                if cend > ready.len() {
+                    cend = ready.len();
+                }
+                // MAGIC-BYTE PRECHECK BEFORE ANY DECODE (poison quarantine part 1):
+                // a candidate whose first four bytes are not ASCII `GRIB` (a `.idx`
+                // sidecar delivered next to the product is the common case) can
+                // NEVER reach the decoder. It gets a kind=IGNORED record, is logged
+                // ONCE, and is never looked at again until its content changes.
+                let mut dec: Vec<(String, u64, i64, String)> = Vec::<(String, u64, i64, String)>::new();
+                let mut cj = ci;
+                while cj < cend {
+                    let rpath = ready[cj].0.to_string();
+                    let rsize = ready[cj].1;
+                    let rmtime = ready[cj].2;
+                    let rhash = ready[cj].3.to_string();
+                    let hg = head_is_grib(&rpath);
+                    let isg = match hg {
+                        Err(e) => {
+                            // unreadable/short: NOT a verdict about the content, so
+                            // NO record is written and the candidate is retried.
+                            self.note(format!("magic-byte precheck could not read {} ({}): retrying next round", rpath, e));
+                            false
                         }
-                        self.ingest_messages(&mdl, dr.0);
+                        Ok(v) => { v }
+                    };
+                    if !isg {
+                        let prior = self.state.find(rpath.clone());
+                        let already = match prior {
+                            None => { false }
+                            Some(pr) => { pr.kind == REC_IGNORED && pr.hash == rhash }
+                        };
+                        if !already {
+                            self.note(format!("not GRIB2 (magic bytes absent), never decoded: {}", rpath));
+                            self.counters.ignored_files += 1;
+                            self.live.add(0, 0, 0, 1, 0, 0);
+                        }
+                        self.progress(format!("ignored {0}: not a GRIB2 stream", rpath));
                         self.state.upsert(FileRec {
-                            path: names[fpos].clone(),
-                            size: ready[fpos].1,
-                            mtime_ns: ready[fpos].2,
-                            hash: ready[fpos].3.clone(),
+                            path: rpath,
+                            size: rsize,
+                            mtime_ns: rmtime,
+                            hash: rhash,
+                            kind: REC_IGNORED,
                         });
-                        if ready[fpos].2 > self.counters.last_mtime_ns {
-                            self.counters.last_mtime_ns = ready[fpos].2;
+                        let _ = self.state.save();
+                        cj += 1;
+                        continue;
+                    }
+                    dec.push((rpath, rsize, rmtime, rhash));
+                    cj += 1;
+                }
+                if !dec.is_empty() {
+                    let mut names: Vec<String> = Vec::<String>::new();
+                    for d in &dec {
+                        names.push(d.0.clone());
+                    }
+                    // ONE rayon pass over the chunk. The returned vector is iterated
+                    // DIRECTLY: the pre-B code copied it into a second vector first.
+                    let results = self.pool.install(|| decode_files_parallel(names.clone(), ParamFilter::Only(triples.clone())));
+                    for one in results {
+                        let rd = dec.remove(0);
+                        match one {
+                            Err(e) => {
+                                // POISON QUARANTINE part 2: record the failure WITH
+                                // its content hash, so later rounds skip this file
+                                // until its CONTENT changes, and advance `errors`
+                                // only when a NEW FAILED record is created or the
+                                // hash changed (never once per scan round).
+                                let prior = self.state.find(rd.0.clone());
+                                let same = match prior {
+                                    None => { false }
+                                    Some(pr) => { pr.kind == REC_FAILED && pr.hash == rd.3 }
+                                };
+                                if !same {
+                                    self.note(format!("grib decode {}: {:?}", rd.0, e));
+                                    self.counters.errors += 1;
+                                    self.counters.quarantined_files += 1;
+                                    self.live.add(1, 0, 0, 0, 1, 0);
+                                }
+                                self.state.upsert(FileRec {
+                                    path: rd.0.clone(),
+                                    size: rd.1,
+                                    mtime_ns: rd.2,
+                                    hash: rd.3.clone(),
+                                    kind: REC_FAILED,
+                                });
+                                let _ = self.state.save();
+                                self.progress(format!("failed {0}: decode error quarantined ({1:?})", rd.0, e));
+                            }
+                            Ok(dr) => {
+                                // structural SKIP-AND-NOTE bookkeeping (spec §4.2):
+                                // coordinate-list / unknown-template messages counted
+                                // separately from errors and logged for operators.
+                                if dr.1.messages_unsupported > 0 {
+                                    self.note(format!("{} message(s) skipped as structurally unsupported in {}",
+                                        dr.1.messages_unsupported, rd.0));
+                                    self.counters.skipped_messages += dr.1.messages_unsupported as u64;
+                                    self.live.add(0, 0, dr.1.messages_unsupported as u64, 0, 0, 0);
+                                }
+                                let out = self.ingest_file(&mdl, dr.0, rd.0.to_string());
+                                if out.failed_groups > 0 {
+                                    // ANY group failed: the file is NOT marked ingested,
+                                    // so the NEXT round retries it (idempotent thanks to
+                                    // phase-A merge dedup + atomic renames). ONE error per
+                                    // file-with-failure, not one per failed group.
+                                    self.counters.errors += 1;
+                                    self.live.add(1, 0, 0, 0, 0, out.groups as u64);
+                                    self.progress(format!("FAILED {0}: {1} of {2} group(s) unwritable, retrying next round",
+                                        rd.0, out.failed_groups, out.groups + out.failed_groups));
+                                } else {
+                                    self.state.upsert(FileRec {
+                                        path: rd.0.clone(),
+                                        size: rd.1,
+                                        mtime_ns: rd.2,
+                                        hash: rd.3.clone(),
+                                        kind: REC_OK,
+                                    });
+                                    let _ = self.state.save();
+                                    if rd.2 > self.counters.last_mtime_ns {
+                                        self.counters.last_mtime_ns = rd.2;
+                                    }
+                                    self.counters.ingested_files += 1;
+                                    self.counters.groups_written += out.groups as u64;
+                                    ingested += 1;
+                                    self.live.add(0, 1, 0, 0, 0, out.groups as u64);
+                                    self.live.note_mtime(rd.2);
+                                    self.progress(format!("ingested {0}: {1} groups, {2} bytes, {3} ms",
+                                        rd.0, out.groups, out.bytes_written, out.ms));
+                                }
+                            }
                         }
-                        self.counters.ingested_files += 1;
-                        ingested += 1;
                     }
                 }
-                fpos += 1;
+                ci = cend;
             }
         }
+        // Per-FILE state saves above are authoritative; this final save keeps the
+        // IGNORED/FAILED records of a chunk that produced no successful file.
         let _ = self.state.save();
         retention_prune(self);
         return ingested;
@@ -1021,6 +1272,12 @@ pub struct WindPending {
     pub key: (i64, i64, u8, f64),
     pub u: Option<Vec<f32> >,
     pub v: Option<Vec<f32> >,
+    // V1.2 phase B: the CONFIGURED param KEY each component resolved to. Looking
+    // the pair up by name ("UGRD"/"VGRD") would silently DROP a model that names
+    // its winds by RAW discipline/category/number triple, so the keys travel with
+    // the pending entry instead.
+    pub ukey: String,
+    pub vkey: String,
 }
 
 fn find_wind(pend: &Vec<WindPending>, key: (i64, i64, u8, f64)) -> Option<usize> {
@@ -1032,15 +1289,116 @@ fn find_wind(pend: &Vec<WindPending>, key: (i64, i64, u8, f64)) -> Option<usize>
     return None;
 }
 
+/// One WRITE UNIT (V1.2 phase B): every message of ONE source file that lands in
+/// the SAME field file is merged and written ONCE. The group key is
+/// `(run epoch, param key, level type code, forecast-hour offset in seconds)` —
+/// the WindPending-style keying extended with the run EPOCH, because ONE file can
+/// carry TWO runs (`tests/fixtures/frac_small.grib2`) and `fh_secs` is relative
+/// to the run. Levels inside a group keep caller order, so the documented
+/// "first entry wins" rule of `merge_field` applies inside a group too.
+#[derive(Clone, Debug)]
+pub struct StoreGroup {
+    pub epoch: i64,
+    pub dir_name: String,
+    pub grid: GridDef,
+    pub param_key: String,
+    pub level_code: u8,
+    pub fh_secs: i64,
+    pub units: String,
+    pub stat_processed: bool,
+    pub stat_kind: String,
+    pub stat_has_range: bool,
+    pub stat_begin_secs: i64,
+    pub stat_end_secs: i64,
+    pub stat_step_secs: i64,
+    pub entries: Vec<(f64, Vec<f32>)>, // (level value, plane) in caller order
+}
+
+fn find_group(gs: &Vec<StoreGroup>, epoch: i64, param_key: &str, code: u8,
+              fh: i64) -> Option<usize> {
+    for k in 0 .. gs.len() {
+        if gs[k].epoch == epoch && gs[k].param_key == param_key &&
+           gs[k].level_code == code && gs[k].fh_secs == fh {
+            return Some(k);
+        }
+    }
+    return None;
+}
+
+/// Append one plane to its group, creating the group on demand. Planes are MOVED
+/// into the group (no per-message clone of a multi-megabyte plane, which the
+/// pre-B code paid once per message).
+fn group_put(gs: &mut Vec<StoreGroup>, epoch: i64, dir_name: &str, grid: &GridDef,
+             param_key: &str, units: &str, level_code: u8, fh_secs: i64,
+             stat_processed: bool, stat_kind: &str, stat_has_range: bool,
+             stat_begin_secs: i64, stat_end_secs: i64, stat_step_secs: i64,
+             level_val: f64, plane: Vec<f32>) {
+    let gi = find_group(gs, epoch, param_key, level_code, fh_secs);
+    match gi {
+        None => {
+            gs.push(StoreGroup {
+                epoch: epoch,
+                dir_name: dir_name.to_string(),
+                grid: grid.clone(),
+                param_key: param_key.to_string(),
+                level_code: level_code,
+                fh_secs: fh_secs,
+                units: units.to_string(),
+                stat_processed: stat_processed,
+                stat_kind: stat_kind.to_string(),
+                stat_has_range: stat_has_range,
+                stat_begin_secs: stat_begin_secs,
+                stat_end_secs: stat_end_secs,
+                stat_step_secs: stat_step_secs,
+                entries: [(level_val, plane)].to_vec(),
+            });
+        }
+        Some(gi2) => { gs[gi2].entries.push((level_val, plane)); }
+    }
+}
+
+/// Result of consuming ONE source file.
+#[derive(Clone, Debug)]
+pub struct FileOutcome {
+    pub groups: usize,          // field files WRITTEN successfully
+    pub failed_groups: usize,   // groups whose write FAILED (file retried)
+    pub bytes_written: u64,     // storage BYTES_WRITTEN_TOTAL delta
+    pub renames: u64,           // RENAMES_TOTAL delta (groups + grid.bin + manifests)
+    pub ms: i64,                // monotonic time spent on this file
+    pub runs_touched: usize,    // manifest refreshes performed
+}
+
 impl Pipeline {
-    pub fn ingest_messages(self: &mut Self, mdl: &ResolvedModel, msgs: Vec<DecodedMessage>) {
+    /// Consume ONE decoded file (V1.2 phase B). Order of operations:
+    ///   1. pair wind components (the pending map is scoped to THIS FILE and
+    ///      FULLY DRAINED at the end: an orphan is noted + counted as a SKIP,
+    ///      never stored and never leaked into the next file),
+    ///   2. group every plane by (run, param, level type, forecast hour),
+    ///   3. merge+write each group ONCE via `merge_write_field_batch`, collecting
+    ///      per-group errors WITHOUT aborting the rest of the file,
+    ///   4. refresh each affected run's manifest.json ONCE,
+    ///   5. fsync every DISTINCT directory touched ONCE (`TouchedDirs`),
+    ///   6. publish the registry ONCE (visibility granularity = one file, which
+    ///      still satisfies spec §4.5 because products arrive per forecast hour).
+    pub fn ingest_file(self: &mut Self, mdl: &ResolvedModel, msgs: Vec<DecodedMessage>,
+                       path: String) -> FileOutcome {
+        let t0 = self.clock.elapsed_ns();
+        let c0 = counters_snapshot();
+        let mut gs: Vec<StoreGroup> = Vec::<StoreGroup>::new();
         let mut pend: Vec<WindPending> = Vec::<WindPending>::new();
-        for msg in &msgs {
-            let rp = resolve_param(mdl, msg);
+        let mut viol_noted = false;
+        let mut queue: Vec<DecodedMessage> = msgs;
+        while !queue.is_empty() {
+            let msg = queue.remove(0);
+            let rp = resolve_param(mdl, &msg);
             match rp {
                 None => { continue; }
                 Some(_) => {}
             }
+            // Owned handle on the resolved parameter (V1.2 phase B): the group
+            // key/units are needed several times below, so unwrap ONCE instead of
+            // moving `rp` repeatedly.
+            let rpp = rp.unwrap();
             let wg = grid_winds(&msg.grid);
             if wg && !self.wind_violation {
                 let mut names2: Vec<String> = Vec::<String>::new();
@@ -1054,91 +1412,250 @@ impl Pipeline {
                         self.note(format!("wind pair rule violated (model {}): {}", mdl.name, m));
                         self.wind_violation = true;
                         self.counters.errors += 1;
+                        self.live.add(1, 0, 0, 0, 0, 0);
                     }
                 }
             }
             if wg && self.wind_violation {
-                continue;
-            }
-            let mut is_wind = false;
-            match msg.param_name {
-                None => {}
-                Some(pn) => {
-                    if pn == "UGRD" || pn == "VGRD" {
-                        is_wind = wg;
-                    }
+                // Sticky rule KEPT (a half-rotated wind field is nonsense), but
+                // the note is logged at most ONCE per FILE and every dropped
+                // component counts as a SKIP, not as an extra error.
+                self.counters.skipped_messages += 1;
+                self.live.add(0, 0, 1, 0, 0, 0);
+                if !viol_noted {
+                    self.note(format!("wind components skipped in {}: model {} already violated the pair rule", path, mdl.name));
+                    viol_noted = true;
                 }
+                continue;
             }
             // Layer / range messages (two fixed surfaces, or a coordinate list
             // that survived decoding) cannot be stored as a single point value:
-            // SKIP-AND-NOTE, counted separately from errors (spec §4.2 spirit:
-            // skipping is not failing). Point queries are out of scope for
-            // layers per spec §13, but the policy must not poison the error
-            // counter nor abort the file.
+            // SKIP-AND-NOTE, counted separately from errors.
             if msg.levels.len() != 1 {
                 self.note(format!("message with {} levels skipped (layer/range levels unsupported for point queries)", msg.levels.len()));
                 self.counters.skipped_messages += 1;
+                self.live.add(0, 0, 1, 0, 0, 0);
                 continue;
             }
-            // Fractional forecast hours are FIRST-CLASS data (V1.1 phase 3):
-            // CT 4.4 units minute/hour/day/3h/6h/12h/second all normalize to
-            // whole SECONDS, so `fc_secs` is the storage key directly. Only a
-            // NEGATIVE offset (unrepresentable in section 4's unsigned field,
-            // i.e. corrupt input) is rejected, and as a skip, not an error.
+            // Fractional forecast hours are FIRST-CLASS data (V1.1 phase 3); only a
+            // NEGATIVE offset (corrupt) is rejected, and as a skip, not an error.
             if msg.fc_secs < 0 {
                 self.note(format!("negative forecast offset fc_secs={} skipped", msg.fc_secs));
                 self.counters.skipped_messages += 1;
+                self.live.add(0, 0, 1, 0, 0, 0);
                 continue;
             }
             let lv = msg.levels[0];
             let fh = msg.fc_secs;
+            let epoch = msg.run.epoch_secs;
+            let dirn = run_dir_name(msg.run.clone());
+            let stp = msg.stat.kind != StatKind::Instantaneous;
+            let kind_name = stat_kind_name(msg.stat.kind.clone());
+            // Configured parameter whose LEVEL is NOT requested: skip silently.
+            // This used to happen inside `store_plane`; doing it here keeps an
+            // unrequested level from ever creating a group (and therefore a write).
+            if !level_spec_match(&rpp, lv.0, lv.1) {
+                continue;
+            }
+            let is_wind = wg && named_wind_component(&msg);
             if is_wind {
-                let key = (msg.run.epoch_secs, fh, lv.0, lv.1);
+                let key = (epoch, fh, lv.0, lv.1);
                 let is_u = param_is_ugrd(&msg);
                 let ki = find_wind(&pend, key);
                 match ki {
                     None => {
-                        let mut wp = WindPending { key: key, u: None, v: None };
-                        if is_u { wp.u = Some(msg.data.clone()); } else { wp.v = Some(msg.data.clone()); }
+                        let mut wp = WindPending { key: key, u: None, v: None,
+                                                   ukey: "".to_string(), vkey: "".to_string() };
+                        if is_u {
+                            wp.u = Some(msg.data);
+                            wp.ukey = rpp.key.clone();
+                        } else {
+                            wp.v = Some(msg.data);
+                            wp.vkey = rpp.key.clone();
+                        }
                         pend.push(wp);
                     }
                     Some(ki2) => {
-                        if is_u { pend[ki2].u = Some(msg.data.clone()); } else { pend[ki2].v = Some(msg.data.clone()); }
+                        if is_u {
+                            pend[ki2].u = Some(msg.data);
+                            pend[ki2].ukey = rpp.key.clone();
+                        } else {
+                            pend[ki2].v = Some(msg.data);
+                            pend[ki2].vkey = rpp.key.clone();
+                        }
                     }
                 }
                 let ki3 = find_wind(&pend, key);
                 match ki3 {
                     Some(ki4) => {
                         if pend[ki4].u.is_some() && pend[ki4].v.is_some() {
-                            let u4 = pend[ki4].u.clone().unwrap();
-                            let v4 = pend[ki4].v.clone().unwrap();
-                            let rot = rotate_winds_to_earth(&msg.grid, &u4, &v4);
+                            // BOTH components present: rotate ONCE for the PAIR, then
+                            // each component flows into its OWN group (two field files,
+                            // ONE write each). The completed entry is REMOVED.
+                            let wp = pend.remove(ki4);
+                            let ugv = wp.u.unwrap();
+                            let vgv = wp.v.unwrap();
+                            let rot = rotate_winds_to_earth(&msg.grid, &ugv, &vgv);
                             let uu = rot.0;
                             let vv = rot.1;
-                            let rp_u = resolve_param_by_key(mdl, "UGRD");
-                            let rp_v = resolve_param_by_key(mdl, "VGRD");
-                            match rp_u {
+                            let ru = resolve_param_by_key(mdl, wp.ukey.as_str());
+                            let rv = resolve_param_by_key(mdl, wp.vkey.as_str());
+                            match ru {
                                 None => {}
-                                Some(ru) => {
-                                    self.store_plane(mdl, msg, ru, uu, lv.0, lv.1, fh);
+                                Some(rux) => {
+                                    if level_spec_match(&rux, lv.0, lv.1) {
+                                        group_put(&mut gs, epoch, dirn.as_str(), &msg.grid,
+                                            rux.key.as_str(), rux.units.as_str(), lv.0, fh,
+                                            stp, kind_name.as_str(), stp,
+                                            msg.stat.begin_secs, msg.stat.end_secs, msg.stat.step_secs,
+                                            lv.1, uu);
+                                    }
                                 }
                             }
-                            match rp_v {
+                            match rv {
                                 None => {}
-                                Some(rv) => {
-                                    self.store_plane(mdl, msg, rv, vv, lv.0, lv.1, fh);
+                                Some(rv2) => {
+                                    if level_spec_match(&rv2, lv.0, lv.1) {
+                                        group_put(&mut gs, epoch, dirn.as_str(), &msg.grid,
+                                            rv2.key.as_str(), rv2.units.as_str(), lv.0, fh,
+                                            stp, kind_name.as_str(), stp,
+                                            msg.stat.begin_secs, msg.stat.end_secs, msg.stat.step_secs,
+                                            lv.1, vv);
+                                    }
                                 }
                             }
-                            pend.remove(ki4);
                         }
                     }
                     None => {}
                 }
                 continue;
             }
-            self.store_plane(mdl, msg, rp.unwrap(), msg.data.clone(), lv.0, lv.1, fh);
+            group_put(&mut gs, epoch, dirn.as_str(), &msg.grid, rpp.key.as_str(),
+                      rpp.units.as_str(), lv.0, fh, stp, kind_name.as_str(), stp,
+                      msg.stat.begin_secs, msg.stat.end_secs, msg.stat.step_secs,
+                      lv.1, msg.data);
         }
+        // ---- WIND MAP FULLY DRAINED PER FILE ---------------------------------
+        // Anything left here is an ORPHAN component (its partner never arrived IN
+        // THIS file). It is noted and counted as a SKIP, REMOVED, and NEVER stored
+        // — so nothing leaks into the next file's pairing (the pre-B code simply
+        // dropped these silently at the end of the function).
+        while !pend.is_empty() {
+            let wp = pend.remove(0);
+            self.note(format!("wind component orphaned in {} at run/fh/level {:?}: only one of UGRD/VGRD present, message skipped", path, wp.key));
+            self.counters.skipped_messages += 1;
+            self.live.add(0, 0, 1, 0, 0, 0);
+        }
+        // ---- WRITE PHASE: ONE merge+write per GROUP --------------------------
+        let mut dirs = TouchedDirs { dirs: Vec::<String>::new() };
+        let mut runs: Vec<(i64, String)> = Vec::<(i64, String)>::new();
+        let mut written = 0usize;
+        let mut failed = 0usize;
+        while !gs.is_empty() {
+            let g = gs.remove(0);
+            let mdir = join_path(&self.data_dir, mdl.name.as_str());
+            let run_dir = join_path(&mdir, g.dir_name.as_str());
+            let mk = create_dir_all(&run_dir);
+            if mk.is_err() {
+                self.note(format!("mkdir run dir failed: {}", run_dir));
+                failed += 1;
+                continue;
+            }
+            // grid.bin ONCE per run directory (per FILE, not per message).
+            let gpath = format!("{}/grid.bin", run_dir);
+            match stat_size_mtime(&gpath) {
+                Ok(_) => {}
+                Err(_) => {
+                    let gw = write_grid_bin(&run_dir, &g.grid);
+                    if gw.is_err() {
+                        self.note(format!("grid.bin write failed: {}", run_dir));
+                        failed += 1;
+                        continue;
+                    }
+                    note_run(&mut runs, g.epoch, g.dir_name.clone());
+                }
+            }
+            let lvl_dir = level_dir_name(g.level_code);
+            let kdir = join_path(&run_dir, g.param_key.as_str());
+            let fparent = join_path(&kdir, lvl_dir.as_str());
+            let pd = create_dir_all(&fparent);
+            if pd.is_err() {
+                self.note(format!("mkdir field dir failed: {}", fparent));
+                failed += 1;
+                continue;
+            }
+            let fpath = join_path(&fparent, &fh_file_name(g.fh_secs));
+            let scan_ns = grid_scan_ns(&g.grid);
+            // winds_grid=false: components are stored EARTH-relative (spec §4.4).
+            let mw = merge_write_field_batch(fpath.to_string(), g.level_code, g.grid.nx(),
+                                             g.grid.ny(), scan_ns, false, g.entries, Some(&mut dirs));
+            match mw {
+                Err(e) => {
+                    self.note(format!("group write failed {}: {}", fpath, e));
+                    failed += 1;
+                    continue;
+                }
+                Ok(_nlv) => {
+                    written += 1;
+                    note_run(&mut runs, g.epoch, g.dir_name.clone());
+                }
+            }
+            let mf = open_field(fpath.to_string());
+            match mf {
+                Err(e) => {
+                    self.note(format!("open_field failed: {}", e));
+                    failed += 1;
+                    continue;
+                }
+                Ok(mfv) => {
+                    self.registry_put(mdl, g.epoch, g.dir_name.clone(), g.grid.clone(),
+                        FieldKey { param_key: g.param_key, level_code: g.level_code },
+                        g.fh_secs, Arc::new(mfv), g.units, g.stat_processed, g.stat_kind.clone(),
+                        g.stat_has_range, g.stat_begin_secs, g.stat_end_secs, g.stat_step_secs);
+                }
+            }
+        }
+        // ---- manifest.json ONCE per AFFECTED RUN -----------------------------
+        for r in &runs {
+            if !update_run_manifest(self, mdl.name.clone(), r.0) {
+                self.note(format!("manifest update failed for run {0}", r.1));
+                self.counters.errors += 1;
+                self.live.add(1, 0, 0, 0, 0, 0);
+            }
+        }
+        // ---- DIRECTORY FSYNCS ONCE per DISTINCT DIRECTORY TOUCHED ------------
+        match dirs.flush() {
+            Err(e) => {
+                self.note(format!("directory fsync batch failed: {}", e));
+                failed += 1;
+            }
+            Ok(_) => {}
+        }
+        // ---- PUBLISH ONCE per FILE -------------------------------------------
+        self.publish();
+        let c1 = counters_snapshot();
+        return FileOutcome {
+            groups: written,
+            failed_groups: failed,
+            bytes_written: c1.bytes_written - c0.bytes_written,
+            renames: c1.renames - c0.renames,
+            ms: (self.clock.elapsed_ns() - t0) / 1000000,
+            runs_touched: runs.len(),
+        };
     }
+}
+
+/// Remember a run touched by this file (deduped) so its manifest is refreshed
+/// exactly ONCE afterwards.
+fn note_run(runs: &mut Vec<(i64, String)>, epoch: i64, dir_name: String) {
+    let mut k = 0;
+    while k < runs.len() {
+        if runs[k].0 == epoch {
+            return;
+        }
+        k += 1;
+    }
+    runs.push((epoch, dir_name));
 }
 
 fn resolve_param(mdl: &ResolvedModel, msg: &DecodedMessage) -> Option<ResolvedParam> {
@@ -1155,6 +1672,17 @@ fn param_is_ugrd(msg: &DecodedMessage) -> bool {
     match msg.param_name {
         None => { return false; }
         Some(pn) => { return pn == "UGRD"; }
+    }
+}
+
+/// True when the message's reverse-looked-up parameter name is one of the two
+/// wind components. A RAW-triple parameter whose (discipline,category,number)
+/// maps to UGRD/VGRD through the built-in table matches too, which is exactly
+/// what the earth-relative rotation must apply to.
+fn named_wind_component(msg: &DecodedMessage) -> bool {
+    match msg.param_name {
+        None => { return false; }
+        Some(pn) => { return pn == "UGRD" || pn == "VGRD"; }
     }
 }
 
@@ -1227,93 +1755,10 @@ pub fn update_run_manifest(p: &Pipeline, model_name: String, epoch: i64) -> bool
     }
 }
 
-impl Pipeline {
-    /// Store one plane under (param, level type, forecast-hour offset in
-    /// SECONDS), merging any existing levels in that file, then PUBLISH
-    /// (forecast-hour granularity, spec §4.5 incremental visibility).
-    pub fn store_plane(self: &mut Self, mdl: &ResolvedModel, msg: &DecodedMessage,
-                       rp: ResolvedParam, plane: Vec<f32>, level_code: u8,
-                       level_val: f64, fh_secs: i64) {
-        if !level_spec_match(&rp, level_code, level_val) {
-            return; // configured param but level not requested: skip silently
-        }
-        let epoch = msg.run.epoch_secs;
-        let dirn = run_dir_name(msg.run.clone());
-        let mdir = join_path(&self.data_dir, mdl.name.as_str());
-        let run_dir = join_path(&mdir, dirn.as_str());
-        let mk = create_dir_all(&run_dir);
-        if mk.is_err() {
-            self.note(format!("mkdir run dir failed: {}", run_dir));
-            self.counters.errors += 1;
-            return;
-        }
-        let gpath = format!("{}/grid.bin", run_dir);
-        match stat_size_mtime(&gpath) {
-            Ok(_) => {}
-            Err(_) => {
-                let gw = write_grid_bin(&run_dir, &msg.grid);
-                if gw.is_err() {
-                    self.note(format!("grid.bin write failed: {}", run_dir));
-                    self.counters.errors += 1;
-                    return;
-                }
-            }
-        }
-        let lvl_dir = level_dir_name(level_code);
-        let kdir = join_path(&run_dir, rp.key.as_str());
-        let fparent = join_path(&kdir, lvl_dir.as_str());
-        let pd = create_dir_all(&fparent);
-        if pd.is_err() {
-            self.note(format!("mkdir field dir failed: {}", fparent));
-            self.counters.errors += 1;
-            return;
-        }
-        let fpath = join_path(&fparent, &fh_file_name(fh_secs));
-        let newv: Vec<(f64, Vec<f32>)> = [(level_val, plane)].to_vec();
-        let merged = merge_field(fpath.to_string(), level_code, newv);
-        match merged {
-            Err(e) => {
-                self.note(format!("merge failed {}: {}", fpath, e));
-                self.counters.errors += 1;
-                return;
-            }
-            Ok(mg) => {
-                let scan_ns = grid_scan_ns(&msg.grid);
-                let wf = write_field(fpath.to_string(), level_code, msg.grid.nx(), msg.grid.ny(),
-                                     scan_ns, false, mg);
-                if wf.is_err() {
-                    self.note(format!("field write failed: {}", fpath));
-                    self.counters.errors += 1;
-                    return;
-                }
-            }
-        }
-        let mf = open_field(fpath.to_string());
-        match mf {
-            Err(e) => {
-                self.note(format!("open_field failed: {}", e));
-                self.counters.errors += 1;
-                return;
-            }
-            Ok(mfv) => {
-                let stp = msg.stat.kind != StatKind::Instantaneous;
-                // PDT 4.8 messages carry their statistical time range (offsets
-                // from the run time in seconds); PDT 4.0 has none.
-                let has_rng = stp;
-                self.registry_put(mdl, epoch, dirn.clone(), msg.grid.clone(),
-                    FieldKey { param_key: rp.key, level_code: level_code },
-                    fh_secs, Arc::new(mfv), rp.units, stp, stat_kind_name(msg.stat.kind.clone()),
-                    has_rng, msg.stat.begin_secs, msg.stat.end_secs, msg.stat.step_secs);
-                let mok = update_run_manifest(self, mdl.name.clone(), epoch);
-                if !mok {
-                    self.note(format!("manifest update failed for run {0}", dirn));
-                    self.counters.errors += 1;
-                }
-                self.publish();
-            }
-        }
-    }
-}
+// (V1.2 phase B) the per-message `store_plane` path is GONE: `ingest_file`
+// groups a file's messages per (run, param, level type, forecast hour) and writes
+// each group ONCE, so mkdir/grid.bin/manifest/publish happen per FILE instead of
+// per MESSAGE. The single-level merge+write primitives stay available in `store`.
 
 pub fn level_spec_match(rp: &ResolvedParam, code: u8, val: f64) -> bool {
     for sp in &rp.level_specs {

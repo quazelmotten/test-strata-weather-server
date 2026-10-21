@@ -4,6 +4,11 @@
 //! * `[ingest].stable_window_secs` (default 10): size+mtime must be unchanged
 //!   for this long before a file is eligible under the window strategy.
 //! * `[ingest].ingest_threads` (default 4): rayon pool size for decode work.
+//! * `[ingest].decode_batch_files` (default 4, V1.2 phase B): how many candidate
+//!   files are DECODED as one chunk before ANY of them is written. Cross-file
+//!   parallelism is preserved inside a chunk; peak decode RAM is ~K files; the
+//!   FIRST queryable output lands after the first file of the first chunk instead
+//!   of after the slowest file of the WHOLE directory. Must be >= 1.
 //! * `[[models]].sidecar_suffix` (absent by default): when present the model
 //!   uses the sidecar-marker stability strategy instead of the window — a
 //!   candidate `<file>` is eligible only once `<file><suffix>` exists.
@@ -27,6 +32,11 @@ use wx_core::tables::parse_f64;
 pub const DEFAULT_STABLE_WINDOW_SECS: u32 = 10;
 /// Default ingest decode pool thread count when the key is absent.
 pub const DEFAULT_INGEST_THREADS: u32 = 4;
+/// Default number of files decoded per chunk before consumption starts (V1.2
+/// phase B). K bounds peak decode memory at ~K files while keeping cross-file
+/// parallelism; K == 1 makes ingest strictly sequential per file (lowest latency
+/// to first output, lowest RAM).
+pub const DEFAULT_DECODE_BATCH_FILES: u32 = 4;
 
 #[derive(serde::Deserialize)]
 pub struct ServerCfg {
@@ -40,6 +50,8 @@ pub struct IngestCfg {
     pub retention_runs: u32,
     pub stable_window_secs: Option<u32>,
     pub ingest_threads: Option<u32>,
+    // V1.2 phase B: chunk size of the DECODE stage (see module docs).
+    pub decode_batch_files: Option<u32>,
 }
 
 #[derive(serde::Deserialize)]
@@ -177,6 +189,14 @@ pub fn validate_config(cfg: &PointConfig) -> Result<Vec<ResolvedModel>, String> 
         Some(t) => {
             if t < 1 {
                 return Err("ingest.ingest_threads must be >= 1".to_string());
+            }
+        }
+    }
+    match cfg.ingest.decode_batch_files {
+        None => {}
+        Some(k) => {
+            if k < 1 {
+                return Err("ingest.decode_batch_files must be >= 1".to_string());
             }
         }
     }

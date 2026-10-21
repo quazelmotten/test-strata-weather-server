@@ -113,4 +113,23 @@ case "$radout" in
     echo "FATAL: hrrr_ellip_small: wgrib2 read '$radout', expected the inline WGS84 axes"; exit 1 ;;
 esac
 
+# ---------------------------------------------------------------------------
+# orphan-wind fixture (V1.2 phase B gate `wind_orphan.rs`): the FIRST FOUR
+# messages of hrrr_small.grib2 (TMP x2 + UGRD x2, NO VGRD), i.e. a delivered
+# product whose wind pair can NEVER complete -> exercises the per-file pending-
+# map drain (orphan noted, counted as a skip, removed, never stored half-rotated).
+# Byte-exact prefix of a valid multi-message stream: each GRIB2 record ends with
+# its own section-7 CRC, so cutting at a message boundary stays decodable.
+# ---------------------------------------------------------------------------
+off5=$("$WG" tests/fixtures/hrrr_small.grib2 2>/dev/null | sed -n '5s/^[0-9]*:\([0-9]*\):.*/\1/p')
+if [ -z "$off5" ]; then
+  echo "FATAL: could not locate message 5 offset in hrrr_small.grib2"; exit 1
+fi
+head -c "$off5" tests/fixtures/hrrr_small.grib2 > tests/fixtures/hrrr_orphan.grib2
+n4=$("$WG" tests/fixtures/hrrr_orphan.grib2 2>/dev/null | wc -l)
+if [ "$n4" != "4" ]; then
+  echo "FATAL: hrrr_orphan.grib2 has $n4 messages, expected 4"; exit 1
+fi
+echo "ok hrrr_orphan (first 4 messages: TMP x2 + UGRD x2, no VGRD)"
+
 echo "gen_fixtures.sh: fixtures regenerated under tests/fixtures (+ tests/perfdata)"

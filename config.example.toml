@@ -14,6 +14,13 @@ retention_runs = 4
 # Dedicated rayon decode pool size for ingest work (default 4); kept separate
 # from the HTTP runtime so ingest never starves the query path.
 #ingest_threads = 4
+# How many candidate files are DECODED as ONE chunk before any of them is written
+# (V1.2 phase B; default 4, must be >= 1). Cross-file parallelism is preserved INSIDE
+# a chunk; peak decode RAM is ~K files; the FIRST queryable output lands after the
+# first file of the first chunk instead of after the slowest file of the whole
+# directory. K=1 means strictly sequential per-file ingest (lowest RAM, slightly
+# later first output); larger K trades RAM for earlier output.
+#decode_batch_files = 4
 
 [[models]]
 name = "gfs"

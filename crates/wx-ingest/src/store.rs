@@ -24,7 +24,7 @@
 use wx_core::grid::{GridDef, GridRegular, GridLambert};
 use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, fsync_path,
                        PlaneSource, count_rename, count_bytes_written, le_u32, bits_to_f32,
-                       unique_tmp_path};
+                       unique_tmp_path, TouchedDirs};
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
@@ -308,13 +308,32 @@ impl<'a> PlaneSource for MergedPlanes<'a> {
     }
 }
 
-/// Serialize merged planes and write atomically through wx-core's STREAMING
+/// Serialize merged planes and write them atomically through wx-core's STREAMING
 /// writer (header + planes through a 256 KiB chunk buffer, NO whole-file byte
-/// vector). The parent-directory fsync stays HERE for now: the primitive dropped
-/// it (Phase B batches those with `TouchedDirs`), and the crash rule is unchanged
-/// because the FILE fsync still happens before the rename.
-pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
+/// vector). THIS variant keeps its OWN parent-directory fsync.
+pub fn write_field(path: String, code: u8, nx: u32, ny: u32, scan_ns: bool,
                    winds_grid: bool, merged: Vec<(f64, Vec<f32>)>) -> Result<(), String> {
+    let dir = parent_dir_pub(&path);
+    match write_field_no_dir_fsync(path, code, nx, ny, scan_ns, winds_grid, merged) {
+        Err(e) => { return Err(e); }
+        Ok(_) => {}
+    }
+    match fsync_path(&dir) {
+        Err(e) => { return Err(format!("dir fsync: {0}", e)); }
+        Ok(_) => {}
+    }
+    return Ok(());
+}
+
+/// THE BATCHED PRIMITIVE (V1.2 phase B): identical serialization, but NO
+/// parent-directory fsync — the caller records the directory in a
+/// [`TouchedDirs`] collector and fsyncs every DISTINCT directory ONCE per file
+/// instead of once per rename. Durability rule unchanged: the temp inode is
+/// fsynced BEFORE the rename, so a crash can only lose the DIRECTORY ENTRY of a
+/// file whose data is already durable, which is exactly what the batched flush
+/// covers before the process exits.
+pub fn write_field_no_dir_fsync(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
+                                winds_grid: bool, merged: Vec<(f64, Vec<f32>)>) -> Result<(), String> {
     let mut hdr = BinHeader {
         nx: nx,
         ny: ny,
@@ -325,15 +344,10 @@ pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
     for m in &merged {
         hdr.levels.push(m.0 as f32);
     }
-    let dir = parent_dir_pub(&path);
     let w = write_bin_atomic_stream(path, &hdr, merged.len(),
                                     MergedPlanes { items: &merged, idx: 0 });
     match w {
         Err(e) => { return Err(e.to_string()); }
-        Ok(_) => {}
-    }
-    match fsync_path(&dir) {
-        Err(e) => { return Err(format!("dir fsync: {0}", e)); }
         Ok(_) => {}
     }
     return Ok(());
@@ -341,19 +355,40 @@ pub fn write_field(path: String, _code: u8, nx: u32, ny: u32, scan_ns: bool,
 
 /// BATCH PATH: merge a GROUP of K levels into ONE field file and write it ONCE
 /// (ONE temp file, ONE rename, O(L+K) passes over planes). Returns the resulting
-/// LEVEL COUNT. `store_plane` still drives the single-level path until the Phase
-/// B pipeline restructure groups messages per (param, level type, forecast hour).
+/// LEVEL COUNT. Driven by the V1.2 phase B pipeline, which groups each file's
+/// messages per (run, param, level type, forecast hour) — see
+/// `pipeline::ingest_file`.
 pub fn merge_write_field(path: String, code: u8, nx: u32, ny: u32, scan_ns: bool,
                          winds_grid: bool, new: Vec<(f64, Vec<f32>)>) -> Result<usize, String> {
+    return merge_write_field_batch(path, code, nx, ny, scan_ns, winds_grid, new, None);
+}
+
+/// Same merge + ONE write, but the parent-directory fsync is DEFERRED to the
+/// caller's [`TouchedDirs`] collector (phase B batches them per source file).
+/// Pass `None` for the self-fsync behavior above.
+pub fn merge_write_field_batch(path: String, code: u8, nx: u32, ny: u32, scan_ns: bool,
+                               winds_grid: bool, new: Vec<(f64, Vec<f32>)>,
+                               dirs: Option<&mut TouchedDirs>) -> Result<usize, String> {
     let mut count: usize = 0;
     let mut err = "".to_string();
     match merge_field(path.to_string(), code, new) {
         Err(e) => { err = e; }
         Ok(pairs) => {
             count = pairs.len();
-            match write_field(path, code, nx, ny, scan_ns, winds_grid, pairs) {
-                Err(e) => { err = e; }
-                Ok(_) => {}
+            match dirs {
+                None => {
+                    match write_field(path, code, nx, ny, scan_ns, winds_grid, pairs) {
+                        Err(e) => { err = e; }
+                        Ok(_) => {}
+                    }
+                }
+                Some(dd) => {
+                    let pcopy = path.to_string();
+                    match write_field_no_dir_fsync(path, code, nx, ny, scan_ns, winds_grid, pairs) {
+                        Err(e) => { err = e; }
+                        Ok(_) => { dd.note(pcopy); }
+                    }
+                }
             }
         }
     }

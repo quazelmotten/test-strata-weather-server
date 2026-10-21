@@ -59,6 +59,7 @@ startup — unknown param/level names fail). See `config.example.toml`.
 | `ingest.retention_runs` | 4 | keep N most recent runs per model |
 | `ingest.stable_window_secs` | 10 | file must hold (size,mtime) stable this long before ingest; `0` still requires one re-observation |
 | `ingest.ingest_threads` | 4 | dedicated rayon decode pool (separate from the tokio HTTP runtime) |
+| `ingest.decode_batch_files` | 4 | V1.2 phase B: how many candidate files are decoded as ONE chunk before any is written (must be ≥ 1; bounds peak decode RAM at ~K files while keeping cross-file parallelism) |
 | `[[models]].sidecar_suffix` | absent | per-model alternative stability rule: eligible once `<file><suffix>` appears |
 
 Per model: `name`, `ingest_dir`, `file_glob` (glob is a FILTER ONLY — all
@@ -191,9 +192,17 @@ Metrics (Prometheus): `wxpoint_queries_total{status="2xx|4xx|5xx"}`,
 `wxpoint_ingest_errors_total`, `wxpoint_ingested_files_total`,
 `wxpoint_skipped_messages_total` (V1.1 phase 3 counter: structurally unusable
 messages noted, NOT errors — layer/range levels, coordinate lists after the
-product-definition template, unimplemented grid/PDT templates; they never
-increment `wxpoint_ingest_errors_total`), and
-`wxpoint_ingest_lag_seconds` (newest ingested file mtime → now).
+product-definition template, unimplemented grid/PDT templates; since V1.2 phase B
+also wind components DROPPED by the pair rule or ORPHANED inside one file; they
+never increment `wxpoint_ingest_errors_total`), `wxpoint_ignored_files_total`
+(V1.2 phase B: candidates whose magic bytes are not `GRIB`, never decoded),
+`wxpoint_quarantined_files_total` (decode failures recorded WITH their content
+hash so a corrupt file is not retried every round), `wxpoint_ingest_groups_written_total`
+(the write-once grouping unit — compare it with a message count to see the
+amplification phase B removed), and `wxpoint_ingest_lag_seconds` (newest ingested
+file mtime → now). Every ingest-side gauge reads `max(legacy store, LIVE pipeline
+mirror)`, and the live mirror advances after EVERY consumed FILE, so `/metrics`
+reflects a scan round that is still running.
 
 ## 4. Storage format (`data_dir`)
 
@@ -245,15 +254,20 @@ data_dir/
   cannot represent a file that declared its own spheroid, so refusing beats
   silently re-projecting it on a guessed earth.
 * Atomicity and durability chain: every write is temp-file → `flush` → **fsync of
-  the file inode** → atomic rename → **fsync of the PARENT DIRECTORY**, so a query
-  never sees a partial file and a crash cannot resurrect a renamed-but-unlinked
-  name. How fsync is obtained here: this toolchain's `std::fs::File` exposes only
-  `flush()` (a userspace buffer flush — verified with `strace`, it emits no
-  `fsync` syscall), so `wx_core::storage::fsync_path()` binds libc
-  `open`/`fsync`/`close` through `extern "C"` and fsyncs by path. Durability
-  failures surface as ingest notes/errors, never swallowed. A run becomes
-  visible forecast-hour by forecast hour as each completes (publish after every
-  field store) — see the transient-publish caveat in §9.
+  the file inode** → atomic rename → directory fsync, so a query never sees a partial
+  file and a crash cannot resurrect a renamed-but-unlinked name. How fsync is obtained
+  here: this toolchain's `std::fs::File` exposes only `flush()` (a userspace buffer
+  flush — verified with `strace`, it emits no `fsync` syscall), so
+  `wx_core::storage::fsync_path()` binds libc `open`/`fsync`/`close` through
+  `extern "C"` and fsyncs by path. Since V1.2 phase B the PARENT-DIRECTORY fsync is
+  BATCHED: field writes record their directory in a `TouchedDirs` collector and the
+  pipeline flushes every DISTINCT directory ONCE per source file (the file inode is
+  still fsynced BEFORE its rename, so the crash rule is unchanged — a crash can only
+  lose the directory ENTRY of a file whose data is already durable). Durability
+  failures surface as ingest notes/errors, never swallowed. Visibility granularity
+  is ONE SOURCE FILE (registry published once per file after all its GROUPS are
+  written), which still satisfies spec §4.5 because products arrive forecast-hour
+  by forecast-hour — see the transient-publish caveat in §9.
 * `manifest.json` is human-facing inventory; the index is authoritative. Per
   field it records `units`, `stat_processed`, `stat_kind`, `levels`, decimal
   `forecast_hours` (informational only — the filename is the exact key) and
@@ -268,8 +282,11 @@ data_dir/
   `Arc` reference drops (Linux unlink-while-mapped), so in-flight queries never
   fault (`retention_evicts_after_publish_stale_snapshot_still_reads`).
 * Warm start: `state/files.json` (path+size+mtime_ns+FNV-1a64 over first/last
-  64 KiB) prevents re-ingest after restart; same path with different content
-  hash IS re-ingested. The index is rebuilt from disk before any scan.
+  64 KiB, plus V1.2 phase B `kind`: 0 = ingested, 1 = magic-byte IGNORED, 2 = decode
+  FAILED quarantined WITH its hash) prevents re-ingest after restart; same path with
+  different content hash IS re-ingested (a FAILED record is retried ONLY then). Records
+  without a `kind` key (pre-V1.2 files) load as kind=0. The index is rebuilt from disk
+  before any scan.
 
 ## 5. Interpolation semantics (exactly as implemented)
 
@@ -331,6 +348,20 @@ ecosystem; we implement 5.200. PDT 4.0 and 4.8 both handled (stat process type
 a dedicated rayon pool (`ingest_threads`) separate from the HTTP runtime.
 The grib-rs crate was evaluated and rejected (capability gaps documented in
 docs/DECISIONS.md); the decoder is purpose-built against wgrib2 behavior.
+
+**Ingest loop shape (V1.2 phase B).** Candidates are collected per model, then
+processed in CHUNKS of `decode_batch_files` (default 4): ONE rayon pass decodes a
+chunk, and EACH file is consumed IMMEDIATELY afterwards — magic-byte precheck
+(non-`GRIB` candidates get a kind=IGNORED record and NEVER reach the decoder), wind
+pairing scoped to that one file (leftover components are ORPHANS: noted, counted as
+skips, removed, never stored half-rotated), GROUPING of every plane by
+`(run, param, level type, forecast hour)` so each field file is merged and written
+ONCE (`merge_write_field_batch`) instead of once per message, registry update,
+manifest refresh ONCE per affected run, directory fsyncs ONCE per distinct directory,
+ONE publish, ONE progress line, and a state upsert+save. A decode failure records
+kind=FAILED with the content hash (so `errors` advances ONCE per new/changed corrupt
+file, not once per round) and a group-write failure leaves the file UNMARKED so the
+next round retries it idempotently. Full rationale + measured numbers: docs/DECISIONS.md.
 
 Concurrency: read-mostly index published atomically with `arc-swap`; query
 threads take zero locks, ZERO heap allocations anywhere on the lookup path
@@ -414,13 +445,30 @@ product behaviour unchanged (§9 documents the window itself).
 
 ### 7.3 Ingest → queryable (`scripts/ingestbench.sh`)
 
-Files placed cold; scan_interval_secs=1, stable_window_secs=0, ingest_threads=16:
+Files placed cold; scan_interval_secs=1, stable_window_secs=0, ingest_threads=16,
+decode_batch_files=4 (the script honours `BATCH=<n>` to override K):
 
-* first-queryable (`/ready`): **3.9 s** after placement
-* gfs f000 visible 4.1 s, f006 4.2 s; hrrr f000 4.3 s, f003 5.1 s
-  (one GFS forecast hour ≈ 10 params becomes queryable within a few seconds —
-  §8 target MET)
-* peak RSS (VmHWM): **372 MB** for the whole dataset indexed
+| metric | pre-phase-B (per-message writes) | phase B, K=4 (default) | phase B, K=1 |
+|---|---|---|---|
+| first-queryable (`/ready`) | **8.28 s** | **4.05 s** | 4.97 s |
+| last forecast hour visible | 9.44 s | 4.55 s | 5.68 s |
+| server CPU time to that point | 7.55 s | 4.2 s | 4.2 s |
+| peak RSS (VmHWM) | 362 MB | ~421 MB | ~177 MB |
+
+One GFS forecast hour ≈ 10 params becomes queryable within a few seconds (§8 target
+MET, now at roughly HALF the previous wall time). The RAM column is the deliberate
+trade-off of grouping: a file's planes stay resident until its GROUP is written, so
+peak RSS scales with K (`K=1` is both faster-to-steady-state AND lower-RAM than the
+pre-B code ever was; `K=4` buys earlier first output for ~2.4x that floor).
+
+Write amplification on the SAME dataset (storage counters, measured by
+`crates/wx-ingest/tests/ingest_perf_grouping.rs` and its pre-B twin):
+
+| counter | pre-phase-B | phase B |
+|---|---|---|
+| renames per GFS hour | 45 (22 field writes + 22 manifest rewrites + grid.bin) | 10 (8 GROUPS + grid.bin + manifest); next hour 9 |
+| bytes written per hour | 323.5 MB vs 91.2 MB final store (**3.55x**, = 78 plane serializations where 8 suffice) | 182.48 MB vs 182.48 MB final store (**1.0000x**) |
+| fsyncs per hour | 94 | 26 (1 per field inode + 2 per aux writer + 1 per DISTINCT dir) |
 
 Codec cost at production scale (release build, this machine): decoding one full
 GFS forecast hour (1440 x 720, 22 fields) takes **~1.0 s** from the simple-packed

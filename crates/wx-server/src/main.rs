@@ -17,8 +17,9 @@ use wx_ingest::config::{load_config, startup_wind_preflight};
 use wx_ingest::pipeline::Pipeline;
 use wx_ingest::state::now_ns_marker;
 use wx_server::httpapi::{ServerState, build_router};
-use wx_server::stats::{new_stats, mono_ns};
+use wx_server::stats::{new_stats_with, mono_ns};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 /// Resolve the config path: --config flag wins, then WXPOINT_CONFIG.
 #[allow(clippy::needless_return)]
@@ -103,7 +104,9 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
         }
     }
 
-    let stats = new_stats();
+    // Stats share the Pipeline's LIVE counter mirror from birth (V1.2 phase B),
+    // so /metrics reflects ingest progress DURING a scan round, not only after it.
+    let stats = new_stats_with(p.live.clone());
     let cfg_models = Arc::new(p.models.clone());
     let st = ServerState {
         index: p.shared.clone(), // same ArcSwap the ingest thread publishes through
@@ -111,6 +114,28 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
         models_cfg: cfg_models,
     };
     let app = build_router(st);
+
+    // --- LIVE progress printer (V1.2 phase B): prints the pipeline's newest
+    // per-file line ("ingested <file>: G groups, W bytes, X ms", or an
+    // ignore/failure note) whenever `progress_seq` advances. It runs on its OWN
+    // thread because the ingest thread is blocked inside `scan_round` while
+    // those lines are produced, which is exactly when operators want them.
+    let live_p = p.live.clone();
+    let _printer = spawn(move || {
+        let mut seen: u64 = 0;
+        loop {
+            let seq = live_p.progress_seq.load(Ordering::Relaxed);
+            if seq != seen {
+                seen = seq;
+                let m = live_p.last_msg.lock();
+                match m {
+                    Err(_) => {}
+                    Ok(g) => { println!("{0}", g.clone()); }
+                }
+            }
+            unsafe { usleep(100000); } // 0.1 s polling granularity
+        }
+    });
 
     // --- ingest side: dedicated plain thread, OUTSIDE the tokio runtime
     let interval_ns = (interval_secs as i64) * 1000000000;
@@ -122,6 +147,9 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) {
             if n > 0 {
                 println!("scan_round ingested {0} file(s)", n);
             }
+            // Back-compat absolute store (also monotone-merged into the live
+            // mirror; see QueryStats.set_ingest). The per-FILE live mirror is
+            // what makes /metrics move mid-round.
             stats.set_ingest(p.counters.errors, p.counters.ingested_files,
                         p.counters.skipped_messages, p.counters.last_mtime_ns);
             while printed_logs < p.log.len() {

@@ -1530,3 +1530,158 @@ across 5 new binaries), executed twice back-to-back with identical results, PLUS
 flaky binary) after the monotonic-clock change. `cargo clippy --workspace -- -D warnings`:
 rc=0, zero diagnostics (vendored-`bitflags` future-incompat NOTE only; NEVER `-q`).
 `AUDIT_1.1.md` left UNTRACKED and untouched (origin unknown; not trusted, not deleted).
+
+# V1.2 phase B decisions — ingest loop restructure (chunked decode, write-once grouping, poison quarantine)
+
+Audit anchors verified in the then-current source before touching anything: `scan_round`
+decoded EVERY eligible file of a model in ONE `pool.install` call and only then wrote;
+`store_plane` merged + wrote the field file, rewrote `manifest.json` and published
+PER MESSAGE (78 plane serializations per GFS hour, 22 field renames + 22 manifest
+renames per file); the Err branch recorded NOTHING in `state`, so a corrupt file was
+re-decoded (and re-counted as an error) on every round; wind pairs were only removed from
+the pending map when BOTH components arrived, so an orphan silently persisted across
+messages with no note; progress/metrics surfaced only AFTER a whole round.
+
+## 1. Chunked decode: new key `[ingest].decode_batch_files` (default 4, validated >= 1)
+
+K bounds how many candidate files are DECODED before ANY is written. Cross-file
+parallelism is preserved INSIDE a chunk (one rayon pass), peak decode RAM is ~K files,
+and the FIRST queryable output lands after the first file of the first chunk instead of
+after the slowest file of the whole directory. Documented in `config.example.toml` and
+README §2; rejected at startup with `ingest.decode_batch_files must be >= 1`.
+
+## 2. Per-FILE consumption, in this order
+
+```
+candidates -> ordered list -> chunks of K
+  per chunk: magic precheck (non-GRIB -> kind=IGNORED, never decoded)
+             one rayon decode pass over the surviving K
+             per result:
+               Err  -> kind=FAILED record WITH content hash (error counted ONCE
+                       per new/changed hash, never once per round)
+               Ok   -> ingest_file(): pair winds (map scoped to THIS file, drained
+                        at end: orphans noted + counted as skips, removed)
+                     -> group planes by (epoch, param_key, level_code, fh_secs)
+                     -> merge_write_field_batch ONCE per GROUP (dir fsync deferred)
+                     -> registry_put per group; manifest ONCE per affected run
+                     -> TouchedDirs.flush ONCE; publish ONCE
+                     -> state upsert + save; live counters; progress line
+```
+
+Group key extends the WindPending-style keying with the RUN EPOCH because ONE file can
+carry TWO runs (`tests/fixtures/frac_small.grib2`). Levels inside a group keep caller
+order, so `merge_field`'s documented "first entry wins" rule applies inside a group too.
+
+## 3. Publish granularity: per FILE, not per message
+
+Spec §4.5 ("a run becomes visible forecast hour by forecast hour") stays satisfied because
+products arrive per forecast hour. This also closes most of the transient-422 window
+documented in §9: a file's groups all become visible together rather than one message
+at a time.
+
+## 4. Poison quarantine
+
+* `FileRec` gained `kind: u8` (0 OK / 1 IGNORED / 2 FAILED) with `#[serde(default)]`
+  so pre-V1.2 `files.json` files (no `kind` key) still load as OK. The hand-written
+  serializer emits `"kind":N`.
+* `state::head_is_grib()` mmaps FOUR bytes: a glob-matching sidecar (`.idx`, `.xml`)
+  never reaches the decoder. An unreadable/short file writes NO record (retried).
+* FAILED records carry the content hash, so the existing "unchanged (size,mtime,hash)"
+  check makes rounds 2..N free of re-decodes; mutating the file re-arms exactly ONE
+  retry and exactly ONE more error.
+
+## 5. Failure propagation
+
+Any GROUP whose write fails (simulated ENOSPC via read-only level dir): the other groups
+of that file stay written (each group is atomic on its own), the SOURCE FILE is NOT
+upserted so the NEXT round retries it idempotently, and `errors` advances ONCE for the
+file-with-failure, not once per failed group. No `.tmp.` litter (phase-A unlink-on-failure
+still applies). A `TouchedDirs.flush()` failure marks the file failed the same way
+(parity with the V1.1 per-write dir fsync).
+
+## 6. Live counters (`Pipeline.live: Arc<LiveCounters>`)
+
+`IngestCounters` gained `ignored_files`, `quarantined_files`, `groups_written`;
+`LiveCounters` mirrors them plus `progress_seq` and `last_msg` as relaxed atomics,
+updated after EVERY consumed file. `QueryStats.attach_live`/`new_stats_with` share the
+pipeline's Arc; `/metrics` renders `max(legacy store, live)` so a scan round in flight
+is visible immediately. New gauges: `wxpoint_ignored_files_total`,
+`wxpoint_quarantined_files_total`, `wxpoint_ingest_groups_written_total`.
+`set_ingest` keeps its absolute-store contract (back compat) and additionally merges
+monotonically into the mirror; `add_ingest(...)` is the delta API for embedders that do
+NOT hold the pipeline Arc. `main` spawns a printer thread that prints
+`ingested <file>: G groups, W bytes, X ms` whenever `progress_seq` advances — the only
+way to get truly mid-round lines without a callback type shared across packages.
+
+## 7. Tests added (names)
+
+* `crates/wx-ingest/tests/ingest_grouping.rs` — `one_file_writes_groups_once_not_messages`:
+  gfs_small (39 messages, 36 stored) -> 18 field files, renames == 18+grid.bin+manifest
+  == 20 (< 39), BYTES_WRITTEN delta == final store size EXACTLY, fsyncs ==
+  fields + 2 aux writers + 6 DISTINCT dirs + 2 per state save; values unchanged
+  (TMP@850 f006 node == 421 exact-node).
+* `crates/wx-ingest/tests/ingest_perf_grouping.rs` — `perf_hour_costs_eight_group_writes_not_twenty_two`
+  (skips when `tests/perfdata` absent): renames 10 then 9 per hour, 16 field files,
+  bytes <= 1.1x final store (measured 1.0000x), prints the MEASURE line used below.
+* `crates/wx-ingest/tests/poison_quarantine.rs` — `poison_files_are_quarantined_not_retried`:
+  good + `.idx` sidecar + truncated GRIB; rounds 2..5 re-decode NOTHING and add no
+  errors; mutating the truncated copy re-attempts exactly once; restart preserves
+  kind=IGNORED/FAILED and adds no new error; `files.json` carries the kind column.
+* `crates/wx-ingest/tests/disk_full_retry.rs` — `unwritable_group_dir_fails_once_and_retries_cleanly`:
+  read-only level dir (libc chmod) -> ONE error, NO state record, NO `.tmp.` litter,
+  unwritable field absent from disk AND index while writable groups landed; chmod back
+  -> full retry ingests and answers 421.
+* `crates/wx-ingest/tests/restart_midchunk.rs` — `per_file_saves_make_a_midchunk_restart_partial`:
+  K=2 with three files (chunks [a,b] then [c]), ONE publish each; truncating the on-disk
+  state to the saved prefix leaves exactly ONE file to re-ingest after reopen; also gates
+  `decode_batch_files = 0` failing config validation.
+* `crates/wx-ingest/tests/wind_orphan.rs` — `orphan_wind_components_are_drained_per_file`:
+  new fixture `tests/fixtures/hrrr_orphan.grib2` (first four messages of hrrr_small: TMP x2
+  + UGRD x2, no VGRD) -> both pending entries noted as ORPHANS, counted as skips, REMOVED,
+  UGRD never stored; the next file pairs normally (no leak) and stores earth-relative
+  (header flag bit1 clear); the sticky pair rule logs ONE violation note plus at most
+  ONE skip note per file.
+Existing concurrency tests (`concurrency_http.rs`, `concurrency.rs`) stayed green under the
+new publish cadence.
+
+## 8. Measured before/after (this machine, release build, perf dataset)
+
+BEFORE numbers were measured, not estimated: a detached worktree of the pre-phase-B
+HEAD ran the identical harness (`zz_measure.rs`, deleted afterwards).
+
+| metric | BEFORE (per-message writes) | AFTER (K=4 default) | AFTER (K=1) |
+|---|---|---|---|
+| first-queryable (/ready) | 8276 ms | 4047 / 4083 ms | 4971 ms |
+| last forecast hour visible | 9435 ms | 4568 ms | 5683 ms |
+| server CPU time | 7.55 s | 4.2 s | 4.2 s |
+| peak RSS (VmHWM) | 362 MB | 421-437 MB | 177-223 MB |
+| renames / GFS hour | 45 (then 44) | 10 (then 9) | same 10/9 |
+| bytes written vs final store | 647.0 MB vs 182.5 MB (**3.55x**, 78 plane serializations where 8 suffice) | 182.48 MB vs 182.48 MB (**1.0000x**) | same |
+| fsyncs / GFS hour | 94 | 26 | 26 |
+
+Decode cost itself is untouched (same decoder, same pool); the wall-time win comes from
+publishing after the first file of a chunk instead of after the slowest file of the
+directory, and the CPU win from removing ~4x redundant plane serialization.
+
+## 9. Surprises / deviations worth remembering
+
+* Peak RSS went UP (+15%) at the default K=4 versus the old code: grouping keeps a
+  file's planes resident until its GROUP is written, whereas the old path streamed each
+  plane out immediately. K is the knob (K=1 measures BELOW the old profile).
+* Wind components dropped by the sticky pair rule now increment `skipped_messages`
+  (previously silent), and orphaned components are noted. Counter semantics documented
+  in README §"Metrics"; no existing test asserted those counts.
+* In these fixtures the grid-relative flag lives in section 3 of the WIND messages only
+  (`scripts/gen_grib2.py` passes `wind_grid=True` for UGRD/VGRD), so a pair-rule violator
+  still stores TMP. Behavior is identical to V1.1; the test comments say so.
+* `wx_core::storage::open_field()` on a field file written EARLIER IN THE SAME PROCESS
+  returns "mmap failed" here; the product path opens mmaps only in a fresh process
+  (warm start), so this is a test-harness limitation, not a storage bug. The wind test
+  therefore reads the header BYTES (flags byte at offset 22) instead.
+* `state.save()` runs once per consumed FILE plus once at round end; the round-end save
+  is kept so an all-skip round still persists IGNORED/FAILED verdicts.
+
+## Gate
+
+`cargo test --workspace` green twice back-to-back (54 binaries, 0 failed), `cargo clippy
+--workspace -- -D warnings` rc=0.

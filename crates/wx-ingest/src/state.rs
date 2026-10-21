@@ -26,7 +26,25 @@ pub struct FileRec {
     pub size: u64,
     pub mtime_ns: i64,
     pub hash: String, // 16 hex chars
+    /// Record KIND (V1.2 phase B poison quarantine):
+    ///   0 = OK      — ingested successfully; skipped until content changes.
+    ///   1 = IGNORED — magic-byte precheck failed (NOT a GRIB2 stream, e.g. a
+    ///                 `.idx` sidecar matching the model glob): never decoded,
+    ///                 logged ONCE, never retried until content changes.
+    ///   2 = FAILED  — decode error; quarantined WITH its content hash so a
+    ///                 corrupt file is not re-decoded every scan round; retried
+    ///                 only when the content hash changes.
+    /// `#[serde(default)]` keeps pre-V1.2 `files.json` (no `kind` key) loadable:
+    /// absent means 0 = OK, exactly what those records always were.
+    #[serde(default)]
+    pub kind: u8,
 }
+
+/// Record-kind constants (kept as named values: the pipeline and tests both
+/// speak in them instead of bare integers).
+pub const REC_OK: u8 = 0;
+pub const REC_IGNORED: u8 = 1;
+pub const REC_FAILED: u8 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateDoc {
@@ -81,6 +99,7 @@ impl StateStore {
                 r.size = rec.size;
                 r.mtime_ns = rec.mtime_ns;
                 r.hash = rec.hash;
+                r.kind = rec.kind;
                 return;
             }
         }
@@ -172,6 +191,33 @@ pub fn content_hash_file(path: &str) -> Result<String, String> {
     }
 }
 
+/// Magic-byte precheck (V1.2 phase B): true when the file starts with ASCII
+/// `GRIB`. Cheap because it mmaps the file and inspects FOUR BYTES, and it runs
+/// BEFORE any decode so a non-GRIB candidate that matches a model's glob (a
+/// `.idx`/`.xml` sidecar delivered next to the product is the common case) can
+/// NEVER reach the decoder. Returns None when the file cannot be opened or is
+/// shorter than 4 bytes (both are "not decodable" answers, distinct from a
+/// GRIB-headed file that fails later inside section 7).
+pub fn head_is_grib(path: &str) -> Result<bool, String> {
+    let f = File::open(&path);
+    match f {
+        Err(_) => { return Err("open failed".to_string()); }
+        Ok(h) => {
+            let m = unsafe { Mmap::map(&h) };
+            match m {
+                Err(_) => { return Err("mmap failed".to_string()); }
+                Ok(region) => {
+                    if region.len() < 4 {
+                        return Ok(false);
+                    }
+                    return Ok(region[0] == 0x47 && region[1] == 0x52 &&
+                               region[2] == 0x49 && region[3] == 0x42);
+                }
+            }
+        }
+    }
+}
+
 /// stat() surface used for stability + records: (size, mtime ns since epoch).
 pub fn stat_size_mtime(path: &str) -> Result<(u64, i64), String> {
     match metadata(&path) {
@@ -219,8 +265,8 @@ pub fn serialize_text(doc: &StateDoc) -> String {
 }
 
 fn esc_rec(r: &FileRec) -> String {
-    return format!("{{\"path\":\"{}\",\"size\":{},\"mtime_ns\":{},\"hash\":\"{}\"}}",
-        esc_json_str(&r.path), r.size, r.mtime_ns, r.hash);
+    return format!("{{\"path\":\"{}\",\"size\":{},\"mtime_ns\":{},\"hash\":\"{}\",\"kind\":{}}}",
+        esc_json_str(&r.path), r.size, r.mtime_ns, r.hash, r.kind);
 }
 
 /// Parse state JSON text written by serialize_text.
