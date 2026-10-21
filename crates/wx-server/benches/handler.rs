@@ -193,7 +193,7 @@ pub fn bench_handler(c: &mut Criterion) {
     println!("handler-level percentiles (no HTTP, warm page cache):");
     println!("{0}  p50={1} us  p90={2} us  p99={3} us  max={4} us",
              "", p50, p90, p99, samples[n - 1]);
-    println!("{0}  mean={1} us  single-thread throughput={2} Mops/s",
+    println!("{0}  mean={1} us  single-thread throughput={2} ops/s",
              "", (total_us as f64) / (n as f64),
              (n as f64) / ((total_us as f64) / 1000000.0));
     if sink == 0usize && n == 0usize {

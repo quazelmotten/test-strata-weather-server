@@ -125,13 +125,24 @@ U6="$BASE/v1/point?model=hrrr&param=TMP&level=isobaric:850&lat=35.009136&lon=-96
 U7="$BASE/v1/point?model=nope&param=TMP&level=isobaric:1000&lat=0&lon=0&valid=$RUN"
 U8="$BASE/v1/point?model=gfs&param=TMP&level=isobaric:1&lat=39.875&lon=25.0&valid=$RUN"
 
-# sanity: every URL answers with its expected class before hammering
+# sanity: every URL answers with its expected class before hammering.
+# NOTE: ingest publishes field-by-field (spec 4.5 incremental visibility), so
+# between /ready and full publication a level stack can be momentarily PARTIAL
+# and a 200-class URL legitimately answers 422 level_out_of_range. Wait each
+# URL out instead of racing the publisher (the documented transient-publish
+# window; see docs/DECISIONS.md). Worst case 15 s per URL.
 expect=(200 200 200 200 200 200 404 422)
+urls=("$U1" "$U2" "$U3" "$U4" "$U5" "$U6" "$U7" "$U8")
 idx=0
-for u in "$U1" "$U2" "$U3" "$U4" "$U5" "$U6" "$U7" "$U8"; do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$u")
+for u in "${urls[@]}"; do
+  code=000
+  for t in $(seq 1 75); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "$u")
+    [ "$code" = "${expect[idx]}" ] && break
+    sleep 0.2
+  done
   if [ "$code" != "${expect[idx]}" ]; then
-    echo "FAIL: url idx $idx status $code != ${expect[idx]}"; PASS=0
+    echo "FAIL: url idx $idx status $code != ${expect[idx]} (after 15 s)"; PASS=0
   fi
   idx=$((idx+1))
 done

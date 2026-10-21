@@ -1129,3 +1129,108 @@ interning tables added). Retention/index semantics untouched.
 
 `cargo test --workspace`: green (95 tests; +4 over phase 4's 91).
 `cargo clippy --workspace -- -D warnings`: rc=0.
+
+# V1.1 phase 6 — docs finalization + acceptance sweep
+
+Scope: documentation plus a FULL acceptance sweep. NO product-behaviour changes;
+the two fixes the sweep forced are both non-product (script + bench print label),
+listed below.
+
+## Acceptance sweep results (AMD EPYC 7402, rustc 1.99.1, oha 1.16.0, kernel 7.0.0-31)
+
+| Step | Result |
+|---|---|
+| `bash scripts/gen_fixtures.sh` | rc=0; 17 twin/checksum assertions ok (c3/jpeg/aec/ieee/png/png_f per model + stat jpeg + unsupported_drt guard + perf jpeg twin); md5s of all 20 `tests/fixtures/*.grib2` IDENTICAL across two consecutive runs → idempotent; 17.2 s wall |
+| `cargo test --workspace` | rc=0; **95 passed / 0 failed across 38 test binaries**; 68.6 s |
+| `cargo clippy --workspace -- -D warnings` | rc=0; zero lint diagnostics (only cargo's future-incompat NOTE about vendored `bitflags` 0.4.0/0.7.0, not a lint). Scope note: the documented gate is workspace lib+bin targets. Probing wider (`--all-targets`) surfaces PRE-EXISTING lint debt in wx-core test/bench code (`assertions_on_constants` from the `assert!(false)` idiom, `needless_return`, …) — 93 diagnostics, none in product code, none introduced this phase; left alone because fixing them would touch test bodies during a docs phase. |
+| `cargo bench --workspace` | rc=0; medians: regular lat/lon project **20.430 ns**, LCC project **86.187 ns**, bilinear heap slab **30.746 ns**, bilinear mmap field **32.663 ns**, index point query **136.62 ns** (+2.0% vs the phase-5 record 135.0 ns — inside the ±2% session band; criterion flagged the change as noise-level), handler parse+lookup+render **681.74 ns** (`-p wx-server` re-run same session: 699.05 ns); handler percentile pass p50=p90=p99=**1 µs**, max 60 µs, mean 1.0068 µs, ≈**993k ops/s** single-thread |
+| `bash scripts/smoke.sh` | **SMOKE PASS**; 17 `probes.tsv` ground-truth probes replayed, **0 failures**; ready after 10 s; release avg point-query latency **18.6 µs** over 422 queries |
+| `bash scripts/loadtest.sh 20` | portable: **287,451 req/s** then **286,342 req/s** (two runs); server-side n = 5,752,100 / 5,730,170, mean **9.4 µs**, p50 ≤**10 µs**, p99 ≤**50 µs** → §8 targets MET; `NATIVE=1`: **281,305 req/s**, mean **9.9 µs** (MET, still NOT better than portable) |
+| `python3 scripts/validate_rotation.py` | rc=0; 42 expected-angle rows (21 sphere CT 3.2 = 6 + 21 oblate CT 3.2 = 3 inline WGS 84) → `tests/fixtures/rotation_expected.csv`; Rust cross-check worst delta **4.80469e-11 deg** against a 1e-6 deg tolerance |
+| extra pole probe (docs evidence) | on the full-geometry GFS fixture: `lat=90` → 422 `out_of_domain`, `lat=89.9` → 422, `lat=-90` → 422, `lat=89.875` → 200 exact node (value 250 K) — pins the README §9 true-pole caveat on measured behaviour |
+
+## Minimal fixes made during the sweep (non-product)
+
+* `scripts/loadtest.sh`: its pre-hammering sanity probe fired ONCE per URL and
+  raced the field-by-field publisher — the HRRR 200-class URL answered 422 while
+  its level stack was still PARTIAL, aborting an otherwise valid run. Each URL is
+  now waited out (bounded 15 s) before hammering. Product behaviour untouched; the
+  publish window itself remains documented (README §9) and is what the retry exists
+  for.
+* `crates/wx-server/benches/handler.rs` printed single-thread throughput with the
+  unit `Mops/s` while computing ops/s (it rendered "993260 Mops/s"). Label corrected
+  to `ops/s`; measurement code and numbers untouched.
+
+## Publish granularity: decision kept, follow-up named (audit item)
+
+DECISION: keep publish-after-every-field-store. WHY: spec §4.5 requires a run to
+become visible forecast-hour by forecast hour as each completes, and per-field
+publish satisfies that at the finest granularity with one `arc-swap` per field
+store (no batch staging, no lock, no window where a whole group is withheld).
+CONSEQUENCE accepted: the transient 422 `level_out_of_range` window for NON-STORED
+levels mid-file. Evidence it is bounded and self-healing: `concurrency_http.rs`
+counts those separately (`transient_422`) instead of asserting them away, requires
+zero 5xx and zero torn JSON bodies, and a settled-state batch proves they are
+gone once ingest finishes. FOLLOW-UP if ever needed: coarsen publish to per-(param,
+forecast-hour-group) — needs a staged snapshot builder that publishes a whole group
+at once, delaying first visibility of a field by up to one group. NOT taken: nothing
+in §4.5 or §8 asks for it and current behaviour is spec-correct.
+
+## DRT 5.1 rejection rationale (audit item)
+
+GRIB2 Code Table 5.0 contains NO dictionary template: 5.0 simple packing, 5.2
+complex packing, 5.3 complex + spatial differencing, 5.200 run length packing,
+5.4 IEEE float, 5.40 JPEG2000, 5.41 PNG, 5.42 CCSDS AEC. So the task text's
+"5.1 dictionary" names something that does not exist, and its "5.1 runlength" is
+mis-numbered 5.200 (which we DO implement). DECISION: return typed
+`UnsupportedData(1)` for template 5.1 rather than write a decoder, because (a)
+there is no reference encoder OR decoder anywhere in the wgrib2 ecosystem to
+validate against — any implementation would be unverifiable fiction, and (b)
+guessing a template mapping risks wrong NUMBERS, which correctness-first forbids.
+Evidence the rejection is real rather than assumed: `tools/wgrib2-full` itself
+refuses to emit DRT 5.1, and the guard fixture `tests/fixtures/unsupported_drt.grib2`
+declares it by hand so `dictionary_packing_rejected_with_typed_error` pins the
+typed error end-to-end. Corrupt or unsupported section 7 stays a LOUD ingest ERROR
+(not a skip), so the guard can never be silently downgraded into the skip-and-note
+path (`robust_skips.rs`).
+
+## Docs finalization decisions (this phase)
+
+* README §9 LIMITATIONS narrowed to exactly five categories: §13 out-of-scope list;
+  the typed-rejection list (one-line rationale each); the §9.3 environment block
+  (pointer here + `scripts/validate_rotation_wgrib2.sh` stub); the transient-publish
+  window; the ±90 fixture caveat. Claims that JPEG2000 / PNG / AEC / fractional
+  forecast hours are limitations were REMOVED — they are implemented and tested
+  (phases 2–3), and leaving them listed would misrepresent the build.
+* README §8 became a TABLE: 9 rows, one per spec §9 requirement, each naming the
+  test functions, the truth source (wgrib2 `-lon` / `-ll2ij` / `-checksum data`,
+  pyproj, analytic grids) and the tolerance.
+* New README §10 decision log summarizes V1.1 choices; docs/DECISIONS.md stays the
+  full per-phase record.
+* `stat_ranges` visibility documented WHERE they actually are (per forecast hour in
+  `manifest.json`), with an explicit note that `/v1/inventory` exposes only
+  `stat_processed`/`stat_kind` plus decimal forecast hours — documentation follows
+  the code, not the other way round.
+* Metrics section documents `wxpoint_skipped_messages_total` and states it never
+  increments `wxpoint_ingest_errors_total`.
+
+## Gate
+
+`cargo test --workspace`: green (**95 tests / 38 binaries**, unchanged from phase 5).
+`cargo clippy --workspace -- -D warnings`: rc=0.
+Tag: `v1.1`.
+
+# V1.1 scope statement — AGENTS.md requirements, met how
+
+| § | Requirement | Where met |
+|---|---|---|
+| 3 | Single TOML config, param→(discipline,category,number) table incl. the 13 named params + raw triples, level-type → CT 4.5 mapping, loud startup validation | `config.example.toml`; `wx-core/src/tables.rs` param/level tables; `config_validate.rs` (unknown param/level/retention/dupes fail with named messages) |
+| 4 | Discovery (notify + periodic scan), stability window or sidecar, persistent ingest record with content hash, GRIB-template decode coverage, never trust filenames, skip-unpack for unconfigured params, bitmap→NaN, PDT 4.0 + 4.8 with process type and time ranges, parallel rayon ingest off the HTTP runtime, grid templates 3.0 + 3.30 with seam wrap and N→S scan flags, LCC forward transform with precomputed constants and CT 3.2 earth shapes, longitude normalization, wind rotation to earth-relative + single-component config failure, storage layout with atomic writes and per-fh visibility, retention after index removal | `pipeline.rs` (watch+scan, `stability.*`, `state/files.json` FNV-1a64 record), `grib2.rs` (DRT 5.0/5.2/5.3/5.200/5.4/5.40/5.41/5.42, sec-4-before-sec-7 filter, bitmap→NaN, PDT 4.0/4.8 + ranges), `grid.rs` (regular + Lambert, inline axes), `store.rs`/`fsync_path` (temp→fsync→rename→dir fsync), `retention.rs`, `preflight_windpair.rs` + `check_wind_pair`; proven by `stability.rs`, `packing_twins.rs`, `checksum_parity.rs`, `skip_unpack_counters`, `stat_pdt.rs`, `restart.rs`, `retention.rs`, `parallel_decode.rs` |
+| 5 | Read-mostly index published with arc-swap, all mmaps opened at index build, hot path lock-free and allocation-free beyond the response body | `index.rs` + `arc-swap`; `hotpath_alloc.rs` and `hotpath_full_alloc.rs` (counting allocator: ZERO allocations over 20k queries) |
+| 6 | Bilinear horizontal (exact-node shortcut, no extrapolation, NaN→null), linear vertical in the level coordinate with bracket echo and no extrapolation, linear time between forecast hours of ONE run with stat-field guard and `time_interp=none`, order H→V→T in f64 | `query_point` / `resolve_levels*` / `resolve_field_times` + `time_lerp`; seconds-based fh math; covered by `kernels.rs`, `alloc_free_kernels.rs`, `alloc_free_select.rs`, `stat_pdt.rs` |
+| 7 | `/v1/point` parameter set and JSON shape, native units, null-with-reason, 400/404/422 error classes, `/v1/models`, `/v1/inventory`, `/health`, `/ready`, Prometheus `/metrics` | `httpapi.rs` + `queryapi.rs` + `stats.rs`; `point_http.rs`, `meta_json.rs`, `frac_http.rs`, smoke probe replay |
+| 8 | p50 < 50 µs / p99 < 250 µs server-side, ≥50k req/s on 8 cores, one GFS forecast hour queryable within seconds of file stability, criterion benches, load-test script, release profile with lto=fat/codegen-units=1/panic=abort, target-cpu=native measured and documented | measured repeatedly (§7 of README): p50 ≤10 µs, p99 ≤50 µs, 286–287k req/s, first-queryable 3.9 s; `benches/{kernels,query_index,handler}.rs`, `scripts/loadtest.sh`, root `Cargo.toml` profiles; native variant measured WORSE and NOT shipped |
+| 9 | The nine correctness verifications, wgrib2/pyproj truth sources, fixtures under version control + regeneration script | README §8 map table (9/9 rows); `tests/fixtures/*` + `scripts/gen_fixtures.sh` (idempotent, checksum-equal twins) + `scripts/regen_expected.sh` + `scripts/validate_rotation.py`; the ONLY spec item not run as written is §9.3's IPOLATES golden (environment-blocked, replaced by pyproj dual-shape check) |
+| 10 | Suggested workspace layout with async/HTTP-free `wx-core`, benches/, tests/, config.example.toml, README | `crates/wx-core` (memmap2 only; rayon/serde confined to tests/benches), `crates/wx-ingest`, `crates/wx-server`, `benches` inside each crate, `tests/`, `config.example.toml`, this README |
+| 11 | Each milestone leaves `cargo test` and `cargo clippy -- -D warnings` passing | every phase gate above records rc=0; phase 6 sweep re-confirms 95 tests green and clippy clean |
+| 12 | Deliverables: building workspace, example config, README covering setup/config/API/storage/interpolation/benchmarks/limitations, list of ambiguity decisions | this repo: builds on stable rustc 1.99.1; `config.example.toml` covers GFS + HRRR; README §§1–10; ambiguities in docs/DECISIONS.md (per phase) + README §10 |
