@@ -1,70 +1,223 @@
 #!/usr/bin/env bash
-# MANUAL, NOT PART OF CI. Optional helper to close the one honesty gap in README
-# section 8: every automated test uses SYNTHETIC fixtures whose ground truth is
-# wgrib2 reading those same files. This script pulls a SMALL slice of a REAL NWS
-# product from the public `aws-nws` S3 bucket so the same probes can be replayed
-# against production bytes. Requires network access; nothing else in this repo
-# touches the network (spec 13: ingest only reads local directories).
+# ============================================================================
+# MANUAL, NETWORK — NOT PART OF CI.
 #
-#   scripts/fetch_real_sample.sh [MODEL]     # MODEL = gfs (default) | hrrr
+# Fetches SMALL, targeted slices of REAL NWS model output so the point-query
+# server can be validated against production bytes (spec §9 ground truth),
+# not just the synthetic fixtures whose correctness bar is "wgrib2 agrees with
+# us about our own generated files".
 #
-# Downloads a RANGE-limited prefix (a truncated GRIB2 is legal input for wgrib2:
-# it stops at the truncation) into tests/realsample/ (gitignored), prints the
-# record list, and shows how to point a wxpoint config at it.
+# Method: every NOMADS file has a sibling `.idx` giving the byte offset of
+# each GRIB message. We download ONLY the .idx, pick the messages we care
+# about by parameter/level, and HTTP-Range-extract exactly those byte spans
+# (a few MB total instead of hundreds). Each extracted file is a legal GRIB2
+# stream because messages are self-delimiting.
+#
+#   scripts/fetch_real_sample.sh            # fetch everything below
+#   KEEP=1 scripts/fetch_real_sample.sh     # keep raw .idx files for debugging
+#
+# Environment overrides (defaults = the Oct 22 2026 live-fire configuration):
+#   GFS_YMD=20261021 GFS_HH=12   HRRR_YMD=20261022 HRRR_HH=00
+#   BASE=https://nomads.ncep.noaa.gov/pub/data/nccf/com
+#
+# Outputs land in tests/realdata/ (GITIGNORED — fetched data is NEVER
+# committed). The script is IDEMPOTENT: an existing output that starts with
+# GRIB, ends with 7777, and is non-empty is verified and left alone.
+#
+# crates/wx-ingest/tests/realdata_gate.rs consumes this directory and SKIPS
+# cleanly (with a printed reason) whenever it is absent, so CI never touches
+# the network while a developer box can pin live-byte behaviour on demand.
+# Nothing else in this repo touches the network (spec §13).
+# ============================================================================
 set -u
 cd "$(dirname "$0")/.."
 
-MODEL=${1:-gfs}
-MAX_BYTES=${MAX_BYTES:-8388608}          # 8 MiB prefix keeps this a few-MBs affair
-OUT=tests/realsample
+BASE=${BASE:-https://nomads.ncep.noaa.gov/pub/data/nccf/com}
+GFS_YMD=${GFS_YMD:-$(date -u -d 'yesterday' +%Y%m%d 2>/dev/null || echo 20261021)}
+GFS_HH=${GFS_HH:-12}
+HRRR_YMD=${HRRR_YMD:-$(date -u +%Y%m%d 2>/dev/null || echo 20261022)}
+HRRR_HH=${HRRR_HH:-00}
+OUT=tests/realdata
 WG=${WG:-tools/wgrib2-full}
+CURL_TIMEOUT=${CURL_TIMEOUT:-120}
 mkdir -p "$OUT"
 
-case "$MODEL" in
-  gfs)
-    # 1.5-degree GFS product: much smaller than 0.25-degree, same template family
-    # (regular lat/lon, template 3.0, JPEG2000 packing 5.40). Pick a recent cycle
-    # by hand -- YYYY-MM-DD and HH below.
-    YYYY_MM_DD=${YYYY_MM_DD:-2026-10-19}
-    HH=${HH:-12}
-    url="https://storage.googleapis.com/noaa-gfs-bdp-pds/gfs/${YYYY_MM_DD}/${HH}/gfs.t${HH}z.pgrb2.1p50.f000"
-    fn="gfs.t${HH}z.pgrb2.1p50.f000.partial.grib2"
-    ;;
-  hrrr)
-    YYYY_MM_DD=${YYYY_MM_DD:-2026-10-19}
-    HH=${HH:-00}
-    url="https://storage.googleapis.com/noaa-hrrr-pds/hrrr/${YYYY_MM_DD}/${HH}/hrrr.t${HH}z.wrmaf.f000.grib2"
-    fn="hrrr.t${HH}z.wrmaf.f000.partial.grib2"
-    ;;
-  *) echo "usage: $0 [gfs|hrrr]"; exit 2;;
-esac
+GFS_DIR="$BASE/gfs/prod/gfs.$GFS_YMD/$GFS_HH/atmos"
+HRRR_DIR="$BASE/hrrr/prod/hrrr.$HRRR_YMD/conus"
+# Product stem on the nccf/com mirror as of Oct 2026 is wrfnatf (the live-fire
+# preserved files were named "wrfnaf" by the orchestrator's own renaming).
+HRSTEM=${HRSTEM:-wrfnatf}
 
-echo "fetching first ${MAX_BYTES} bytes of"
-echo "  $url"
-echo "  -> $OUT/$fn"
-curl -sfL --max-time 300 -r "0-$((MAX_BYTES - 1))" -o "$OUT/$fn" "$url" || {
-  echo "FATAL: download failed (no network? path moved upstream?). This script is"
-  echo "       best-effort and manual; nothing in CI depends on it."
-  exit 1
+fail=0
+
+# ---------------------------------------------------------------------------
+# verify_file NAME: magic + trailing 7777 + non-empty, else fail marker
+# ---------------------------------------------------------------------------
+verify_file() {
+    local f="$1"
+    [ -s "$f" ] || return 1
+    [ "$(head -c 4 "$f")" = "GRIB" ] || return 1
+    [ "$(tail -c 4 "$f")" = "7777" ] || return 1
+    return 0
 }
-head -c 4 "$OUT/$fn" | grep -q GRIB || { echo "FATAL: no GRIB magic bytes"; exit 1; }
-ls -l "$OUT/$fn"
 
-if [ -x "$WG" ]; then
-  echo "--- wgrib2 record list (first 40 lines; truncated file is tolerated) ---"
-  "$WG" "$OUT/$fn" 2>/dev/null | head -40
-  echo "--- data representation templates present ---"
-  "$WG" "$OUT/$fn" -G '^[0-9]+:[0-9]+:' -d ':{0}:code table 5.0=' 2>/dev/null |
-    sed 's/.*code table 5.0=\([0-9]*\).*/DRT 5.\1/' | sort | uniq -c | sort -rn | head
+# ---------------------------------------------------------------------------
+# fetch_slice OUTNAME URL PATTERN [PATTERN...]
+#   Range-extracts every message whose .idx line matches ANY PATTERN (POSIX
+#   regex matched against the whole idx line) and concatenates them.
+# ---------------------------------------------------------------------------
+fetch_slice() {
+    local name="$1"; shift
+    local url="$1"; shift
+    local out="$OUT/$name"
+    # Join the remaining PATTERN args with the @@ separator awk will split on
+    # ($* would insert spaces and corrupt the first/last patterns).
+    local pats=""
+    while [ $# -gt 0 ]; do
+        if [ -z "$pats" ]; then pats="$1"; else pats="$pats@@$1"; fi
+        shift
+    done
+
+    if verify_file "$out"; then
+        echo "== $name: present and structurally complete, keeping (idempotent)"
+        sha256sum "$out"
+        return 0
+    fi
+
+    echo "== $name: fetching .idx from"
+    echo "     $url.idx"
+    local idx="$OUT/.$name.idx.tmp"
+    if ! curl -sfL --max-time "$CURL_TIMEOUT" -o "$idx" "$url.idx"; then
+        echo "   WARN: .idx fetch failed (rotated off NOMADS? network?) — skipping $name"
+        rm -f "$idx"
+        return 0
+    fi
+
+    # Emit "start end" byte ranges; end == -1 means "to EOF". NOMADS .idx
+    # lines are RECORD:OFFSET:d=YYYYMMDDHH:PARAM:LEVEL:... — the OFFSET is
+    # the SECOND colon-separated field (reading the first yields record
+    # numbers, which silently fetches garbage: pinned by this comment after
+    # the E4a live-fire caught exactly that).
+    local ranges
+    ranges=$(awk -v pats="$pats" '
+        BEGIN { n = 0 }
+        {
+            m = index($0, ":")
+            if (m == 0) next
+            rest = substr($0, m + 1)
+            m2 = index(rest, ":")
+            if (m2 == 0) next
+            off[n] = substr(rest, 1, m2 - 1) + 0
+            line[n] = $0
+            n++
+        }
+        END {
+            split(pats, pa, "@@")
+            for (i = 0; i < n; i++) {
+                hit = 0
+                for (j in pa) if (line[i] ~ pa[j]) { hit = 1; break }
+                if (hit) {
+                    e = (i + 1 < n) ? off[i + 1] - 1 : -1
+                    printf "%d %d\n", off[i], e
+                }
+            }
+        }' "$idx")
+
+    if [ -z "$ranges" ]; then
+        echo "   WARN: no .idx line matched — skipping $name (product drift?)"
+        [ "${KEEP:-0}" = "1" ] && mv "$idx" "$OUT/$name.idx" || rm -f "$idx"
+        return 0
+    fi
+
+    local tmp="$OUT/.$name.part.tmp"
+    : > "$tmp"
+    local total=0
+    while read -r start end; do
+        [ -n "$start" ] || continue
+        local spec
+        if [ "$end" = "-1" ]; then spec="${start}-"; else spec="${start}-${end}"; fi
+        if ! curl -sfL --max-time "$CURL_TIMEOUT" -r "$spec" -o "$tmp.chunk" "$url"; then
+            echo "   WARN: range fetch failed for $name ($spec) — abandoning slice"
+            rm -f "$tmp" "$tmp.chunk"
+            fail=1
+            return 0
+        fi
+        cat "$tmp.chunk" >> "$tmp"
+        total=$((total + 1))
+    done <<< "$ranges"
+    rm -f "$tmp.chunk"
+
+    if [ "$total" = "0" ] || ! verify_file "$tmp"; then
+        echo "   WARN: assembled slice failed magic/7777 verification — dropping $name"
+        rm -f "$tmp"
+        fail=1
+        return 0
+    fi
+    mv "$tmp" "$out"
+    [ "${KEEP:-0}" = "1" ] && mv "$idx" "$OUT/$name.idx" || rm -f "$idx"
+    echo "   OK: $total message(s), $(stat -c %s "$out") bytes"
+    sha256sum "$out"
+}
+
+echo "wxpoint real-sample fetch (MANUAL / NETWORK)"
+echo "  GFS : $GFS_DIR  (run ${GFS_YMD}T${GFS_HH}Z)"
+echo "  HRRR: $HRRR_DIR (run ${HRRR_YMD}T${HRRR_HH}Z)"
+echo
+
+# --- GFS sflux family -------------------------------------------------------
+# NOTE (E4a diagnosis): the live GFS sflux messages ride grid definition
+# TEMPLATE 3.40 (3072 x 1536), NOT regular lat/lon 3.0 — our decoder skips
+# them by design (README limitations). They are fetched anyway so the skip
+# behaviour itself is pinned against production bytes.
+fetch_slice gfs_sflux_f000.grib2 \
+    "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf000.grib2" \
+    ':ACOND:' ':TMP:2 m above ground'
+fetch_slice gfs_sflux_f006.grib2 \
+    "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf006.grib2" \
+    ':UGRD:10 m above ground' ':VGRD:10 m above ground'
+fetch_slice gfs_sflux_f012.grib2 \
+    "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf012.grib2" \
+    ':HGT:' ':TMP:.*hybrid'
+
+# --- HRRR CONUS family ------------------------------------------------------
+fetch_slice hrrr_tmp2m_f00.grib2 \
+    "$HRRR_DIR/hrrr.t${HRRR_HH}z.${HRSTEM}00.grib2" \
+    ':TMP:2 m above ground'
+fetch_slice hrrr_uv10m_f06.grib2 \
+    "$HRRR_DIR/hrrr.t${HRRR_HH}z.${HRSTEM}06.grib2" \
+    ':UGRD:10 m above ground' ':VGRD:10 m above ground'
+# The zero-window accumulation: APCP with begin==end==run time, encoded with
+# an EMPTY section 7 (212 bytes total on Oct 22 2026). We take the FIRST
+# APCP:surface message of f000; the gate tolerates any size and pins the
+# all-zero degenerate semantics only when the slice really is that shape.
+fetch_slice hrrr_apcp_tight.grib2 \
+    "$HRRR_DIR/hrrr.t${HRRR_HH}z.${HRSTEM}00.grib2" \
+    ':APCP:surface'
+# Optional: PDT 4.8 instantaneous-max wind product (time-interpolation guard
+# regression material). Skipped with a warning when the product line lacks it.
+fetch_slice hrrr_windmax_f06.grib2 \
+    "$HRRR_DIR/hrrr.t${HRRR_HH}z.${HRSTEM}06.grib2" \
+    ':WIND:'
+
+echo
+echo "== checksums of everything in $OUT =="
+if ls "$OUT"/*.grib2 >/dev/null 2>&1; then
+    sha256sum "$OUT"/*.grib2
 else
-  echo "(no executable $WG here: build wgrib2-full or set WG=... to inspect records)"
+    echo "(nothing fetched — check dates/network; NOMADS keeps only recent cycles)"
 fi
 
-cat <<EOF
+if [ -x "$WG" ] && ls "$OUT"/*.grib2 >/dev/null 2>&1; then
+    echo
+    echo "== wgrib2-full inventory (reference view of the same bytes) =="
+    for f in "$OUT"/*.grib2; do
+        echo "-- $f"
+        "$WG" "$f" 2>/dev/null | head -8
+    done
+fi
 
-Next steps (manual): make a config whose [[models]] ingest_dir points at
-$OUT with a file_glob matching the fetched name, start the server, then compare
-/v1/point answers against '$WG -lon <lon> <lat>' on the same file, exactly like
-scripts/validate_realistic.py does for the synthetic realistic dataset. A
-truncated prefix only exercises the messages that fit inside it.
-EOF
+echo
+echo "Done. With data present, 'cargo test -p wx-ingest --test realdata_gate'"
+echo "activates the live-byte gates; without it they skip cleanly."
+[ "$fail" = "0" ] || echo "NOTE: at least one slice failed to assemble (see WARNs)."
+exit 0

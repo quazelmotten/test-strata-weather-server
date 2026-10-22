@@ -69,6 +69,17 @@ pub struct QueryStats {
     /// (wxpoint_stat_collisions_total; fed by the LIVE mirror only — the
     /// legacy setters predate this counter).
     pub stat_collisions: AtomicU64,
+    /// V1.3 phase E4a: structural message skips broken down BY KIND —
+    /// coordinate lists, unimplemented grid templates, unimplemented product
+    /// definition templates (wxpoint_skip_coordlists_total /
+    /// wxpoint_skip_grid_total / wxpoint_skip_pdt_total). FLAT counters on
+    /// purpose: this metrics surface has no label machinery. Fed by the LIVE
+    /// mirror only, like `stat_collisions`. The three partition the
+    /// STRUCTURAL subset of wxpoint_skipped_messages_total (policy skips —
+    /// wind-pair drops, orphaned components — count in the total only).
+    pub skip_coordlists: AtomicU64,
+    pub skip_grid: AtomicU64,
+    pub skip_pdt: AtomicU64,
     /// Slot holding the ingest pipeline's LIVE counter mirror (V1.2 phase B).
     /// Detached (fresh zeros) until [`QueryStats.attach_live`] points it at the
     /// Pipeline's own `Arc<LiveCounters>`; from then on `/metrics` reflects
@@ -229,6 +240,32 @@ impl QueryStats {
         }
         out = format!("{0}{1}", out, "\nwxpoint_stat_collisions_total ");
         out = format!("{0}{1}", out, v_col);
+        // V1.3 phase E4a: structural skip tallies BY KIND (flat, no labels).
+        // A gap between these and wxpoint_skipped_messages_total is EXPECTED
+        // and meaningful: policy skips (wind pair, orphans) live only in the
+        // total; decoder-coverage gaps live here with their template numbers
+        // spelled out in the ingest log note.
+        let mut v_kc = self.skip_coordlists.load(Ordering::Relaxed);
+        let l_kc = lv.skip_coordlists.load(Ordering::Relaxed);
+        if l_kc > v_kc {
+            v_kc = l_kc;
+        }
+        out = format!("{0}{1}", out, "\nwxpoint_skip_coordlists_total ");
+        out = format!("{0}{1}", out, v_kc);
+        let mut v_kg = self.skip_grid.load(Ordering::Relaxed);
+        let l_kg = lv.skip_grid.load(Ordering::Relaxed);
+        if l_kg > v_kg {
+            v_kg = l_kg;
+        }
+        out = format!("{0}{1}", out, "\nwxpoint_skip_grid_total ");
+        out = format!("{0}{1}", out, v_kg);
+        let mut v_kp = self.skip_pdt.load(Ordering::Relaxed);
+        let l_kp = lv.skip_pdt.load(Ordering::Relaxed);
+        if l_kp > v_kp {
+            v_kp = l_kp;
+        }
+        out = format!("{0}{1}", out, "\nwxpoint_skip_pdt_total ");
+        out = format!("{0}{1}", out, v_kp);
         // V1.2 phase D: write-amplification observability straight from the wx-core
         // storage counters (renames / bytes handed to writers / fsync syscalls).
         // These are PROCESS-WIDE totals since boot, which is exactly what an ingest
@@ -327,6 +364,9 @@ pub fn new_stats_with(live: Arc<LiveCounters>) -> Arc<QueryStats> {
         groups_written: AtomicU64::new(0),
         retention_skipped: AtomicU64::new(0),
         stat_collisions: AtomicU64::new(0),
+        skip_coordlists: AtomicU64::new(0),
+        skip_grid: AtomicU64::new(0),
+        skip_pdt: AtomicU64::new(0),
         live_slot: Mutex::<Arc<LiveCounters>>::new(live),
     };
     return Arc::new(qs);
@@ -349,4 +389,25 @@ pub fn realtime_ns() -> i64 {
         clock_gettime(CLOCK_REALTIME, &mut ts);
     }
     return ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+#[cfg(test)]
+mod skip_kind_render_tests {
+    use super::*;
+
+    // V1.3 phase E4a: the three FLAT structural-skip counters must surface on
+    // /metrics from the LIVE mirror (max-merge pattern of stat_collisions),
+    // each under its own name — no label machinery.
+    #[test]
+    fn skip_kind_counters_render_from_the_live_mirror() {
+        let lv = Arc::new(LiveCounters::new_live());
+        lv.bump_skip_kinds(2, 5, 1);
+        let st = new_stats_with(lv);
+        let body = st.render_prometheus();
+        assert!(body.find("wxpoint_skip_coordlists_total 2").is_some());
+        assert!(body.find("wxpoint_skip_grid_total 5").is_some());
+        assert!(body.find("wxpoint_skip_pdt_total 1").is_some());
+        // and the pre-existing total remains independent of them (partition)
+        assert!(body.find("wxpoint_skipped_messages_total ").is_some());
+    }
 }

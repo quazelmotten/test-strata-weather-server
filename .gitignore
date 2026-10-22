@@ -6,3 +6,4 @@ tests/perfdata/
 data/
 tools/
 AUDIT_1.1.md
+tests/realdata/

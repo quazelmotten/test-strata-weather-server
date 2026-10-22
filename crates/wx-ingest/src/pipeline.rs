@@ -4,7 +4,7 @@
 //! reconcile with a full recursive scan (authoritative on network mounts).
 
 use wx_core::grid::{GridDef};
-use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times, GribErr};
+use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times, GribErr, skip_tally_text};
 use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES, glob_overlap_warnings};
 use serde_json::from_str;
 use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, STATE_VERSION, join_path};
@@ -290,6 +290,16 @@ pub struct IngestCounters {
     /// and counted here (NEVER an error). Range selection in the query API is
     /// future work (docs/DECISIONS.md V1.3 E1).
     pub stat_collisions: u64,
+    /// V1.3 phase E4a SKIP-REASON OBSERVABILITY: `skipped_messages` broken
+    /// down by structural KIND so "this product line needs grid template
+    /// 3.40" is visible on /metrics without reading logs. The three totals
+    /// partition `skipped_messages`' STRUCTURAL subset (wind-pair drops and
+    /// orphan skips keep counting only in the total — they are policy skips,
+    /// not decoder gaps; see docs/DECISIONS.md §15). Mirrored to
+    /// wxpoint_skip_coordlists_total / _grid_total / _pdt_total.
+    pub skip_coordlists: u64,
+    pub skip_grid: u64,
+    pub skip_pdt: u64,
 }
 
 /// Live mirror of the ingest counters (V1.2 phase B). The pipeline updates this
@@ -310,6 +320,13 @@ pub struct LiveCounters {
     /// group already claimed their field file within the same source file
     /// (first-in-message-order wins). Never an error; see `IngestCounters`.
     pub stat_collisions: AtomicU64,
+    /// V1.3 phase E4a: structural skip tallies BY KIND (coordinate lists /
+    /// unknown grid templates / unknown PDTs), kept FLAT (three separate
+    /// counters — no Prometheus label machinery exists in this codebase).
+    /// Together they partition the structural subset of `skipped_messages`.
+    pub skip_coordlists: AtomicU64,
+    pub skip_grid: AtomicU64,
+    pub skip_pdt: AtomicU64,
     pub last_mtime_ns: AtomicI64,
     /// Bumped once per consumed file; the printer side compares it against the
     /// last value it saw to decide whether a fresh progress line exists.
@@ -342,6 +359,9 @@ impl LiveCounters {
             groups_written: AtomicU64::new(0),
             retention_skipped: AtomicU64::new(0),
             stat_collisions: AtomicU64::new(0),
+            skip_coordlists: AtomicU64::new(0),
+            skip_grid: AtomicU64::new(0),
+            skip_pdt: AtomicU64::new(0),
             last_mtime_ns: AtomicI64::new(0),
             progress_seq: AtomicU64::new(0),
             last_msg: Mutex::<String>::new("".to_string()),
@@ -398,6 +418,15 @@ impl LiveCounters {
         let _a = self.stat_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Structural skip deltas BY KIND (V1.3 phase E4a), applied next to the
+    /// existing `skipped_messages` delta at the decode-consumption site. Flat
+    /// counters on purpose: the metrics surface has no label machinery.
+    pub fn bump_skip_kinds(self: &Self, coordlists: u64, grid: u64, pdt: u64) {
+        let _a = self.skip_coordlists.fetch_add(coordlists, Ordering::Relaxed);
+        let _b = self.skip_grid.fetch_add(grid, Ordering::Relaxed);
+        let _c = self.skip_pdt.fetch_add(pdt, Ordering::Relaxed);
+    }
+
     /// Monotone merge of ABSOLUTE values (used by `QueryStats.set_ingest`, which
     /// stores whole-counter values rather than deltas). Compare-store keeps this
     /// safe even when the pipeline has already advanced past the caller's snapshot
@@ -443,6 +472,9 @@ impl LiveCounters {
             groups_written: self.groups_written.load(Ordering::Relaxed),
             retention_skipped_files: self.retention_skipped.load(Ordering::Relaxed),
             stat_collisions: self.stat_collisions.load(Ordering::Relaxed),
+            skip_coordlists: self.skip_coordlists.load(Ordering::Relaxed),
+            skip_grid: self.skip_grid.load(Ordering::Relaxed),
+            skip_pdt: self.skip_pdt.load(Ordering::Relaxed),
         };
     }
 }
@@ -1021,7 +1053,7 @@ impl Pipeline {
             clock: MonoClock::new_clock(),
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
-            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0, stat_collisions: 0 },
+            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0, stat_collisions: 0, skip_coordlists: 0, skip_grid: 0, skip_pdt: 0 },
             live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
             wind_pair_enforce: enforce,
@@ -1733,10 +1765,32 @@ impl Pipeline {
                                 // coordinate-list / unknown-template messages counted
                                 // separately from errors and logged for operators.
                                 if dr.1.messages_unsupported > 0 {
-                                    self.note(format!("{} message(s) skipped as structurally unsupported in {}",
-                                        dr.1.messages_unsupported, rd.0));
+                                    // V1.3 phase E4a SKIP-REASON OBSERVABILITY:
+                                    // the note now says WHY by kind AND template
+                                    // number ("... : 2 skipped: 2 grid template
+                                    // 3.40"), and each kind advances its own flat
+                                    // Prometheus counter. The generic form stays
+                                    // for the (unexpected) zero-tally case so the
+                                    // count is never noted without explanation.
+                                    let tally = skip_tally_text(&dr.1);
+                                    if tally.is_empty() {
+                                        self.note(format!("{} message(s) skipped as structurally unsupported in {}",
+                                            dr.1.messages_unsupported, rd.0));
+                                    } else {
+                                        self.note(format!("{} message(s) skipped as structurally unsupported in {}: {}",
+                                            dr.1.messages_unsupported, rd.0, tally));
+                                    }
                                     self.counters.skipped_messages += dr.1.messages_unsupported as u64;
                                     self.live.add(0, 0, dr.1.messages_unsupported as u64, 0, 0, 0);
+                                    let kc = dr.1.skip_coordlists as u64;
+                                    let mut kg = 0u64;
+                                    for gk in &dr.1.skip_grid { kg += gk.1 as u64; }
+                                    let mut kp = 0u64;
+                                    for pk in &dr.1.skip_pdt { kp += pk.1 as u64; }
+                                    self.counters.skip_coordlists += kc;
+                                    self.counters.skip_grid += kg;
+                                    self.counters.skip_pdt += kp;
+                                    self.live.bump_skip_kinds(kc, kg, kp);
                                 }
                                 let out = self.ingest_file(&mdl, dr.0, rd.0.to_string());
                                 if out.failed_groups > 0 {

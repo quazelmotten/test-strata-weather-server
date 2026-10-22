@@ -271,7 +271,14 @@ I/O alone no longer quarantines), `wxpoint_ingest_groups_written_total`
 amplification phase B removed), `wxpoint_stat_collisions_total` (V1.3 phase E1:
 statistically-distinct groups REJECTED because an earlier group of the same
 source file already claimed their field file — first-in-message-order wins;
-skipped and logged, never counted as errors), `wxpoint_ingest_lag_seconds`
+skipped and logged, never counted as errors); — V1.3 phase E4a — the structural
+skip breakdown `wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /
+`wxpoint_skip_pdt_total` (FLAT counters on purpose: this surface has no label
+machinery. They partition the STRUCTURAL subset of
+`wxpoint_skipped_messages_total` — policy skips like wind-pair drops or
+orphaned components count in the TOTAL only — and the exact template numbers
+are spelled out in the ingest-log note, e.g. "2 skipped: 2 grid template
+3.40"), `wxpoint_ingest_lag_seconds`
 (newest ingested
 file mtime → now), and — V1.3 phase E3a — `wxpoint_state_writes_total` /
 `wxpoint_state_bytes_written`: successful `state/files.json` saves and the
@@ -793,9 +800,15 @@ but NOT NOAA's bytes. The independent truth source in rows 1-3 is therefore
 **wgrib2 reading those same synthetic files**, which validates our decoder, projection
 and rotation against a mature reference implementation without validating against
 production products. Real NWS files are not fetched in CI (spec §13: no downloading).
-To close that gap manually, run `scripts/fetch_real_sample.sh` (curl from the public
-`aws-nws` S3 bucket, a few MB) and point `scripts/validate_realistic.py`-style probes
-at it; see §9 Limitations for what remains unverified until you do.
+To close that gap manually, run `scripts/fetch_real_sample.sh` (MANUAL / NETWORK:
+it fetches the `.idx` message index of live NOMADS products and HTTP-Range-extracts
+only the messages under test — a few MB total — into the gitignored
+`tests/realdata/`). With that directory present, `cargo test -p wx-ingest
+--test realdata_gate` activates live-byte gates (GFS sflux skip kinds, the
+212-byte degenerate APCP, HRRR node probes replayed through the full index path
+against recorded `wgrib2 -lon` values); without it they skip cleanly, so CI
+stays offline. Recorded probes and the full diagnosis: docs/DECISIONS.md §15.
+See §9 Limitations for what remains unverified until you do.
 
 Beyond §9 (V1.1 additions): packing parity — each small fixture exists in six
 extra packings (`_c3` 5.3, `_jpeg` 5.40, `_png` 5.41 filter None, `_png_f` 5.41
@@ -826,8 +839,10 @@ against wgrib2), `scripts/gen_fixtures.sh` + `scripts/regen_expected.sh`
 (small fixtures incl. all packing twins, idempotent), `scripts/validate_rotation.py`
 (expected-angle table), `scripts/validate_rotation_wgrib2.sh` (stub that runs the
 IPOLATES golden where it is available), and `scripts/fetch_real_sample.sh`
-(MANUAL ONLY: range-limited curl of a real NWS product so the same probes can be
-replayed against production bytes; nothing automated depends on it). `tools/`
+(MANUAL ONLY: `.idx`-guided HTTP-Range slices of live NOMADS GFS/HRRR products
+into gitignored `tests/realdata/`, verified for GRIB magic + trailing `7777`
+and checksummed; idempotent — existing complete files are kept, not refetched;
+nothing automated depends on it). `tools/`
 (gitignored) holds the local wgrib2 build trees (`wgrib2`, `wgrib2-full` with
 jasper/libpng/libaec codecs) and oha.
 
@@ -904,8 +919,31 @@ live in §10 and docs/DECISIONS.md.
     answer a single-point query as specified, and the walk resumes at the declared
     byte length so the rest of the file still ingests. Corrupt or undecodable
     section 7 still fails LOUD as an ingest error.
+  * **DEGENERATE SECTION 7 (V1.3 phase E4a): a section 7 of exactly five
+    octets — length + section number, ZERO data values — DECODES instead of
+    failing.** With a bitmap, EVERY point becomes NaN (zero value octets exist
+    for ANY point, so even bitmap-"defined" points have no value): queries
+    answer `null` + `missing_data`. WITHOUT a bitmap the plane is a full-size
+    constant `0.0`, EXACTLY matching `tools/wgrib2-full` on the live message
+    that motivated this (an HRRR zero-window accumulation,
+    `APCP:surface:0-0 day acc`, 212 bytes total — the reference decoder prints
+    `mean=0:min=0:max=0 undef=0`, and matching it is the correctness bar spec
+    §9 sets). Plane size always comes from the grid definition, never from
+    section 5's npoints field. A TRULY truncated stream still fails loudly
+    (message-length and section-overrun checks unchanged; `degenerate_sec7.rs`
+    pins all four shapes).
   * Unimplemented grid/product-definition templates beyond 3.0/3.30 and 4.0/4.8
     — same skip-and-note path (a grid we cannot project cannot be interpolated).
+    One REAL-WORLD instance pinned by the V1.3 phase E4a live fire: today's
+    operational GFS surface-flux product line (`gfs.tHHZ.sfluxgrbfFFF.grib2`)
+    rides grid template **3.40** (geostationary family, 3072 x 1536) END TO
+    END, so EVERY message in it skips as `Grid(40)` until 3.40 support exists —
+    correct-by-design, spec §4.3 mandates only 3.0 and 3.30. Since E4a the
+    skip note names kinds AND template numbers ("N skipped: X coordinate-list,
+    Y grid template 3.<t>, Z PDT 4.<t>") and each kind advances its own flat
+    counter (`wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /
+    `wxpoint_skip_pdt_total`), making product-line coverage gaps visible on
+    `/metrics` without reading logs (docs/DECISIONS.md §15).
 * **§9.3 wind-rotation golden is environment-blocked here.** `wgrib2 -new_grid_winds
   earth` refuses on this machine ("IPOLATES package is not installed") and no
   Fortran/transpiler toolchain exists to rebuild it with IPOLATES. The spec's

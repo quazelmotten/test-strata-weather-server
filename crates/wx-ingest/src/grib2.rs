@@ -174,8 +174,50 @@ pub struct DecodeStats {
     pub messages_decoded: u32,
     pub messages_skipped: u32, // filtered out by the parameter allow-list
     pub messages_unsupported: u32, // structurally unparseable: SKIP-AND-NOTE
+    /// V1.3 phase E4a SKIP-REASON OBSERVABILITY: the unsupported total broken
+    /// down BY KIND so operators can tell "this product line needs template
+    /// 3.40" from "this producer emits coordinate lists" without re-running a
+    /// decoder by hand. The Vecs are (template number -> count) in first-seen
+    /// order; expected length is tiny (one or two distinct templates per
+    /// product line). Flat totals derive from them; the pipeline mirrors the
+    /// three KINDS into flat Prometheus counters (no label machinery exists).
+    pub skip_coordlists: u32,
+    pub skip_grid: Vec<(u16, u32)>,
+    pub skip_pdt: Vec<(u16, u32)>,
     pub sec7_bytes_decoded: usize,
     pub sec7_bytes_skipped: usize,
+}
+
+/// Bump one (template -> count) tally list (V1.3 phase E4a).
+fn bump_kind(list: &mut Vec<(u16, u32)>, t: u16) {
+    for k in 0 .. list.len() {
+        if list[k].0 == t {
+            list[k].1 += 1;
+            return;
+        }
+    }
+    list.push((t, 1));
+}
+
+/// One-line breakdown of WHY messages were skipped as structurally
+/// unsupported (V1.3 phase E4a), e.g. "2 skipped: 2 grid template 3.40".
+/// Empty string when nothing was unsupported (callers append conditionally).
+pub fn skip_tally_text(st: &DecodeStats) -> String {
+    if st.messages_unsupported == 0 {
+        return "".to_string();
+    }
+    let mut parts: Vec<String> = Vec::<String>::new();
+    if st.skip_coordlists > 0 {
+        parts.push(format!("{0} coordinate-list", st.skip_coordlists));
+    }
+    for g in &st.skip_grid {
+        parts.push(format!("{0} grid template 3.{1}", g.1, g.0));
+    }
+    for p in &st.skip_pdt {
+        parts.push(format!("{0} PDT 4.{1}", p.1, p.0));
+    }
+    let joined = parts.join(", ");
+    return format!("{0} skipped: {1}", st.messages_unsupported, joined);
 }
 
 /// A parameter allow-list: (discipline, category, number) tuples from the
@@ -631,8 +673,35 @@ pub const MISSING_SENTINEL: i64 = 0x7FFFFFFF;
 /// `s5` is the section 5 payload, `s6` the section 6 payload (may be None),
 /// `s7` the section 7 payload.
 pub fn decode_sec7(s3: &GridDef, s5: &[u8], s6: Option<&[u8]>, s7: &[u8]) -> Result<Vec<f32>, GribErr> {
-    let tmpl = be_u16(s5, 4);
+    if s5.len() < 6 {
+        return Err(GribErr::Truncated);
+    }
     let ngrid = (wx_nx(s3) as usize) * (wx_ny(s3) as usize);
+    // V1.3 phase E4a DEGENERATE SECTION 7 (zero data octets): the framing
+    // layer accepts a 5-octet section 7 (see the `floor_ln` sites in
+    // decode_stream), and here it becomes a full-size plane WITHOUT running
+    // any DRT unpacker (the section-5 template fields of such files are
+    // themselves minimal/absent — the real HRRR sample carries only 16
+    // payload octets). Semantics, pinned by tests/degenerate_sec7.rs:
+    //  * bitmap present  -> EVERY point NaN: zero value octets exist, so even
+    //    bitmap-"defined" points have no value; queries answer null
+    //    missing_data (spec §4.2 "missing points must be stored as NaN").
+    //  * NO bitmap       -> 0.0 everywhere, EXACTLY matching tools/wgrib2-full
+    //    on the live 212-byte file (`mean=0:min=0:max=0 undef=0`). The known
+    //    producer of this shape is a zero-window accumulation (HRRR APCP with
+    //    begin==end==run time) intending a constant zero field; matching the
+    //    reference implementation is the correctness bar set by spec §9.
+    // Output size ALWAYS comes from the grid definition (ngrid), never from
+    // section 5's npoints, so a degenerate message can never yield a silently
+    // wrong-shaped plane.
+    if s7.is_empty() {
+        let fill: f32 = match bitmap_of(s6) {
+            Some(_) => { f32::NAN }
+            None => { 0.0 }
+        };
+        return Ok(vec![fill; ngrid]);
+    }
+    let tmpl = be_u16(s5, 4);
     match tmpl {
         0 => { return dec_simple(s5, s6, s7, ngrid); }
         2 => { return dec_complex(s5, s6, s7, ngrid, false); }
@@ -1127,6 +1196,9 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
         messages_decoded: 0,
         messages_skipped: 0,
         messages_unsupported: 0,
+        skip_coordlists: 0,
+        skip_grid: Vec::<(u16, u32)>::new(),
+        skip_pdt: Vec::<(u16, u32)>::new(),
         sec7_bytes_decoded: 0,
         sec7_bytes_skipped: 0,
     };
@@ -1173,7 +1245,18 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
             }
             let ln = be_u32(bytes, q) as usize;
             let num = bytes[q + 4];
-            if ln < 6 || q + ln > body_end {
+            // V1.3 phase E4a DEGENERATE SECTION 7 TOLERANCE: a real HRRR
+            // zero-window APCP message carries section 7 as exactly 5 octets
+            // (length + number, ZERO data values): the producer encoded a
+            // constant field by omitting every value octet, and the reference
+            // decoder (tools/wgrib2-full verified on the live file) accepts
+            // it. ONLY section 7 gets this floor of 5; every other section
+            // keeps 6 (their parsers length-check payloads anyway, and a
+            // 5-octet section 3/4/5 would mean a genuinely broken stream).
+            // A TRULY truncated stream still fails loudly: `q + ln > body_end`
+            // and the message-length-vs-file check are UNCHANGED.
+            let floor_ln = if num == 7 { 5 } else { 6 };
+            if ln < floor_ln || q + ln > body_end {
                 return Err(GribErr::Truncated);
             }
             let payload = &bytes[q + 5..q + ln];
@@ -1237,9 +1320,16 @@ pub fn decode_stream(bytes: &[u8], filter: ParamFilter) -> Result<(Vec<DecodedMe
         // cannot desynchronize the walk (proof: robust_skips.rs decodes the
         // messages on BOTH SIDES of a coord-list and a layer message).
         match skip {
-            Some(_) => {
+            Some(rs) => {
                 st.messages_total += 1;
                 st.messages_unsupported += 1;
+                // V1.3 phase E4a: tally BY KIND so the pipeline note can say
+                // WHY (template numbers included), not just how many.
+                match rs {
+                    SkipReason::CoordLists => { st.skip_coordlists += 1; }
+                    SkipReason::Grid(t) => { bump_kind(&mut st.skip_grid, t); }
+                    SkipReason::Pdt(t) => { bump_kind(&mut st.skip_pdt, t); }
+                }
                 pos = body_end;
                 if eof_flag {
                     break;
@@ -1405,7 +1495,18 @@ fn probe_stream(bytes: &[u8]) -> Result<GridProbe, GribErr> {
             }
             let ln = be_u32(bytes, q) as usize;
             let num = bytes[q + 4];
-            if ln < 6 || q + ln > body_end {
+            // V1.3 phase E4a DEGENERATE SECTION 7 TOLERANCE: a real HRRR
+            // zero-window APCP message carries section 7 as exactly 5 octets
+            // (length + number, ZERO data values): the producer encoded a
+            // constant field by omitting every value octet, and the reference
+            // decoder (tools/wgrib2-full verified on the live file) accepts
+            // it. ONLY section 7 gets this floor of 5; every other section
+            // keeps 6 (their parsers length-check payloads anyway, and a
+            // 5-octet section 3/4/5 would mean a genuinely broken stream).
+            // A TRULY truncated stream still fails loudly: `q + ln > body_end`
+            // and the message-length-vs-file check are UNCHANGED.
+            let floor_ln = if num == 7 { 5 } else { 6 };
+            if ln < floor_ln || q + ln > body_end {
                 return Err(GribErr::Truncated);
             }
             if num == 3 {
@@ -1562,7 +1663,18 @@ fn peek_stream(bytes: &[u8]) -> Result<RefPeek, GribErr> {
             }
             let ln = be_u32(bytes, q) as usize;
             let num = bytes[q + 4];
-            if ln < 6 || q + ln > body_end {
+            // V1.3 phase E4a DEGENERATE SECTION 7 TOLERANCE: a real HRRR
+            // zero-window APCP message carries section 7 as exactly 5 octets
+            // (length + number, ZERO data values): the producer encoded a
+            // constant field by omitting every value octet, and the reference
+            // decoder (tools/wgrib2-full verified on the live file) accepts
+            // it. ONLY section 7 gets this floor of 5; every other section
+            // keeps 6 (their parsers length-check payloads anyway, and a
+            // 5-octet section 3/4/5 would mean a genuinely broken stream).
+            // A TRULY truncated stream still fails loudly: `q + ln > body_end`
+            // and the message-length-vs-file check are UNCHANGED.
+            let floor_ln = if num == 7 { 5 } else { 6 };
+            if ln < floor_ln || q + ln > body_end {
                 return Err(GribErr::Truncated);
             }
             if num == 1 {

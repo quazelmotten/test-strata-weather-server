@@ -2703,3 +2703,165 @@ errors FOREVER — no machine-observable failure.
   and reuses `skipped_messages` / `quarantined_files` exactly as before.
 * Exit-code table EXTENDED with `7` (provisional wind-pair enforcement);
   0/1/2/3/4/5/6/8 keep their established meanings.
+
+## 15. V1.3 phase E4a — skip-reason observability + live-GFS diagnosis + degenerate section-7 tolerance (2026-10-22)
+
+The orchestrator's live fire (Oct 22 2026, NOMADS `.idx` + HTTP Range) surfaced
+two findings plus an observability gap. All three are resolved here; the real
+bytes themselves are NOT committed (fetched on demand by
+`scripts/fetch_real_sample.sh` into gitignored `tests/realdata/`).
+
+### 15.1 Root cause (a): live GFS sflux skips = grid definition template 3.40
+
+Full diagnosis table (each preserved artifact, construct found, verdict):
+
+| Artifact (preserved under /tmp/opencode/) | Construct found | Verdict | Evidence |
+|---|---|---|---|
+| `realtest/in_gfs/gfs.t211200z.pgrb2.0p25.f000` (ACOND:surface + TMP:2 m, run 2026102112) | BOTH messages ride **grid definition template 3.40** (nx=3072 ny=1536, npts=4718592) | DOCUMENTED LIMITATION — `SkipReason::Grid(40)` is correct-by-design | our parser's sec3-template read agrees with `wgrib2-full -Sec3` ("Grid Def Template=3.40") independently; parsing the same bytes as template 3.0 would yield garbage lat/lon (lat1 field reads 1542°) |
+| `...f006` (UGRD+VGRD:10 m) | same, template 3.40 | same | `-Sec3` identical line for both messages |
+| `...f012` (HGT+TMP:1 hybrid level) | same, template 3.40 (+ level type 105 hybrid) | same; hybrid LEVEL support is separately E4b scope | `-Sec3` identical; sec4 lv1-type=105 |
+| `hrrr_apcp_tight.grib2` (APCP:surface 0-0 day acc, run 2026102200, 212 bytes) | section 7 of exactly FIVE octets (zero data values), DRT 5.0, 21-octet section 5, NO bitmap (indicator 255) | FIXED — see 15.2 | section dump + `wgrib2-full -Sec_len/-Sec5/-Sec6` (ndata=1905141, Template=5.0, bitmap indicator 255) + `-lon` probe val=0 |
+| `realtest/in_hrrr/wrfnaf00/f06` | standard LCC 3.30, PDT 4.0 | regression guards — already decoded cleanly, still do | probes below replayed green through the index path |
+
+* **Not fixed deliberately:** template 3.40 (geostationary family) is outside
+  spec §4.3 (only regular_ll 3.0 + LCC 3.30 mandated). Adding it without a
+  projection truth source would risk silent lat/lon garbage; README §9 carries
+  the limitation. The live-fire fetcher re-confirms the shape on fresh bytes
+  every run (today's re-fetch: all THREE f012 messages — including HGT:surface
+  added by the ':HGT:' pattern — are 3.40 too).
+* **Surprise worth recording:** files NAMED `gfs.t*z.pgrb2.0p25.f*` are NOT
+  0.25° regular lat/lon (1440 x 721) — they are 3072 x 1536 template-3.40
+  grids. Operational product-line drift masked by filenames; spec §4.2's
+  "never trust filenames" paid for itself on the first live fire.
+* Reference probes proving the skipped data is REAL and reference-decodable
+  (`wgrib2-full -lon -95 40` on f000): ACOND=0.0125, TMP:2m=286.74 K at node
+  (264.960938, 40.006506).
+
+### 15.2 Root cause (b): 212-byte APCP rejected with `GribErr::Truncated`
+
+The message is a zero-window accumulation (PDT 4.8, begin==end==run time): the
+producer encoded a constant field by OMITTING every value octet — section 7 is
+length 5 (header only), section 5 carries just 16 payload octets, and there is
+NO bitmap. Our section-framing floor was `ln < 6 => Truncated`, so the walk
+died on the whole file. wgrib2 (spec §9's reference bar) decodes it as a
+constant-zero plane (`mean=0:min=0:max=0 undef=0`).
+
+* **Fix:** the floor becomes 5 ONLY for section 7 (three walkers: decode,
+  probe, retention-peek); everything else keeps 6. `decode_sec7` gains an
+  early return for an EMPTY section 7 BEFORE dispatching any DRT unpacker:
+  bitmap present -> ALL NaN (no value octets exist even for bitmap-"defined"
+  points; queries answer null `missing_data`); NO bitmap -> 0.0 fill (exact
+  wgrib2 parity on the real message — rejected alternative: NaN here, which
+  would diverge from the reference implementation on a real, intentionally
+  produced message where 0 mm is also the physically right answer).
+* **Shape guard:** output size always `nx*ny` from the grid DEFINITION (the
+  file's own npoints field is never trusted for sizing). A short section 5
+  now fails with a typed `Truncated` instead of risking an unguarded read.
+* **Truncation boundaries re-probed, not loosened globally:** a message length
+  past EOF and a section-7 declared length overrunning the body STILL fail
+  with `Truncated` (variants C/D in `degenerate_sec7.rs`); the pre-existing
+  `robust_skips` suite stayed green untouched.
+
+### 15.3 Skip-reason observability design
+
+* `DecodeStats` gains `skip_coordlists: u32` plus `(template -> count)` lists
+  `skip_grid` / `skip_pdt` (first-seen order; expected length ~1 per product
+  line) and `skip_tally_text()` rendering
+  "N skipped: X coordinate-list, Y grid template 3.<t>, Z PDT 4.<t>".
+* The pipeline note becomes "K message(s) skipped as structurally unsupported
+  in FILE: <tally>" — operators see WHICH construct is missing.
+* Metrics: three FLAT counters — `wxpoint_skip_coordlists_total`,
+  `wxpoint_skip_grid_total`, `wxpoint_skip_pdt_total` — plumbed like
+  `stat_collisions` (IngestCounters fields + LiveCounters atomics with
+  `bump_skip_kinds` + max-merge render blocks). No label machinery exists on
+  this surface, so kinds are separate metrics rather than one labeled counter.
+* **Documented partition:** the three totals cover the STRUCTURAL subset of
+  `wxpoint_skipped_messages_total`; POLICY skips (wind-pair drops, orphaned
+  components, layer/range levels) count in the total ONLY. The gap between
+  them is expected and meaningful, asserted exactly by
+  `skip_reasons::pipeline_note_and_counters_break_down_skips_by_kind`
+  (4 total = 3 structural + 1 layer-policy).
+
+### 15.4 Real-sample harness (MANUAL / NETWORK, never CI)
+
+* `scripts/fetch_real_sample.sh` rewritten: fetches the NOMADS `.idx`, parses
+  RECORD:OFFSET lines (the OFFSET is the SECOND field — reading the first
+  silently fetches garbage, caught on the first live run), HTTP-Range-extracts
+  selected messages, concatenates them into self-framed GRIB streams, verifies
+  magic + trailing `7777` + non-empty, prints sha256sums, and is IDEMPOTENT
+  (complete files are kept, not refetched). Targets: GFS sflux ACOND+TMP2m /
+  UV10m / hybrid HGT+TMP; HRRR TMP2m / UV10m / APCP(0-0) / WIND-max.
+* Upstream naming traps recorded: the mirror's HRRR CONUS stem is `wrfnatf`
+  (the orchestrator's preserved "wrfnaf" names were its own renaming), and the
+  classic `pgrb2.0p25` path no longer exists (sflux under `atmos/`).
+* **Byte-for-byte reproduction verified:** today's fetched
+  `hrrr_apcp_tight.grib2` has sha256 `1f3cf83c…` IDENTICAL to the preserved
+  artifact; `hrrr_tmp2m_f00.grib2` matches the preserved wrfnaf00 size exactly
+  (1184004 bytes).
+* Fetched data lives in gitignored `tests/realdata/` and is NEVER committed;
+  `crates/wx-ingest/tests/realdata_gate.rs` skips cleanly with a printed
+  reason whenever the directory is absent.
+
+### 15.5 Recorded reference probes (self-contain the gate when data is present)
+
+All values from `tools/wgrib2-full -lon` on Oct 22 2026:
+
+| Probe | Node snapped to | Value |
+|---|---|---|
+| wrfnaf00 TMP:2m @ req (-95, 40) | (264.994145, 40.008964) | 292.957 K |
+| wrfnaf00 TMP:2m @ req (-97.5, 37) | (262.494146, 36.986616) | 295.582 K |
+| wrfnaf06 UGRD:10m @ node A | (264.994145, 40.008964) | −0.0926971 m/s (STORED grid-relative) |
+| wrfnaf06 VGRD:10m @ node A | same | 1.68939 m/s (STORED grid-relative) |
+| APCP-212B @ any node | (262.494146, 36.986616) | 0 |
+| GFS f000 ACOND / TMP:2m @ req (-95, 40) | (264.960938, 40.006506) | 0.0125 / 286.74 K |
+
+* Gate tolerance on TMP probes: 0.01 K. The printed node coordinates are
+  rounded (~3e-4 grid units off exact), so the query does a tiny bilinear
+  blend instead of the Exact-node branch; 0.01 K covers both the rounding and
+  the blend while staying far below any real discrepancy.
+* Wind VALUES are deliberately NOT pinned against these grid-relative numbers:
+  our store keeps EARTH-relative U/V (spec §4.4 rotation at ingest), and the
+  rotation itself is gated independently (`rotation_vs_pyproj.rs`,
+  `validate_rotation_wgrib2.sh`). The realdata gate asserts the pair ingests
+  and answers finite, plausible earth-relative values.
+
+### 15.6 Honest expectation pinning + parser-offset caveat
+
+* The phase task assumed ACOND/TMP2m/UV10m "should INGEST unless documented
+  otherwise". The BYTES say every live GFS sflux message rides template 3.40,
+  so the honest pinned expectation is: Grid(40)-only skips, ZERO decoded, for
+  all three GFS artifacts — until 3.40 support lands. Any OTHER skip kind
+  appearing means product drift and fails the test loudly (re-diagnose, do not
+  silently re-pin).
+* Our sec3 template-number read sits at payload offset p[7:9] and empirically
+  agrees with wgrib2's `-Sec3` verdict on EVERY file tested to date
+  (gfs_small→3.0, hrrr fixtures + live HRRR→3.30, live GFS→3.40), despite
+  confusion about the exact WMO octet arithmetic of the section-3 preamble.
+  Treat it as validated-by-agreement. Residual risk (recorded, accepted): a
+  hypothetical producer writing a NON-zero NV/i-increment pair at those
+  octets inside a genuine 3.0 section could fool the dispatch — implausible
+  in NWS products, and a false parse would fail loudly downstream on length
+  checks rather than return wrong numbers.
+
+### 15.7 New tests
+
+* `skip_reasons.rs`: per-kind tallies via RUNTIME byte-patches (template
+  numbers rewritten inside a copy of gfs_small — no new fixture bytes), the
+  exact combined three-kind tally string, pipeline note + counters + LIVE
+  mirror advancement, the structural-vs-policy partition, and a vacuous-safe
+  pin of the preserved real-GFS files (skips are Grid(40)-only, nothing
+  decodes) that prints SKIP when /tmp/opencode/realtest is absent.
+* `degenerate_sec7.rs`: zeros/no-bitmap decode, all-NaN/full-bitmap decode,
+  two genuinely-truncated shapes still `Truncated`, end-to-end masked
+  degenerate field answering `PointError::MissingData` through the index.
+* `realdata_gate.rs` (skips cleanly without `tests/realdata/`): GFS sflux
+  Grid(40)-only across all three fetched files; APCP-212B full-size zero plane
+  (size-gated so product drift cannot false-pass); WIND-max PDT 4.8 decodes
+  structurally clean; HRRR TMP node probes vs the table above THROUGH
+  build_context/evaluate_point, APCP answering exactly 0.0, UV pair finite —
+  and zero structural skips on production HRRR bytes.
+
+### 15.8 New counters summary
+
+Three new flat Prometheus counters (no labels): `wxpoint_skip_coordlists_total`,
+`wxpoint_skip_grid_total`, `wxpoint_skip_pdt_total`. No exit-code changes.
