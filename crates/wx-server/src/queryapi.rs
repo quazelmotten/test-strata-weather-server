@@ -316,7 +316,8 @@ pub fn fail_token(t: FailTok) -> String {
 pub struct QueryEntry<'r> {
     pub param: &'r str,
     pub units: &'r str,
-    pub run_epoch: i64, // selected run (echoed at top level)
+    pub run_epoch: i64, // the run THIS result came from (echoed per result;
+                        // top level only when all results agree)
     pub masked: bool,
     pub value: f64,
     pub info: Option<InterpInfo>,
@@ -526,8 +527,15 @@ pub fn render_error_json(token: String, message: String) -> String {
 
 /// Entry-shaped result object for one parameter.
 fn render_entry(e: QueryEntry) -> String {
+    // V1.3 phase E2 PER-RESULT PROVENANCE: every result object carries the
+    // ISO-8601 Z timestamp of the run THAT RESULT came from. With several
+    // indexed runs a multi-param request can legitimately mix provenance
+    // (newest run covering only TMP, older run supplying HGT); before E2 the
+    // single top-level echo was silently wrong for the other params.
+    use crate::timeparse::format_iso_z;
+    let run_s = format_iso_z(e.run_epoch);
     if e.masked {
-        return format!("{{\"param\":\"{0}\",\"value\":null,\"reason\":\"missing_data\",\"units\":\"{1}\",\"interpolation\":null}}", e.param, e.units);
+        return format!("{{\"param\":\"{0}\",\"value\":null,\"reason\":\"missing_data\",\"units\":\"{1}\",\"interpolation\":null,\"run\":\"{2}\"}}", e.param, e.units, run_s);
     }
     let info = e.info;
     let interp: String = match info {
@@ -581,19 +589,40 @@ fn render_entry(e: QueryEntry) -> String {
             obj
         }
     };
-    return format!("{{\"param\":\"{0}\",\"value\":{1},\"units\":\"{2}\",\"interpolation\":{3}}}", e.param, e.value, e.units, interp);
+    return format!("{{\"param\":\"{0}\",\"value\":{1},\"units\":\"{2}\",\"interpolation\":{3},\"run\":\"{4}\"}}", e.param, e.value, e.units, interp, run_s);
 }
 
 /// Top-level /v1/point success body, spec §7 example shape (values in native
-/// GRIB units; `run` echoes the selected run, `level` the canonical level).
-/// V1.1 phase 5: takes the PointEntries buffer instead of a Vec — byte-identical
-/// output to the old renderer (same field order, same fmt_num behavior).
-pub fn render_point_json(model: &str, run_epoch: i64, valid_epoch: i64, lat: f64, lon: f64, code: u8, val: f64, eb: &PointEntries) -> String {
+/// GRIB units; `level` the canonical level). V1.1 phase 5: takes the
+/// PointEntries buffer instead of a Vec.
+/// V1.3 phase E2: EVERY result object additionally carries its own `"run"`
+/// (per-result provenance). The TOP-LEVEL `"run"` is echoed when all results
+/// share one run (back compatible) and emitted as JSON `null` when they
+/// differ — the provenance is then fully visible per result and nothing is
+/// ever echoed that did not answer (defect: entry 0's run used to stand in
+/// for the whole response).
+pub fn render_point_json(model: &str, valid_epoch: i64, lat: f64, lon: f64, code: u8, val: f64, eb: &PointEntries) -> String {
     use crate::timeparse::format_iso_z;
-    let run_s = format_iso_z(run_epoch);
+    let run_tok: String = if eb.n == 0 {
+        "null".to_string()
+    } else {
+        let first = entries_at(eb, 0).run_epoch;
+        let mut same = true;
+        for k in 1 .. eb.n {
+            if entries_at(eb, k).run_epoch != first {
+                same = false;
+                break;
+            }
+        }
+        if same {
+            format!("\"{0}\"", format_iso_z(first))
+        } else {
+            "null".to_string()
+        }
+    };
     let valid_s = format_iso_z(valid_epoch);
     let lvl_s = format_level_str(code, val);
-    let mut out = format!("{{\"model\":\"{0}\",\"run\":\"{1}\",\"valid\":\"{2}\",\"lat\":{3},\"lon\":{4},\"level\":\"{5}\",\"results\":[", model, run_s, valid_s, lat, lon, lvl_s);
+    let mut out = format!("{{\"model\":\"{0}\",\"run\":{1},\"valid\":\"{2}\",\"lat\":{3},\"lon\":{4},\"level\":\"{5}\",\"results\":[", model, run_tok, valid_s, lat, lon, lvl_s);
     for k in 0 .. eb.n {
         if k > 0 {
             out = format!("{0}{1}", out, ",");

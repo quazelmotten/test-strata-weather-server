@@ -19,7 +19,7 @@ use wx_core::tables::{fmt_num};
 use wx_core::storage::{stat_kind_name};
 use wx_core::grid::{GridDef};
 use crate::stats::{mono_ns, QueryStats};
-use crate::queryapi::{parse_query, lookup_entries, new_entries, entries_at, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
+use crate::queryapi::{parse_query, lookup_entries, new_entries, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
 use crate::timeparse::{format_iso_z};
 
 // ---------------------------------------------------------------------------
@@ -108,8 +108,12 @@ pub fn answer_all(snap: Arc<IndexSnapshot>, pa: &ParsedArgs) -> (u16, String) {
         }
         Ok(_) => {}
     }
-    let run_ep = entries_at(&eb, 0).run_epoch;
-    return (200, render_point_json(pa.model, run_ep, pa.valid_epoch, pa.lat, pa.lon, pa.level_code, pa.level_val, &eb));
+    // V1.3 phase E2: the top-level "run" is derived INSIDE the renderer from
+    // the per-entry provenance (every result carries its own "run"): echoed
+    // when ALL results share one run, null when they differ (defect: with two
+    // indexed runs where the newest covers only one requested param, entry 0's
+    // run used to stand in for all of them).
+    return (200, render_point_json(pa.model, pa.valid_epoch, pa.lat, pa.lon, pa.level_code, pa.level_val, &eb));
 }
 
 /// Render a forecast-hour offset (SECONDS past the run time) the way the API
@@ -198,13 +202,20 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
 }
 
 /// Grid definition JSON (spec §7 /v1/models: "grid info incl LCC params").
+/// V1.3 phase E2: the component-convention flag is reported as
+/// `source_winds_grid` — it describes how the SOURCE messages arriving in
+/// `ingest_dir` were encoded (GRIB flag table 3.3 bit 3, taken from the first
+/// message that wrote this run's grid.bin), NOT how data is stored. Stored
+/// and queried U/V are ALWAYS earth-relative (spec §4.4 rotates grid-relative
+/// components at ingest; field headers carry false), so the value here is
+/// informational and may legitimately differ between runs of one model.
 fn render_grid_json(gd: &GridDef) -> String {
     match gd {
         GridDef::Regular(g) => {
             let nx = fmt_num(g.nx as f64);
             let ny = fmt_num(g.ny as f64);
             let scan = fmt_num(g.scan_mode as f64);
-            return format!("{{\"kind\":\"regular\",\"nx\":{0},\"ny\":{1},\"lon1\":{2},\"lat1\":{3},\"dlon\":{4},\"dlat\":{5},\"scan_mode\":{6},\"winds_grid\":{7}}}", nx, ny, g.lon1, g.lat1, g.dlon, g.dlat, scan, g.winds_grid);
+            return format!("{{\"kind\":\"regular\",\"nx\":{0},\"ny\":{1},\"lon1\":{2},\"lat1\":{3},\"dlon\":{4},\"dlat\":{5},\"scan_mode\":{6},\"source_winds_grid\":{7}}}", nx, ny, g.lon1, g.lat1, g.dlon, g.dlat, scan, g.winds_grid);
         }
         GridDef::Lambert(g) => {
             let nx = fmt_num(g.nx as f64);
@@ -212,7 +223,7 @@ fn render_grid_json(gd: &GridDef) -> String {
             let pf = fmt_num(g.proj_flag as f64);
             let scan = fmt_num(g.scan_mode as f64);
             let es = fmt_num(g.earth_shape as f64);
-            return format!("{{\"kind\":\"lcc\",\"nx\":{0},\"ny\":{1},\"la1\":{2},\"lo1\":{3},\"lov\":{4},\"lad\":{5},\"latin1\":{6},\"latin2\":{7},\"dx_m\":{8},\"dy_m\":{9},\"proj_flag\":{10},\"scan_mode\":{11},\"earth_shape\":{12},\"winds_grid\":{13}}}", nx, ny, g.la1, g.lo1, g.lov, g.lad, g.latin1, g.latin2, g.dx_m, g.dy_m, pf, scan, es, g.winds_grid);
+            return format!("{{\"kind\":\"lcc\",\"nx\":{0},\"ny\":{1},\"la1\":{2},\"lo1\":{3},\"lov\":{4},\"lad\":{5},\"latin1\":{6},\"latin2\":{7},\"dx_m\":{8},\"dy_m\":{9},\"proj_flag\":{10},\"scan_mode\":{11},\"earth_shape\":{12},\"source_winds_grid\":{13}}}", nx, ny, g.la1, g.lo1, g.lov, g.lad, g.latin1, g.latin2, g.dx_m, g.dy_m, pf, scan, es, g.winds_grid);
         }
     }
 }

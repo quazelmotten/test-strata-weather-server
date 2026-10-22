@@ -994,6 +994,27 @@ impl Pipeline {
             log: Vec::<String>::new(),
             progress_log: Vec::<String>::new(),
         };
+        // V1.3 phase E2 LOUD STARTUP NOTE: every raw discipline/category/number
+        // param OUTSIDE the built-in table that carries no `units` override
+        // cannot satisfy spec §7 "report the units" — it answers with units "".
+        // Config validation accepts that shape deliberately (the operator may
+        // genuinely not know the units), so we say so once per affected entry,
+        // loudly, at boot. Params WITH an override and table-known params are
+        // silent.
+        {
+            let mc = p.models.len();
+            for mi in 0 .. mc {
+                let pc = p.models[mi].params.len();
+                for pi in 0 .. pc {
+                    let rp = &p.models[mi].params[pi];
+                    if rp.raw && rp.units.is_empty() {
+                        p.note(format!("config note: model '{0}' param '{1}' (discipline {2}/category {3}/number {4}) is outside the built-in parameter table and has NO units override: responses report units \"\" — set units = \"...\" on this [[models.params]] entry",
+                            p.models[mi].name.as_str(), rp.key.as_str(),
+                            rp.disc, rp.cat, rp.num));
+                    }
+                }
+            }
+        }
         rebuild_from_disk(&mut p);
         p.publish();
         return Ok(p);

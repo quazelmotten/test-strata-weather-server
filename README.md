@@ -94,7 +94,11 @@ metadata comes from GRIB sections 1/4, never filenames), and `[[models.params]]`
 entries. Param names map to GRIB2 (discipline, category, number) through a
 built-in table covering `TMP HGT UGRD VGRD RH SPFH DPT PRMSL MSLMA PRES VVEL
 APCP GUST CAPE CIN`; anything else may use raw
-`discipline/category/number` keys. Level specs map to Code Table 4.5
+`discipline/category/number` keys — such an out-of-table entry may carry an
+optional `units = "..."` override (V1.3 phase E2; the ONLY place the key is
+legal — setting it on a table-known param is a hard startup error, and a raw
+param without units boots with one loud note per affected entry because
+responses must report units). Level specs map to Code Table 4.5
 (`isobaric`=100, `height_above_ground`=103, `surface`=1, `msl`=101, …) with
 grammar `"*"`, `"type:*"`, `"type:value"`, bare `"type"` (= 0, e.g. `surface`).
 Isobaric levels arrive in Pa in section 4 and are normalized to hPa internally
@@ -137,8 +141,19 @@ curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP&level=isobaric:837.5&la
   "results":[{"param":"TMP","value":281.734,"units":"K",
     "interpolation":{"horizontal":"bilinear",
       "vertical":{"method":"linear","levels":[850,800]},
-      "time":{"method":"linear","forecast_hours":[6,9]}}}]}
+      "time":{"method":"linear","forecast_hours":[6,9]}},
+    "run":"2026-10-19T12:00:00Z"}]}
 ```
+
+**Per-result run provenance (V1.3 phase E2).** EVERY result object carries
+its own `"run"` (ISO 8601 Z, appended last; masked results too): with several
+indexed runs a multi-param request can legitimately MIX provenance — e.g. the
+newest run covers only `TMP` while an older run supplies `HGT`, and each
+result names the run that actually answered it. The TOP-LEVEL `"run"` is
+echoed when ALL results share one run (byte-identical to pre-E2 responses)
+and emitted as JSON `null` when they differ; nothing is ever echoed that did
+not answer. Gate: `provenance_http.rs` (mixed → top-level `null` + both runs
+named once each; common → echo unchanged + per-result copies).
 
 **Additive vertical metadata (V1.2 phase B0).** Spec §6.4 interpolates vertically
 SEPARATELY AT each forecast hour, and two bracketing forecast hours of one run CAN
@@ -194,11 +209,22 @@ Priority when several apply: level > stat guard > time-exact-only > no-run.
 ### Other endpoints
 
 ```sh
-curl 'http://127.0.0.1:8080/v1/models'                     # grid info (incl LCC params) + configured params/levels
+curl 'http://127.0.0.1:8080/v1/models'                     # grid info (incl LCC params, source_winds_grid) + configured params/levels
 curl 'http://127.0.0.1:8080/v1/inventory?model=hrrr'       # runs queryable NOW: fhs/params/levels (+stat_processed/stat_kind per field)
 curl 'http://127.0.0.1:8080/health'; curl '.../ready'      # ready once >=1 indexed run per configured model
 curl 'http://127.0.0.1:8080/metrics'                      # Prometheus text
 ```
+
+**`source_winds_grid` (V1.3 phase E2 rename).** The `/v1/models` grid blocks
+(both `regular` and `lcc`) report the wind-component convention of the SOURCE
+messages as they arrive in `ingest_dir` — GRIB flag table 3.3 bit 3, recorded
+from the first message that wrote that run's `grid.bin`. It is informational
+metadata about upstream encoding and may legitimately differ between runs of
+one model. Stored and queried U/V are ALWAYS earth-relative (spec §4.4
+rotates grid-relative components at ingest; field headers carry `false`);
+the old bare key `winds_grid` implied otherwise, hence the rename. Gate:
+`models_reports_source_winds_grid_not_winds_grid` (also asserts the old key
+is gone).
 
 `/v1/inventory` per field carries `param`, `level_type`, `units`,
 `stat_processed`, `stat_kind`, `forecast_hours` (DECIMAL HOURS — fractional
@@ -786,6 +812,14 @@ live in §10 and docs/DECISIONS.md.
   selector on `/v1/point`, or a filename scheme carrying the window) is future
   work; until then the rejected window is simply not queryable. Pinned by
   `tests/stat_collision.rs`.
+* **Provenance & raw-param units (V1.3 phase E2).** A multi-param response with
+  MIXED provenance renders the top-level `"run"` as JSON `null` (per-result
+  `"run"` is authoritative; see §3). Raw discipline/category/number params
+  outside the built-in table answer with `units: ""` unless config supplies the
+  optional `units = "..."` override — boot then logs one loud note per affected
+  entry; setting the key on any table-known param (name OR in-table triple) is a
+  hard startup error rather than a warning, so known canonical units can never
+  be silently overridden. Pinned by `provenance_http.rs` and `raw_units.rs`.
 * **Stability timing is MONOTONIC (V1.2 phase B0).** The file-stability window is
   measured with `std::time::Instant`, never against wall-clock mtimes, so NTP step-
   backs, container restore or VM pause cannot freeze ingest. File IDENTITY is still

@@ -16,7 +16,11 @@
 //!   give `discipline`, `category`, `number` integers directly (spec §3:
 //!   "Allow the config to specify raw discipline/category/number"). Units are
 //!   then reported as "" (unknown) unless the triple happens to match a table
-//!   entry, in which case the canonical name/units are used.
+//!   entry, in which case the canonical name/units are used. V1.3 phase E2:
+//!   such an out-of-table entry MAY carry `units = "..."` (the ONLY place the
+//!   key is legal — setting it on a table-known param is a hard startup error,
+//!   and a raw param WITHOUT units boots with a loud note per affected entry,
+//!   because spec §7 requires every response to report units).
 //! * Level specs: `"type:value"`, bare `"type"` (value 0, e.g. `surface`),
 //!   `"type:*"` (every value of that type present) or `"*"` (any level).
 
@@ -63,6 +67,11 @@ pub struct ParamCfg {
     pub category: Option<i64>,
     pub number: Option<i64>,
     pub levels: Vec<String>,
+    /// V1.3 phase E2 UNITS OVERRIDE, legal ONLY on raw discipline/category/number
+    /// entries that the built-in table does not know (their units would
+    /// otherwise be ""). Setting it anywhere else fails validation naming the
+    /// param — see docs/DECISIONS.md V1.3 E2.
+    pub units: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -90,6 +99,11 @@ pub struct ResolvedParam {
     pub cat: u8,
     pub num: u8,
     pub units: String,
+    /// V1.3 phase E2: true iff this entry came from a raw discipline/category/
+    /// number triple that the built-in table does NOT know (units therefore
+    /// come from the optional `units` config key or are ""). Drives the loud
+    /// startup note for unit-less raw params; never used on the query path.
+    pub raw: bool,
     // (CT 4.5 code, wanted value or None=wildcard); code 255 = any type.
     pub level_specs: Vec<(u8, Option<f64>)>,
 }
@@ -134,8 +148,14 @@ pub fn parse_level_spec(s: &str) -> Option<(u8, Option<f64>)> {
 /// Validate the whole config (spec §3: fail loudly at startup) and produce
 /// resolved models. Errors are human-readable strings for main().
 /// Resolve one configured parameter entry to (discipline, category, number,
-/// canonical-or-raw key, units). Errors carry the human message (spec §3).
-fn resolve_entry(p: &ParamCfg, mname: &str) -> Result<(u8, u8, u8, String, String), String> {
+/// canonical-or-raw key, units, out-of-table-raw-flag). Errors carry the
+/// human message (spec §3). V1.3 phase E2: the optional `units` key is
+/// accepted ONLY for raw triples the built-in table does not know; setting
+/// it on anything the table already resolves (by name OR by an in-table
+/// triple) is a HARD error naming the param — silently overriding known
+/// units invites wrong-unit answers (decision: hard error over warn+
+/// override, docs/DECISIONS.md V1.3 E2).
+fn resolve_entry(p: &ParamCfg, mname: &str) -> Result<(u8, u8, u8, String, String, bool), String> {
     let has_name = p.name.is_some();
     let has_raw = p.discipline.is_some() && p.category.is_some() && p.number.is_some();
     if has_name && has_raw {
@@ -151,8 +171,14 @@ fn resolve_entry(p: &ParamCfg, mname: &str) -> Result<(u8, u8, u8, String, Strin
                 return Err(format!("unknown parameter '{0}' in model '{1}': not in the built-in table (or supply raw discipline/category/number)", nm, mname));
             }
             Some(trip) => {
+                match &p.units {
+                    None => {}
+                    Some(_) => {
+                        return Err(format!("units override is only valid for raw discipline/category/number params outside the built-in table: parameter '{0}' in model '{1}' already carries units '{2}'", nm, mname, param_units(&nm).unwrap()));
+                    }
+                }
                 let un = param_units(&nm).unwrap().to_string();
-                return Ok((trip.0, trip.1, trip.2, nm.to_string(), un));
+                return Ok((trip.0, trip.1, trip.2, nm.to_string(), un, false));
             }
         }
     }
@@ -168,10 +194,20 @@ fn resolve_entry(p: &ParamCfg, mname: &str) -> Result<(u8, u8, u8, String, Strin
     let known = param_name_for(du, cu, nu);
     match known {
         None => {
-            return Ok((du, cu, nu, format!("d{0}c{1}n{2}", du, cu, nu), "".to_string()));
+            let un = match &p.units {
+                None => { "".to_string() }
+                Some(u) => { u.clone() }
+            };
+            return Ok((du, cu, nu, format!("d{0}c{1}n{2}", du, cu, nu), un, true));
         }
         Some(kn) => {
-            return Ok((du, cu, nu, kn.to_string(), param_units(&kn).unwrap().to_string()));
+            match &p.units {
+                None => {}
+                Some(_) => {
+                    return Err(format!("units override is only valid for raw discipline/category/number params outside the built-in table: discipline {0}/category {1}/number {2} in model '{3}' IS parameter '{4}' with units '{5}'", du, cu, nu, mname, kn, param_units(kn).unwrap()));
+                }
+            }
+            return Ok((du, cu, nu, kn.to_string(), param_units(&kn).unwrap().to_string(), false));
         }
     }
 }
@@ -261,6 +297,7 @@ pub fn validate_config(cfg: &PointConfig) -> Result<Vec<ResolvedModel>, String> 
                         cat: t.1,
                         num: t.2,
                         units: t.4,
+                        raw: t.5,
                         level_specs: [].to_vec(),
                     };
                     for lv in &p.levels {

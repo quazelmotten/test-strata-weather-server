@@ -2314,3 +2314,97 @@ verified EMPIRICALLY: with the guard reverted to the field-level flag and the
 group key reverted to base-only (API surface kept, so the tests compile), all
 three new tests FAIL — forward order accepts the silent blend, reverse order
 refuses the clean bracket, and the collision counter/note do not exist.
+
+## 12. V1.3 phase E2 — per-result run provenance + source_winds_grid rename + raw-param units override (2026-10-22)
+
+**The defects (AUDIT-confirmed, verified by the orchestrator).**
+(1) `answer_all` echoed ONE top-level `"run"` taken from `entries_at(&eb, 0)
+.run_epoch` while every param resolves its run INDEPENDENTLY in
+`answer_param`/`lookup_entries`. With two indexed runs where the newest covers
+only one requested param, the response echoed the NEWER run even though another
+result came from an older one — provenance lost or silently wrong, and the
+per-result objects carried no run at all.
+(2) `/v1/models` grid blocks reported `"winds_grid"` straight from `grid.bin`
+(written once from the FIRST group's source message) while stored fields are
+ALWAYS earth-relative post-rotation (field headers store `false`). The value
+was nondeterministic w.r.t. message order and contradicted the stored
+representation (reproduced on an HRRR LCC fixture: `true` vs `false` depending
+on which param decoded first).
+(3) Raw discipline/category/number params OUTSIDE the built-in table returned
+`units: ""` and config offered NO override, so spec §7 ("return values in
+native GRIB units ... and report the units") could not be satisfied for them.
+
+**Provenance shape chosen (additive, never a lie).** EVERY result object
+carries its own `"run"` (ISO 8601 Z, same format as the top level), APPENDED
+LAST inside the object so existing prefix/substring consumers keep matching;
+masked results carry it too (a masked answer still has a run). The TOP-LEVEL
+`"run"` is echoed when ALL results share one run — byte-identical to pre-E2
+responses for every single-run case, which is the overwhelming majority — and
+emitted as JSON `null` when they differ. Chosen over "always echo entry 0"
+(wrong half the time) and over "always null" (needless breakage): the echo is
+now a PROVEN fact about the whole response or absent. `render_point_json`
+dropped its `run_epoch` parameter entirely and derives the value from the
+entry buffer itself (one scalar scan, zero allocations; only `httpapi` calls
+it, so no other call sites moved).
+
+**Rename scope (metadata truth, storage untouched).** Only the `/v1/models`
+JSON KEY changed: `winds_grid` → `source_winds_grid`, both grid kinds. The
+VALUE semantics stay exactly as written into `grid.bin` — how the SOURCE
+messages arriving in `ingest_dir` encoded their components (flag table 3.3
+bit 3) — informational, possibly varying between runs of one model. Field
+headers, `grid.bin` layout and the internal `GridDef.winds_grid` field name
+are UNTOUCHED (storage version unchanged; old stores keep working). Stored
+and queried U/V are always earth-relative (§4.4), now stated in README §3.
+
+**Units validation decision: HARD ERROR, not warn+override.** The optional
+`units = "..."` key on `[[models.params]]` is legal ONLY on a raw triple the
+built-in table does NOT know. Setting it on a named param, or on a raw triple
+that resolves to a table param (e.g. 0/0/0 = TMP), fails startup naming the
+param and its canonical units — silently replacing known canonical units
+invites wrong-unit answers downstream, and config errors should be loud at
+boot per spec §3 ("fail loudly"). A raw param WITHOUT units still BOOTS (the
+operator may genuinely not know them) but logs exactly ONE note per affected
+entry at `Pipeline::open`, BEFORE any ingest round, naming the model, key,
+triple and the exact fix. `ResolvedParam.raw` (new) marks out-of-table triples
+purely to drive that note; it never touches the query path. Units flow through
+the existing chain (`ResolvedParam.units` → group → `FieldDef.units` →
+manifest / `/v1/models` / point responses) with zero further plumbing.
+
+**Fixtures + generator gotcha.** `prov_new_small.grib2`: NEWER run
+2026-10-19T18Z carrying ONLY `TMP@isobaric-1000` fh 0 (base 300 → node
+(10 N, 350 E) reads 300), paired with `gfs_small.grib2` (12Z run) so ONE
+query at valid 18Z mixes runs: TMP 300 from 18Z, UGRD 1310 (fh 6) from 12Z.
+`raw_small.grib2`: one message discipline 0 / category 19 / number 5
+(out-of-table → key `d0c19n5`), surface, fh 0, node value 42. Generator bug
+found while pinning them: `gen_grib2.py` REBINDS the variable `grid` to the
+HRRR LCC 61x41 template inside the wind loop (~line 590), so the new block
+initially wrote LCC section-3 bytes under 861-value planes — the decoder
+over-read bit 8616 of a 1077-byte section 7 (`index out of bounds: len 1077
+index 1077`) and panicked. Fixed by building a dedicated `egrid`
+(`sec3_latlon(41, 21, ...)`); all pre-existing fixtures regenerate
+byte-identical. These are also the FIRST simple-packing fixtures with
+`nbits = 10` (span 860), exercising a width no earlier small fixture reached.
+
+**API-visible changes.** `/v1/point`: additive per-result `"run"`; top-level
+`"run"` may be `null` (mixed provenance) — documented in README §3/§9.
+`/v1/models`: BREAKING key rename `winds_grid` → `source_winds_grid` (audit
+judged the old key's implication worse than the rename cost; smoke.sh never
+grepped it). Config: new optional `units` key (hard-error rules above). No
+new status codes or reason tokens anywhere.
+
+**Gates added:** `provenance_http.rs` (4 tests) — mixed provenance pins both
+values (300 / 1310), each run string EXACTLY once on its own result, top-level
+`"run":null`, and the old lie gone (no `"run":"<new>","valid"` prefix); common
+run pins the unchanged echo + per-result copies (occurrence count 3) with
+values 280 / 1280; single-param back-compat pins count 2; models endpoint pins
+the new key AND absence of `"winds_grid":` (leading-quote pattern cannot match
+`source_winds_grid`). Discrimination verified EMPIRICALLY: with only
+`queryapi.rs` + `httpapi.rs` stashed to pre-E2, ALL FOUR FAIL.
+`raw_units.rs` (3 tests) — with-override answers 42 with `kg/m^2` through
+FieldDef + manifest and stays SILENT; without-override boots with exactly one
+note naming `d0c19n5` before any ingest ran, answers 42 with `""`, and does
+not re-note per scan round; the validation matrix pins all five accept/reject
+cells (named+units, in-table-triple+units, out-of-table+units, out-of-table
+bare, named bare + `raw` flag). Pre-E2 these fail semantically (units were
+always `""`, no note mechanism existed; the matrix additionally references the
+new `raw` field, so it would not compile).

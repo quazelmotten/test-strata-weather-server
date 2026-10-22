@@ -56,3 +56,17 @@ file_glob = "hrrr.t*z.wrf*f*.grib2"
   [[models.params]]
   name = "TMP"
   levels = ["height_above_ground:2", "isobaric:*"]
+
+  # Raw parameter outside the built-in table (spec §3): give the GRIB2
+  # discipline/category/number triple instead of a name. The OPTIONAL units
+  # key is legal ONLY here — responses must report units (spec §7), and the
+  # table cannot supply them for an unknown triple. Setting units on any
+  # param the table already resolves (by name OR by an in-table triple) is a
+  # hard startup error. A raw param WITHOUT units still boots but logs one
+  # loud note per affected entry naming the exact fix.
+  #[[models.params]]
+  #discipline = 0
+  #category = 19
+  #number = 5
+  #levels = ["surface"]
+  #units = "kg/m^2"

@@ -704,6 +704,32 @@ def main():
         for r in crecs:
             f.write(r)
 
+    # ------------- V1.3 E2 PROVENANCE + RAW-PARAM FIXTURES -----------------
+    # prov_new_small.grib2: a NEWER run (2026-10-19T18Z) carrying ONLY
+    # TMP@isobaric-1000 fh 0 (base 300 -> node (10N,350E) reads 300), paired
+    # with gfs_small (run 12Z, TMP/UGRD/VGRD fh 0/6/12) so ONE multi-param
+    # query at valid 18Z resolves TMP from the NEW run and UGRD from the OLD
+    # one: pins per-result "run" provenance + the null-top-level rule
+    # (crates/wx-server/tests/provenance_http.rs).
+    t2 = sec1(2026, 10, 19, 18, 0, 0)
+    # NOTE: the variable `grid` was REBOUND by the HRRR loop above (line ~590);
+    # rebuild the GFS-like regular grid explicitly so these two fixtures carry
+    # the 41x21 template their 861-value planes belong to.
+    egrid = sec3_latlon(nx, ny, lon1, lat1, dlon, dlat, wind_grid=False)
+    pinc = [j * nx + i for j in range(ny) for i in range(nx)]
+    p5b, p7b, p6b, _ = encode_field(pinc, 300.0, 0, None)
+    p4b = sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_ISOBARIC, 1000 * 100, 0)
+    with open(os.path.join(a.out, "prov_new_small.grib2"), "wb") as f:
+        f.write(build_record(t2, egrid, p4b, p5b, p7b, p6b))
+    # raw_small.grib2: ONE message discipline 0 / category 19 / number 5,
+    # OUTSIDE the built-in parameter table (config key d0c19n5), surface
+    # level, fh 0, value 42 + j*nx + i (node 42). Configured WITH a `units`
+    # override (answers report it) or WITHOUT (units "" + loud startup note).
+    q4b = sec4(19, 5, LEVEL_SURFACE, 0, 0)
+    q5b, q7b, q6b, _ = encode_field(pinc, 42.0, 0, None)
+    with open(os.path.join(a.out, "raw_small.grib2"), "wb") as f:
+        f.write(build_record(t1, egrid, q4b, q5b, q7b, q6b))
+
     # ------------- FRACTIONAL FORECAST HOURS (V1.1 phase 3) -----------------
     # CT 4.4 unit = MINUTE (code 0): forecast hours 0h, 0h30m, 1h for run
     # 2026-10-19T12Z, PLUS a SECOND RUN 12:30Z inside the SAME FILE (the

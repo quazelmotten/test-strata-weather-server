@@ -24,6 +24,7 @@ fn one_model_cfg(data: String, ing: String) -> PointConfig {
         category: None,
         number: None,
         levels: lv,
+        units: None,
     });
     let mut ms = Vec::<ModelCfg>::new();
     ms.push(ModelCfg {
