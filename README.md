@@ -43,6 +43,7 @@ one without reading logs.
 | 4 | startup wind-pair preflight rejected the configuration (spec §4.4) |
 | 5 | tokio runtime init failed |
 | 6 | the configured `bind` address could not be bound |
+| 7 | provisional wind-pair enforcement fired (V1.3 phase E3b): a model configuring only ONE of UGRD/VGRD decoded a GRID-relative wind field after boot (its dir was empty/unstable at startup, so code 4 could not decide); `[ingest].wind_pair_enforce = false` opts out |
 | 8 | the HTTP server itself returned an error |
 
 
@@ -87,6 +88,7 @@ after normalization (canonicalize when the path exists, else lexical absolutizat
 | `ingest.stable_window_secs` | 10 | file must hold (size,mtime) stable this long before ingest; `0` still requires one re-observation |
 | `ingest.ingest_threads` | 4 | dedicated rayon decode pool (separate from the tokio HTTP runtime) |
 | `ingest.decode_batch_files` | 4 | V1.2 phase B: how many candidate files are decoded as ONE chunk before any is written (must be ≥ 1; bounds peak decode RAM at ~K files while keeping cross-file parallelism) |
+| `ingest.wind_pair_enforce` | true | V1.3 phase E3b: when a model configuring only ONE of UGRD/VGRD decodes a GRID-relative wind field after boot (the startup preflight could only defer), the ingest thread EXITS with code 7 instead of skipping winds + inflating errors forever; `false` keeps the sticky-note-and-skip behavior (documented deviation from spec §4.4's fail-loudly intent) |
 | `[[models]].sidecar_suffix` | absent | per-model alternative stability rule: eligible once `<file><suffix>` appears |
 
 Per model: `name`, `ingest_dir`, `file_glob` (glob is a FILTER ONLY — all
@@ -116,9 +118,19 @@ semantics, full rationale in docs/DECISIONS.md:
 * Every non-decisive case DEFERS with a log note instead of failing: empty dir /
   no matching file, matching files still inside the stability window, unreadable
   or non-GRIB file, or a file containing no wind message. Startup "stable" =
-  size > 0 AND mtime at least `stable_window_secs` old.
-* The decode-time `check_wind_pair` rule stays in force as the second line of
-  defense, so a deferred preflight still fails as soon as decisive data lands.
+  size > 0 AND mtime at least `stable_window_secs` old, compared against libc
+  `CLOCK_REALTIME` read directly (V1.3 phase E3b: the marker-file proxy is gone).
+  Since E3b the preflight also runs BEFORE any storage recovery touches data
+  (a fatal config must not delete run dirs on its way out).
+* A deferral is PROVISIONAL, not final (V1.3 phase E3b): the decode-time
+  `check_wind_pair` rule stays in force as the second line of defense, and with
+  `[ingest].wind_pair_enforce = true` (default) the first scan round whose
+  DECODED evidence proves the violation ends the process with exit code 7 after
+  printing the note — an empty-at-boot directory can no longer start OK and
+  then skip winds + inflate errors forever. Set the key `false` to opt back
+  into the sticky-note-and-skip behavior. Clock weirdness at boot can now only
+  DELAY a verdict, never cause a false hard-fail (those come from probed bytes)
+  nor a permanent miss (decoded evidence re-decides every round).
 * When BOTH components are configured on a grid-relative grid, U/V are rotated
   to earth-relative AT INGEST using the conformal angle derived from the
   projection's own validated cone geometry (per grid point) and stored earth-relative,
@@ -374,11 +386,25 @@ data_dir/
   first, then deleted on disk; stale mmap handles stay valid until their last
   `Arc` reference drops (Linux unlink-while-mapped), so in-flight queries never
   fault (`retention_evicts_after_publish_stale_snapshot_still_reads`).
-* Warm start: `state/files.json` (path+size+mtime_ns+FNV-1a64 over first/last
-  64 KiB, plus V1.2 phase B `kind`: 0 = ingested, 1 = magic-byte IGNORED, 2 = decode
-  FAILED quarantined WITH its hash) prevents re-ingest after restart; same path with
-  different content hash IS re-ingested (a FAILED record is retried ONLY then). Records
-  without a `kind` key (pre-V1.2 files) load as kind=0. The index is rebuilt from disk
+  Since V1.3 phase E3b the delete is QUARANTINED-FIRST: the victim run dir is
+  RENAMED to `<name>.deleting.<stamp>` (one atomic step; `parse_run_dir`
+  rejects the name, so the run is instantly invisible), then removed
+  recursively. A crash between the two leaves only a husk no indexer can
+  parse, and the STARTUP sweep finishes it before anything indexes — loudly
+  counted (`quarantined_husk_is_swept_at_boot_before_anything_indexes`;
+  rename-impossible falls back to the old direct delete, noted).
+* Warm start: `state/files.json` ((model, path)+size+mtime_ns+FNV-1a64 over
+  first/last 64 KiB, plus V1.2 phase B `kind`: 0 = ingested, 1 = magic-byte
+  IGNORED, 2 = decode FAILED quarantined WITH its hash) prevents re-ingest
+  after restart; same path with different content hash IS re-ingested (a
+  FAILED record is retried ONLY then). UPGRADE NOTE (V1.3 phase E3b): records
+  are now keyed PER MODEL (format VERSION 2, `"model"` key per record) so two
+  models sharing an ingest dir with overlapping globs BOTH ingest instead of
+  the first scanner starving the rest forever; a version-1 `files.json` is
+  DISCARDED LOUDLY once (one boot note, NOT an error) and every source file
+  re-ingests exactly ONCE — idempotent by construction, same philosophy as the
+  storage-format recovery traps. Inside v2 a record without a `kind` key still
+  loads as kind=0. The index is rebuilt from disk
   before any scan. V1.3 phase E3a: the two windows are read with plain
   `File`+`seek`+`read_exact` (no mmap on unstable candidates ⇒ no SIGBUS surface),
   digest and format UNCHANGED; a kind=2 record with an EMPTY hash marks the rare
@@ -927,12 +953,38 @@ live in §10 and docs/DECISIONS.md.
    files makes the same file ingest on the NEXT round without a restart. Skipped
    files are absent from `/v1/inventory`, which is the intended steady state, not a
    bug — check the counter to tell "pruned upstream" from "never delivered".
+* **Shared ingest directories are first-class (V1.3 phase E3b).** Two models
+   may point at the SAME (or nested) `ingest_dir` with overlapping `file_glob`s:
+   state records are keyed `(model, path)` so BOTH models ingest matching files
+   (pre-E3b the second was silently starved forever). Startup emits a LOUD
+   non-fatal warning naming both models, dirs and globs when the dirs are
+   equal-or-nested AND the globs are not provably disjoint (conservative
+   literal prefix/suffix heuristic — it OVER-warns rather than missing an
+   overlap; case compared as-is, matching `glob_match`). Sharing remains legal;
+   the file-stability tracker is deliberately PATH-keyed because "stopped
+   changing" is a property of the file, not of a model (`model_state_keys.rs`).
+* **A pathological tree cannot hang discovery (V1.3 phase E3b).** The recursive
+   walk classifies directories with `metadata()` and records each walked
+   directory's CANONICAL path in a visited set: a symlink to an ancestor is
+   skipped with a note instead of looping forever (the pre-E3b walk hung the
+   ingest thread AND the startup preflight infinitely). A hard
+   `WALK_MAX_PATHS = 1_000_000` cap bounds even worse shapes per round, noted
+   once; the next scan round resumes (`symlink_walk.rs`).
+* **A missing `grid.bin` is loud but non-destructive (V1.3 phase E3b).** A run
+   dir whose grid file is absent/unreadable gets ONE "MISSING GRID" note per
+   rebuild + one `errors` increment and stays OUT of the index until its source
+   re-delivers; unlike the CORRUPT-grid upgrade trap it is NOT auto-deleted —
+   nothing is wrong to repair, something is merely absent, and deleting could
+   race a producer mid-write at boot (`missing_gridbin.rs`).
 * **Exit codes** (`crates/wx-server/src/main.rs`, asserted nowhere but documented
    behaviour): `0` normal shutdown; `2` usage error (no `--config` and no
    `WXPOINT_CONFIG`, nothing started); `1` config validation failed loudly (spec
    §3); `3` pipeline initialisation failed (data dir/state unreadable); `4` the
    startup wind-pair PREFLIGHT rejected the config (grid-relative model with only
-   one of UGRD/VGRD) BEFORE any data was ingested or any port bound.
+   one of UGRD/VGRD) BEFORE any data was ingested or any port bound; `7` the
+   PROVISIONAL post-boot enforcement fired (V1.3 phase E3b: the same violation
+   proven by DECODED evidence after a deferred preflight — see
+   `[ingest].wind_pair_enforce`; `exit_codes.rs` pins both halves).
 * **Residual publish window (per-file granularity).** Because visibility flips once
   per SOURCE FILE, a scan round that consumes several files can momentarily expose
   one forecast hour without the next (normal: products DO arrive hour by hour) or

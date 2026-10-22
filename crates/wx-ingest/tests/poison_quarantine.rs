@@ -166,9 +166,9 @@ fn poison_files_are_quarantined_not_retried() {
     assert!(count_progress(&p, "quarantined") == 1);
     assert!(count_notes(&p, "quarantined") == 0);   // live channel only, never replayed
 
-    let rg = p.state.find(good.to_string());
-    let rs = p.state.find(sidecar.to_string());
-    let rb = p.state.find(bad.to_string());
+    let rg = p.state.find("gfs", good.as_str());
+    let rs = p.state.find("gfs", sidecar.as_str());
+    let rb = p.state.find("gfs", bad.as_str());
     match rg {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_OK); }
@@ -225,11 +225,11 @@ fn poison_files_are_quarantined_not_retried() {
     assert!(p2.scan_round() == 0);
     assert!(p2.counters.errors == 0);           // no NEW decode attempt
     assert!(p2.counters.ingested_files == 0);
-    match p2.state.find(bad.to_string()) {
+    match p2.state.find("gfs", bad.as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_FAILED); }
     }
-    match p2.state.find(sidecar.to_string()) {
+    match p2.state.find("gfs", sidecar.as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_IGNORED); }
     }

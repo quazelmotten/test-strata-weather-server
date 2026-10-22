@@ -148,7 +148,7 @@ fn stable_file_ingests_once_and_prints_once() {
     }
     assert!(nrec == 1);
     assert!(p.state.recs.len() == 1);
-    match p.state.find(target.clone()) {
+    match p.state.find("gfs", target.as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_OK); }
     }

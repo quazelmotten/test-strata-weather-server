@@ -1,7 +1,13 @@
 //! Persistent ingest record (spec §4.1): one JSON file under
-//! `<data_dir>/state/files.json` mapping source path -> {size, mtime_ns,
-//! content hash}. A restart must not re-ingest unchanged files; the same path
-//! with a different content hash MUST re-ingest. The state file itself is
+//! `<data_dir>/state/files.json` mapping (model, source path) -> {size,
+//! mtime_ns, content hash}. A restart must not re-ingest unchanged files; the
+//! same path with a different content hash MUST re-ingest. V1.3 phase E3b
+//! namespaces records BY MODEL (format version 2): two models sharing an
+//! ingest dir with overlapping globs each keep their OWN record for the same
+//! file, instead of the first scanner starving the rest forever. A `files.json`
+//! whose version differs from [`STATE_VERSION`] is DISCARDED LOUDLY once —
+//! exactly one full re-ingest after such an upgrade, documented in
+//! docs/DECISIONS.md §14 and the README upgrade note. The state file itself is
 //! written atomically (temp + fsync + rename), mirroring the .bin policy.
 //!
 //! Content hash: FNV-1a 64 over first 64 KiB ++ last 64 KiB (whole file once
@@ -82,6 +88,17 @@ pub struct FileRec {
     /// absent means 0 = OK, exactly what those records always were.
     #[serde(default)]
     pub kind: u8,
+    /// V1.3 phase E3b PER-MODEL NAMESPACING: the model this record belongs to.
+    /// Two models may legitimately share an ingest directory (or one nested
+    /// inside another) with overlapping globs; pre-E3b records were keyed by
+    /// PATH ALONE, so whichever model scanned first wrote the record and every
+    /// other model skipped the same path FOREVER (silent starvation — audit
+    /// defect 4). Records are now keyed (model, path). `#[serde(default)]`
+    /// matters only for parsing tolerance; the real guard against old files is
+    /// the VERSION bump below (v1 docs have no `model` key and are DISCARDED
+    /// loudly once, costing exactly one re-ingest per upgrade).
+    #[serde(default)]
+    pub model: String,
 }
 
 /// Record-kind constants (kept as named values: the pipeline and tests both
@@ -89,6 +106,16 @@ pub struct FileRec {
 pub const REC_OK: u8 = 0;
 pub const REC_IGNORED: u8 = 1;
 pub const REC_FAILED: u8 = 2;
+
+/// On-disk `files.json` format version (V1.3 phase E3b: **2** — records gained
+/// the `model` field and the derived index switched to (model, path) keys).
+/// A file whose version differs from this constant is DISCARDED LOUDLY at load
+/// (one full re-ingest after an upgrade, the same philosophy as the E0/E1
+/// storage-format recovery traps: re-decode is deterministic and cheap, a
+/// silently misinterpreted record is not). The discarded count + found version
+/// surface through [`StateStore::discarded_legacy`] / [`StateStore::found_version`]
+/// so the pipeline can note them exactly once at boot.
+pub const STATE_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct StateDoc {
@@ -101,13 +128,16 @@ pub struct StateStore {
     pub dir_path: String, // <data_dir>/state
     pub file_path: String, // <data_dir>/state/files.json
     pub recs: Vec<FileRec>,
-    /// V1.2 phase C STATE HYGIENE: path -> position in `recs`, so [`StateStore.find`]
-    /// is O(1) instead of a linear scan over every file ever ingested (a busy
-    /// ingest dir can hold tens of thousands of records, and `scan_round` calls
-    /// `find` once per candidate). `recs` stays the SERIALIZED ORDER and the
-    /// on-disk format is UNCHANGED (`save()` still walks `recs`, `kind` included);
-    /// `idx` is derived state, rebuilt by `reindex()` after every structural
-    /// change (load / upsert / drop_under / prune_missing).
+    /// V1.2 phase C STATE HYGIENE: (model, path) -> position in `recs`, so
+    /// [`StateStore.find`] is O(1) instead of a linear scan over every file ever
+    /// ingested (a busy ingest dir can hold tens of thousands of records, and
+    /// `scan_round` calls `find` once per candidate). Since V1.3 phase E3b the
+    /// key is the model-qualified pair joined with US (\x1f, a byte that cannot
+    /// appear in sane paths); before E3b it was the bare path, which starved
+    /// every model but the first when two models shared an ingest dir. `recs`
+    /// stays the SERIALIZED ORDER (`save()` still walks `recs`); `idx` is
+    /// derived state, rebuilt by `reindex()` after every structural change
+    /// (load / upsert / drop_under / prune_missing).
     pub idx: HashMap<String, usize>,
     /// V1.3 phase E3a BATCHED PERSISTENCE: true whenever `recs` diverged from
     /// the last successfully persisted image. Every mutation sets it; [`StateStore::save`]
@@ -116,6 +146,16 @@ pub struct StateStore {
     /// touching the disk at all (no clone, no serialize, no fsync) — that is what
     /// makes the per-chunk + per-round save cadence cheap.
     pub dirty: bool,
+    /// V1.3 phase E3b UPGRADE SIGNAL: true when a `files.json` existed but its
+    /// version differed from [`STATE_VERSION`], so ALL its records were dropped
+    /// (every source file will be re-ingested once). The pipeline turns this
+    /// into exactly one loud boot note; it is an expected upgrade event, NOT an
+    /// error, so it never touches the errors counter.
+    pub discarded_legacy: bool,
+    /// Version actually found in the discarded file (0 when none/unparsable).
+    pub found_version: u32,
+    /// Number of records that were discarded along with the old-version file.
+    pub discarded_records: usize,
 }
 
 impl StateStore {
@@ -128,6 +168,9 @@ impl StateStore {
             recs: Vec::<FileRec>::new(),
             idx: HashMap::<String, usize>::new(),
             dirty: false,
+            discarded_legacy: false,
+            found_version: 0,
+            discarded_records: 0,
         };
         match read_to_string(&file) {
             Err(_) => { st.reindex(); return Ok(st); }
@@ -135,6 +178,18 @@ impl StateStore {
                 match from_str::<StateDoc>(&text) {
                     Err(e) => { return Err(format!("bad state file {}: {}", file, e)); }
                     Ok(doc) => {
+                        // V1.3 phase E3b VERSION GATE: a doc written by another
+                        // format version is DISCARDED LOUDLY (the caller notes
+                        // it once at boot) rather than partially interpreted —
+                        // v1 records carry no `model`, and silently-namespaceless
+                        // records would resurrect the starvation bug E3b fixes.
+                        if doc.version != STATE_VERSION {
+                            st.discarded_legacy = true;
+                            st.found_version = doc.version;
+                            st.discarded_records = doc.recs.len();
+                            st.reindex();
+                            return Ok(st);
+                        }
                         for r in &doc.recs {
                             st.recs.push(r.clone());
                         }
@@ -146,19 +201,21 @@ impl StateStore {
         }
     }
 
-    /// Rebuild the path index from `recs` (last write wins for duplicate paths,
-    /// which `upsert` never creates but a hand-edited state file might).
+    /// Rebuild the (model, path) index from `recs` (last write wins for
+    /// duplicate keys, which `upsert` never creates but a hand-edited state
+    /// file might).
     pub fn reindex(self: &mut Self) {
         self.idx = HashMap::<String, usize>::new();
         for k in 0 .. self.recs.len() {
-            self.idx.insert(self.recs[k].path.to_string(), k);
+            self.idx.insert(state_key(self.recs[k].model.as_str(), self.recs[k].path.as_str()), k);
         }
     }
 
-    /// Look up the record for one source path. O(1) since V1.2 phase C (was a
-    /// linear scan over every record); semantics identical.
-    pub fn find(self: &Self, path: String) -> Option<FileRec> {
-        let pos = self.idx.get(&path);
+    /// Look up the record one SOURCE PATH carries FOR ONE MODEL. O(1) since
+    /// V1.2 phase C (was a linear scan over every record); semantics identical
+    /// except for the model qualification added by V1.3 phase E3b.
+    pub fn find(self: &Self, model: &str, path: &str) -> Option<FileRec> {
+        let pos = self.idx.get(&state_key(model, path));
         match pos {
             None => { return None; }
             Some(pi) => {
@@ -173,7 +230,8 @@ impl StateStore {
 
     pub fn upsert(self: &mut Self, rec: FileRec) {
         self.dirty = true;
-        let pos = self.idx.get(&rec.path);
+        let key = state_key(rec.model.as_str(), rec.path.as_str());
+        let pos = self.idx.get(&key);
         match pos {
             Some(pi) => {
                 let at = *pi;
@@ -187,7 +245,7 @@ impl StateStore {
             }
             None => {}
         }
-        self.idx.insert(rec.path.to_string(), self.recs.len());
+        self.idx.insert(key, self.recs.len());
         self.recs.push(rec);
     }
 
@@ -198,11 +256,14 @@ impl StateStore {
     /// eligible again, otherwise `scan_round` would skip them as "unchanged"
     /// forever and the model would stay EMPTY. Matching is on `<prefix>/` so a
     /// sibling directory whose name merely STARTS with the prefix is untouched.
-    pub fn drop_under(self: &mut Self, prefix: &str) -> usize {
+    /// V1.3 phase E3b: scoped to ONE MODEL — the storage-format recovery that
+    /// deletes a run tree belongs to one model and must not forget another
+    /// model's records for the same shared ingest directory.
+    pub fn drop_under(self: &mut Self, model: &str, prefix: &str) -> usize {
         let mut kept: Vec<FileRec> = Vec::<FileRec>::new();
         let mut n = 0usize;
         for r in &self.recs {
-            if under_prefix(&r.path, prefix) {
+            if r.model == model && under_prefix(&r.path, prefix) {
                 n += 1;
                 continue;
             }
@@ -264,7 +325,7 @@ impl StateStore {
         for r in &self.recs {
             copied.push(r.clone());
         }
-        let doc = StateDoc { version: 1, recs: copied };
+        let doc = StateDoc { version: STATE_VERSION, recs: copied };
         let text = serialize_text(&doc);
         let res = write_bytes_atomic(&self.file_path, &text);
         match res {
@@ -292,6 +353,13 @@ pub fn join_path(dir: &str, name: &str) -> String {
         return format!("/{}", name);
     }
     return format!("{}/{}", dir, name);
+}
+
+/// Derived-index key for one record: (model, path) joined with the ASCII unit
+/// separator (0x1F), a byte that cannot appear in a sane filesystem path and
+/// makes the composite key unambiguous (V1.3 phase E3b).
+pub fn state_key(model: &str, path: &str) -> String {
+    return format!("{0}\u{1f}{1}", model, path);
 }
 
 /// True when `path` lies UNDER `dir` (matched on `<dir>/`, so a sibling whose
@@ -478,8 +546,8 @@ pub fn serialize_text(doc: &StateDoc) -> String {
 }
 
 fn esc_rec(r: &FileRec) -> String {
-    return format!("{{\"path\":\"{}\",\"size\":{},\"mtime_ns\":{},\"hash\":\"{}\",\"kind\":{}}}",
-        esc_json_str(&r.path), r.size, r.mtime_ns, r.hash, r.kind);
+    return format!("{{\"path\":\"{}\",\"size\":{},\"mtime_ns\":{},\"hash\":\"{}\",\"kind\":{},\"model\":\"{}\"}}",
+        esc_json_str(&r.path), r.size, r.mtime_ns, r.hash, r.kind, esc_json_str(&r.model));
 }
 
 /// Parse state JSON text written by serialize_text.

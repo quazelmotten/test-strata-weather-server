@@ -58,6 +58,16 @@ pub struct IngestCfg {
     pub ingest_threads: Option<u32>,
     // V1.2 phase B: chunk size of the DECODE stage (see module docs).
     pub decode_batch_files: Option<u32>,
+    // V1.3 phase E3b: fail-closed enforcement of the spec §4.4 wind-pair rule
+    // AFTER boot. Default TRUE: when a model that configures exactly one of
+    // UGRD/VGRD decodes a message whose grid declares GRID-relative vector
+    // components, the ingest thread exits NON-ZERO (code 7) so a supervisor
+    // restarts it with a fixed config — the boot-time preflight can only probe
+    // files that already exist AND are stable, so an empty-at-boot ingest dir
+    // used to start OK and then silently skip winds + inflate errors forever.
+    // Set FALSE to keep the old sticky-note-and-skip behavior (documented
+    // deviation from spec §4.4 in README §9 + docs/DECISIONS.md §14).
+    pub wind_pair_enforce: Option<bool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -481,6 +491,119 @@ pub fn wind_pair_gap(params: &[ResolvedParam]) -> Option<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// V1.3 phase E3b: SHARED-DIRECTORY GLOB-OVERLAP WARNING (startup, non-fatal)
+// ---------------------------------------------------------------------------
+
+/// Fixed literal PREFIX of a glob: everything before the first wildcard
+/// character. Our matcher (discovery::glob_match) knows exactly two wildcards,
+/// `*` and `?` (brackets are LITERAL), so those are the only split points.
+fn glob_fixed_prefix(pat: &str) -> String {
+    let mut out = String::new();
+    for c in pat.chars() {
+        if c == '*' || c == '?' {
+            break;
+        }
+        out.push(c);
+    }
+    return out;
+}
+
+/// Fixed literal SUFFIX of a glob: everything after the LAST wildcard.
+fn glob_fixed_suffix(pat: &str) -> String {
+    let chars: Vec<char> = pat.chars().collect();
+    let mut out = String::new();
+    let mut k = chars.len();
+    while k > 0 {
+        let c = chars[k - 1];
+        if c == '*' || c == '?' {
+            break;
+        }
+        out.insert(0, c);
+        k -= 1;
+    }
+    return out;
+}
+
+/// True when two literal strings COULD both be prefixes (suffixes) of one and
+/// the same name: either is empty, or one starts with the other.
+fn literals_compatible(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return true;
+    }
+    let ac: Vec<char> = a.chars().collect();
+    let bc: Vec<char> = b.chars().collect();
+    let n = if ac.len() < bc.len() { ac.len() } else { bc.len() };
+    for k in 0 .. n {
+        if ac[k] != bc[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// CONSERVATIVE literal check: could ONE basename match BOTH globs? The two
+/// fixed prefixes must be mutually compatible AND the two fixed suffixes too;
+/// anything provably incompatible (e.g. `gfs.t*z.pgrb2*` vs `hrrr.t*z.wrf*`)
+/// answers "disjoint". LIMITS (documented deliberately): the check ignores
+/// what the wildcards themselves could match, so `a*b` vs `axb` reports
+/// MAYBE-overlap even though no name matches both — over-warning is the safe
+/// direction for a startup note; case is compared as-is, matching glob_match.
+pub fn globs_maybe_overlap(a: &str, b: &str) -> bool {
+    let pa = glob_fixed_prefix(a);
+    let pb = glob_fixed_prefix(b);
+    if !literals_compatible(pa.as_str(), pb.as_str()) {
+        return false;
+    }
+    let sa = glob_fixed_suffix(a);
+    let sb = glob_fixed_suffix(b);
+    return literals_compatible(sa.as_str(), sb.as_str());
+}
+
+/// True when two NORMALIZED directory paths are equal or one contains the
+/// other (component-wise, reusing the phase-C guard helpers).
+fn dirs_nested_or_equal(na: &str, nb: &str) -> bool {
+    let pa = path_parts(na);
+    let pb = path_parts(nb);
+    let n = if pa.len() < pb.len() { pa.len() } else { pb.len() };
+    for k in 0 .. n {
+        if pa[k] != pb[k] {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Startup WARNINGS (non-fatal) for every model PAIR whose ingest dirs are
+/// equal-or-nested AND whose file globs are not provably disjoint. Pre-E3b
+/// this configuration was a silent correctness trap: state records were keyed
+/// by path alone, so the first model to scan recorded the file and the second
+/// skipped it FOREVER. With per-model records (E3b) both models now genuinely
+/// ingest the same files — which may still surprise an operator who meant
+/// them to be separate, hence the loud note naming both models, both dirs and
+/// both globs. NOT an error: shared directories are legitimate (one upstream
+/// feeding several configured models is a real deployment shape).
+pub fn glob_overlap_warnings(models: &[ResolvedModel]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::<String>::new();
+    for a in 0 .. models.len() {
+        for b in (a + 1) .. models.len() {
+            let ma = &models[a];
+            let mb = &models[b];
+            let na = norm_dir_path(&ma.ingest_dir);
+            let nb = norm_dir_path(&mb.ingest_dir);
+            if !dirs_nested_or_equal(na.as_str(), nb.as_str()) {
+                continue;
+            }
+            if !globs_maybe_overlap(ma.file_glob.as_str(), mb.file_glob.as_str()) {
+                continue;
+            }
+            out.push(format!("config warning: models '{0}' and '{1}' share the ingest directory tree ('{2}' vs '{3}') AND their file_globs ('{4}' vs '{5}') are not provably disjoint — BOTH models will decode every matching file (records are per-model since V1.3 E3b). If that is unintended, narrow one file_glob or move one model's files.",
+                ma.name, mb.name, ma.ingest_dir, mb.ingest_dir, ma.file_glob, mb.file_glob));
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // startup wind-pair preflight (spec §4.4: "If only one component is configured
 // for a grid-relative model, fail config validation with a clear message.")
 // ---------------------------------------------------------------------------
@@ -495,15 +618,26 @@ pub fn wind_pair_gap(params: &[ResolvedParam]) -> Option<(String, String)> {
 /// * exactly one component but the grid is earth-relative -> accepted (note);
 /// * no stable candidate file / unreadable file / unsupported grid template ->
 ///   DEFERRED with a note: the decode-time rule (`check_wind_pair` in the
-///   pipeline, second line of defense) still fires as soon as data lands.
+///   pipeline, second line of defense) still fires as soon as data lands —
+///   and since V1.3 phase E3b that firing is PROVISIONAL ENFORCEMENT: with
+///   `[ingest].wind_pair_enforce = true` (default) the ingest thread EXITS
+///   NON-ZERO (code 7) after the scan round that first decoded a grid-relative
+///   wind for the half-configured model, so an empty-at-boot directory can no
+///   longer start OK and then skip winds + inflate errors forever.
 ///
 /// Stability here means "size > 0 and mtime at least `stable_window_secs` old":
 /// unlike a scan round, a single startup probe cannot observe size/mtime over
-/// time, so age is the practical equivalent (documented decision). Notes are
-/// returned for the caller to log; Err carries the fatal message.
+/// time, so age is the practical equivalent (documented decision). `now_ns`
+/// MUST be wall-clock epoch ns (same domain as mtimes); V1.3 phase E3b moved
+/// the caller off the marker-file proxy onto libc CLOCK_REALTIME directly.
+/// A wrong verdict is now harmless in BOTH directions: too-old mtimes merely
+/// DEFER (provisional enforcement re-decides with decoded evidence later),
+/// and the hard-fail answer comes from the probed bytes, never from the
+/// clock. Notes are returned for the caller to log; Err carries the fatal
+/// message.
 pub fn startup_wind_preflight(models: Vec<ResolvedModel>, stable_window_secs: u32,
                               now_ns: i64) -> Result<Vec<String>, String> {
-    use crate::discovery::{glob_match, walk_files, base_name};
+    use crate::discovery::{glob_match, walk_files_bounded, WALK_MAX_PATHS, base_name};
     use crate::state::stat_size_mtime;
     use crate::grib2::{probe_first_grid};
 
@@ -514,8 +648,14 @@ pub fn startup_wind_preflight(models: Vec<ResolvedModel>, stable_window_secs: u3
         match gap {
             None => { continue; }
             Some(pair) => {
-                // first stable file matching the model's glob (walk_files sorts)
-                let cands = walk_files(&mdl.ingest_dir);
+                // first stable file matching the model's glob (the walk sorts;
+                // V1.3 phase E3b: symlink-safe + capped, walk notes join the
+                // preflight notes so operators see WHY candidates are missing)
+                let mut wnotes: Vec<String> = Vec::<String>::new();
+                let cands = walk_files_bounded(mdl.ingest_dir.as_str(), WALK_MAX_PATHS, &mut wnotes);
+                for n in &wnotes {
+                    notes.push(n.to_string());
+                }
                 let mut chosen = "".to_string();
                 let mut unstable = 0;
                 for c in &cands {

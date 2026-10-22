@@ -5,6 +5,14 @@
 // deliberately broken startup conditions and assert the documented NON-ZERO codes
 // (main.rs exit-code table): 2 = usage, 1 = config invalid (including the NEW
 // data_dir / ingest_dir OVERLAP guard).
+//
+// V1.3 phase E3b adds the PROVISIONAL WIND-PAIR ENFORCEMENT code 7: a model
+// configuring only ONE of UGRD/VGRD whose ingest dir was empty/unstable AT BOOT
+// (so the boot preflight could only DEFER) must exit non-zero once its first
+// grid-relative wind file is DECODED, instead of skipping winds + inflating
+// errors forever. The two tail tests pin both halves: rc == 7 with the default
+// `[ingest].wind_pair_enforce = true`, and NO early exit (killed by `timeout`,
+// rc 124) when the key is set false while the violation note still fires.
 
 use std::env::var;
 use std::fs::File;
@@ -14,6 +22,7 @@ use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
 use std::fs::read_to_string;
+use std::fs::read as read_file_bytes;
 use wx_ingest::state::{join_path, stat_size_mtime};
 use wx_ingest::discovery::{path_to_str};
 
@@ -109,9 +118,17 @@ fn cfg_with(data: &str, ing: &str, param: &str) -> String {
 #[allow(clippy::needless_return)]
 fn run_and_capture(args: String, root: String) -> i64 {
     let bin = binary_path();
+    return run_cmd(format!("env -u WXPOINT_CONFIG {0} {1}", bin, args), root);
+}
+
+// V1.3 phase E3b: the shared runner behind run_and_capture, taking the FULL
+// shell command body so a test can prefix it (e.g. `timeout 12 ...` for a
+// process that must NOT exit early). rc capture + parsing are identical.
+#[allow(clippy::needless_return)]
+fn run_cmd(cmd_body: String, root: String) -> i64 {
     let logf = join_path(&root, "run.log");
     let rcf = join_path(&root, "rc.txt");
-    let cmd = format!("env -u WXPOINT_CONFIG {0} {1} > {2} 2>&1; echo rc=$? > {3}", bin, args, logf, rcf);
+    let cmd = format!("{0} > {1} 2>&1; echo rc=$? > {2}", cmd_body, logf, rcf);
     let buf = c_str(cmd);
     let _sys = unsafe { libc_system(&buf[0]) };
     let txt = match read_to_string(&rcf) {
@@ -215,5 +232,118 @@ fn an_unknown_parameter_name_in_the_config_exits_with_the_config_code() {
     let rc = run_and_capture(args, root.to_string());
     assert!(rc != 0);
     assert!(rc == 1);
+    rm_tree(&root);
+}
+
+// ---------------------------------------------------------------------------
+// V1.3 phase E3b — PROVISIONAL WIND-PAIR ENFORCEMENT (exit code 7)
+// ---------------------------------------------------------------------------
+
+/// hrrr model with ONLY UGRD configured (spec §4.4 half-pair). `extra` injects
+/// the optional [ingest].wind_pair_enforce key; `bind` keeps parallel tests
+/// off each other's port. stable_window_secs = 4 makes the FRESHLY-COPIED
+/// fixture UNSTABLE at preflight time (mtime ~0 s old < 4 s window) so the
+/// boot probe can only DEFER — the enforcement then has to come from DECODED
+/// evidence, which is exactly the audit-defect-5 scenario.
+#[allow(clippy::needless_return)]
+fn wind_cfg(data: &str, ing: &str, bind: &str, extra: &str) -> String {
+    let t = "[server]\nbind = \"";
+    let t = format!("{0}{1}", t, bind);
+    let t = t + "\"\ndata_dir = \"";
+    let t = format!("{0}{1}", t, data);
+    let t = t + "\"\n\n[ingest]\nscan_interval_secs = 1\nretention_runs = 4\nstable_window_secs = 4\n";
+    let t = format!("{0}{1}", t, extra);
+    let t = t + "\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
+    let t = format!("{0}{1}", t, ing);
+    let t = t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n";
+    return t;
+}
+
+#[allow(clippy::needless_return)]
+fn write_bytes(path: String, bytes: &[u8]) {
+    let d = File::create(&path);
+    match d {
+        Err(_) => { assert!(false); return; }
+        Ok(mut w) => {
+            let n = w.write_all(bytes);
+            match n {
+                Err(_) => { assert!(false); return; }
+                Ok(_) => {}
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_wind_violation_exits_seven_after_the_decoding_round() {
+    let root = "/tmp/opencode/wxpoint-exit-wind7".to_string();
+    rm_tree(&root);
+    let ing = join_path(&root, "incoming");
+    let data = join_path(&root, "store");
+    let _c = create_dir_all(&ing);
+    // Copy the grid-relative fixture IMMEDIATELY before spawn so its mtime is
+    // ~now: the boot preflight sees one unstable candidate and defers (no rc
+    // 4), while the scan rounds make it eligible ~window seconds later and the
+    // decode fires the violation.
+    let fx = read_file_bytes("../../tests/fixtures/hrrr_small.grib2");
+    let bytes = match fx {
+        Err(_) => { assert!(false); return; }
+        Ok(b) => { b }
+    };
+    write_bytes(join_path(&ing, "hrrr_small.grib2"), &bytes[..]);
+    let cfg = join_path(&root, "config.toml");
+    write_text(&cfg, wind_cfg(&data, &ing, "127.0.0.1:8123", "").as_str());
+    let args = format!("--config {0}", cfg);
+    // run_and_capture BLOCKS until the process exits: default enforce=true
+    // must kill it with code 7 once round ~window+1 decodes the winds. If the
+    // defect regressed, the server would NEVER exit and this test would hang
+    // (bounded by the outer cargo/CI timeout, as intended for a regression).
+    let rc = run_and_capture(args, root.to_string());
+    assert!(rc == 7);
+
+    // The operator saw WHY: the decode-time note AND the FATAL exit line.
+    let logf = join_path(&root, "run.log");
+    let txt = match read_to_string(&logf) {
+        Err(_) => { assert!(false); return; }
+        Ok(t) => { t }
+    };
+    assert!(txt.contains("wind pair rule violated"));
+    assert!(txt.contains("exit 7"));
+    rm_tree(&root);
+}
+
+#[test]
+fn wind_pair_enforce_false_keeps_the_note_but_never_exits_early() {
+    let root = "/tmp/opencode/wxpoint-exit-windoff".to_string();
+    rm_tree(&root);
+    let ing = join_path(&root, "incoming");
+    let data = join_path(&root, "store");
+    let _c = create_dir_all(&ing);
+    let fx = read_file_bytes("../../tests/fixtures/hrrr_small.grib2");
+    let bytes = match fx {
+        Err(_) => { assert!(false); return; }
+        Ok(b) => { b }
+    };
+    write_bytes(join_path(&ing, "hrrr_small.grib2"), &bytes[..]);
+    let cfg = join_path(&root, "config.toml");
+    write_text(&cfg, wind_cfg(&data, &ing, "127.0.0.1:8124",
+                              "wind_pair_enforce = false\n").as_str());
+    let bin = binary_path();
+    // `timeout 12`: comfortably past the window(4 s)+rounds(~5-6 s) at which
+    // the DECODED violation fires, yet the opted-out process must still be
+    // RUNNING -> timeout kills it -> shell rc 124 (never 7).
+    let body = format!("timeout 12 env -u WXPOINT_CONFIG {0} --config {1}", bin, cfg);
+    let rc = run_cmd(body, root.to_string());
+    assert!(rc == 124);
+
+    // The documented sticky-note behavior survives opt-out: the violation IS
+    // reported, only the process-level exit is declined.
+    let logf = join_path(&root, "run.log");
+    let txt = match read_to_string(&logf) {
+        Err(_) => { assert!(false); return; }
+        Ok(t) => { t }
+    };
+    assert!(txt.contains("wind pair rule violated"));
+    assert!(!txt.contains("exit 7"));
     rm_tree(&root);
 }

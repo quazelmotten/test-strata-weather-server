@@ -225,7 +225,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
 
     // THE STATE RECORD MUST STILL CARRY THE OLD HASH (stale REC_OK from life
     // 1): pre-fix this upserted the NEW hash and the retry could never happen.
-    let rec_r = p1.state.find(src.clone());
+    let rec_r = p1.state.find("stat", src.as_str());
     match rec_r {
         None => { assert!(false); return; }
         Some(rc) => {
@@ -270,7 +270,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     assert!(bytes_contains(&man_now, "\"fh_secs\":0,\"begin\":\"2026-10-19T12:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\"".as_bytes()));
 
     // State now records the CURRENT hash as ingested.
-    let rec2_r = p1.state.find(src.clone());
+    let rec2_r = p1.state.find("stat", src.as_str());
     match rec2_r {
         None => { assert!(false); return; }
         Some(rc2) => {

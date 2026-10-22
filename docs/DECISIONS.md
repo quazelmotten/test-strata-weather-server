@@ -2528,3 +2528,178 @@ semantically, pre-E3a the chmod file would have been silently skipped forever
 were 5 where the gate asserts 2. `hash_compat`'s golden/equivalence cases pass
 before AND after BY DESIGN (that IS the compatibility proof); its shrink/empty
 case fails pre-E3a (mmap of an empty file Errs).
+
+## 14. V1.3 phase E3b — five audit-confirmed robustness defects (2026-10-22)
+
+Audit 1.2 confirmed five defects, each with a concrete repro. All five are fixed
+here; every choice below favors CORRECTNESS and LOUDNESS over cleverness, and
+each fix ships discriminating tests (they fail against the pre-fix tree).
+
+### 14.1 Symlink-loop hang in the recursive walk (`discovery::walk_files`)
+
+The pre-E3b walk classified directories by "read_dir succeeded", so a symlink
+pointing at an ANCESTOR directory re-entered itself forever: the ingest thread
+AND the startup wind preflight (both walk ingest dirs) hung INFINITELY, silently.
+
+* **Chosen fix:** classify with `metadata()` (which FOLLOWS symlinks) and record
+  every walked directory in a VISITED set keyed by its CANONICAL path. A link to
+  an ancestor resolves to an already-walked identity -> skipped with a note.
+  A hard cap `WALK_MAX_PATHS = 1_000_000` bounds even pathological trees per
+  round; on hit the walk stops adding and says so ONCE through the caller's
+  notes channel (next round resumes).
+* **Rejected alternatives:** `nix`/`ftw` dependencies (heavier dep for one
+  loop case); depth limits alone (a symlink farm can nest unboundedly while
+  individual paths stay short); silently ignoring symlinks entirely (files
+  BEHIND a legit dir-symlink would vanish from ingest — real deployments stage
+  products through links).
+* **API decision:** `walk_files` keeps its old signature as a thin wrapper
+  (notes dropped) so existing callers/tests are untouched; the pipeline scan
+  and the preflight switched to `walk_files_bounded(dir, cap, &mut notes)` and
+  surface every anomaly through `p.note()` / the preflight notes.
+* **Edge pinned by test:** a directory that exists but cannot be canonicalized
+  (permissions on some component) SKIPS the subtree with a note rather than
+  descending unresolvably; a symlink straight to a FILE remains a candidate
+  (unchanged behavior); deep loop-free trees produce ZERO notes.
+
+### 14.2 Silent missing `grid.bin` (`pipeline::ingest_run_dir`)
+
+A CORRUPT grid.bin got the storage-format recovery treatment (loud note +
+delete + forget records), but a MISSING or unreadable one answered a bare
+`None => { return; }`: an orphan run tree sat there invisible to
+`/v1/inventory`, zero notes, zero counters.
+
+* **Chosen fix:** ONE loud "MISSING GRID" note per run per rebuild naming the
+  run dir + one `errors` increment. The run stays INVISIBLE until its source
+  re-delivers.
+* **Deliberately NOT auto-deleted** (unlike the version-mismatch trap): nothing
+  is wrong to REPAIR, something is merely ABSENT — the producer may still be
+  mid-write at boot, and deleting could race it. The corrupt-grid.bin branch
+  keeps deleting because THERE the bytes are provably from another format.
+* **Counter decision:** counted in `errors` (an operator-visible anomaly), no
+  new named counter (the event is rare and the note carries all context).
+
+### 14.3 Non-atomic retention delete (`retention_prune` / `delete_tree`)
+
+Retention called `delete_tree` directly and IGNORED every error; a crash
+MID-DELETE left a PARTIAL oldest run whose name still parsed, so it RE-INDEXED
+on restart and answered incomplete queries until the next prune evicted it.
+
+* **Chosen fix (quarantine-then-delete):** rename the victim to
+  `<name>.deleting.<mono_elapsed_ns>` FIRST — one atomic operation that
+  `parse_run_dir` rejects (length rule: exactly 10/12/14 digits), making the
+  run instantly invisible — then delete recursively. Rename retry appends
+  `.N` suffixes (up to 8) on EEXIST-style collisions; ENOENT means the victim
+  already vanished (done). A rename that CANNOT happen (EACCES, EXDEV) falls
+  back to the old direct delete, loudly noted.
+* **`delete_tree` now returns the failed-removal count** (ENOENT counts as
+  success — the goal was "it is gone"); partial deletes are noted + counted,
+  and the remainder becomes the startup sweep's problem on purpose.
+* **Startup sweep** (`sweep_deleting_dirs`) runs inside `Pipeline::open` BEFORE
+  `rebuild_from_disk` indexes anything: every `*.deleting.*` entry under a
+  model's data-dir top level is finished off, announced once with a count;
+  sweep failures are noted + counted and left for the next boot.
+* **In-flight safety unchanged:** the registry entry is removed + published
+  BEFORE the rename, and mmap handles are Arc-refcounted, so queries holding a
+  snapshot keep reading until their last reference drops (unlink-while-mapped).
+* **Rejected alternative:** journaling the pending delete into the state file
+  (durable but couples two subsystems; the name-based quarantine is
+  self-describing on the filesystem and needs no schema).
+
+### 14.4 Path-only state records starving overlapping models (`state.rs`)
+
+Records were keyed by PATH ONLY. Two models sharing an ingest dir (or nested)
+with overlapping globs: whichever scanned first wrote the record, every other
+model saw "unchanged" and skipped the file FOREVER — silent starvation, second
+model never queryable.
+
+* **Chosen fix:** `FileRec` gained a `model` field; the derived index, `find`,
+  `drop_under` and the I/O-streak identity are keyed `(model, path)` (joined
+  with ASCII 0x1F, impossible in sane paths). `prune_missing` deliberately
+  STAYS path-wide: a vanished source file invalidates EVERY model's record.
+* **On-disk format bumped to VERSION 2.** A `files.json` whose version differs
+  is DISCARDED LOUDLY at load (`discarded_legacy` / `found_version` /
+  `discarded_records` surface exactly one boot note). **Decision: discard, do
+  not migrate.** v1 records carry no model namespace; partially interpreting
+  them would resurrect the starvation bug. The cost is ONE full re-ingest per
+  upgrade, idempotent by construction (merge dedup + atomic renames) — the
+  same philosophy as the E0/E1 storage-format recovery traps. Discarding is an
+  EXPECTED upgrade event, so it does NOT touch the errors counter. Inside v2,
+  a record missing `kind` still defaults to OK (the pre-V1.2 serde contract
+  survives where it is safe).
+* **Stability tracker deliberately stays PATH-keyed:** "this file stopped
+  changing" is a property of the FILE, not of a model; two models observing the
+  same path share one observation and both become eligible together. (With
+  `stable_window_secs = 0` this makes the second model eligible in the SAME
+  round the first stamped the entry — pinned in `model_state_keys.rs`.)
+* **Startup glob-overlap warning** (`config::glob_overlap_warnings`, emitted
+  via `p.note()` in `Pipeline::open`): for every model PAIR whose normalized
+  ingest dirs are EQUAL or NESTED (phase-C helpers reused) AND whose globs are
+  not PROVABLY disjoint. Disjointness is a conservative literal check: fixed
+  prefixes/suffixes around the wildcards must be mutually incompatible. Only
+  `*` and `?` are treated as wildcards because `discovery::glob_match` knows
+  only those two (`[` is LITERAL there — matching the matcher beats being
+  generically clever). Over-warning is the documented safe direction for a
+  non-fatal note; shared directories remain LEGAL (one upstream feeding
+  several models is a real deployment shape), hence warning, not error.
+
+### 14.5 Boot-only wall-clock wind-pair preflight -> provisional enforcement
+
+The spec §4.4 check ran ONLY at startup against the first STABLE file matching
+the glob. A half-configured model (only UGRD or only VGRD) whose ingest dir was
+empty/unstable at boot started fine; when its first grid-relative file landed,
+the decode-time rule noted once, skipped every wind message and inflated
+errors FOREVER — no machine-observable failure.
+
+* **Ordering fix:** the preflight moved from `start_pipeline` into `main()`,
+  BEFORE `Pipeline::open`, because open performs DESTRUCTIVE storage-format
+  recovery (deleting upgrade-trap run dirs + forgetting records) — a fatal
+  wind config must fail before any data is touched. Exit code 4 unchanged.
+* **Clock fix:** the stability probe's `now_ns` comes from libc
+  `CLOCK_REALTIME` directly (wx-server already links libc), replacing the
+  `.wxpoint-clock` marker-file proxy (filesystem write that can silently fail
+  to 0). NOTE: `MonoClock` is `Instant`-elapsed-only (process-local origin),
+  NOT comparable to mtimes, so it cannot replace CLOCK_REALTIME here; what the
+  audit's "use monotonic" guidance actually buys is achieved differently:
+  durations everywhere else stay on MonoClock, and a wrong verdict at boot can
+  now ONLY DEFER — deferral is safe because enforcement is provisional.
+  `clock_gettime` failing returns 0 => everything looks just-written => defer
+  (the safe direction).
+* **Provisional enforcement:** the decode-time firing (sticky `wind_violation`
+  flag, set when a half-configured model meets a GRID-relative wind grid) is
+  now acted upon: the ingest thread prints the pending notes and EXITS WITH
+  CODE 7 after that scan round. Code 7 chosen because 5 is taken by tokio-init
+  and 6/8 by bind/serve failures (table extended, not reshuffled — existing
+  codes keep their meanings).
+* **New config key `[ingest] wind_pair_enforce` (default TRUE).** Fail-closed:
+  spec §4.4 says "fail config validation", so post-boot evidence should fail
+  too. `false` opts back into the pre-E3b sticky-note-and-skip behavior —
+  documented deviation for operators who deliberately run half-wind models on
+  earth-relative grids whose files mix conventions. The LIBRARY never exits
+  (tests drive `scan_round` directly); only main's ingest thread acts on the
+  flag, keeping wx-ingest free of process policy.
+* **Preflight walk is symlink-safe + capped for free** (shares the 14.1 fix),
+  and its walk anomalies now join the returned notes instead of vanishing.
+
+### 14.6 Existing tests adjusted (and why)
+
+* `disk_full_retry.rs`: plants a bare run-dir skeleton before `Pipeline::open`;
+  boot now LOUDLY reports its missing grid.bin (14.2), so the errors baseline
+  moves 1 -> 2 with BOTH sources asserted explicitly (boot MISSING GRID note +
+  the group-write failure the test actually targets).
+* `state_hygiene.rs`: rewritten honestly for E3b semantics — writer emits
+  version 2 + `"model"` keys; a hand-written VERSION-1 doc is now DISCARDED
+  (asserts `discarded_legacy`/`found_version`/`discarded_records`), while the
+  surviving "missing kind defaults to OK" contract is re-pinned INSIDE v2.
+* Mechanical `(model, path)` signature updates: `find("gfs"|"stat"|"m", ...)`
+  in disk_full_retry / io_retry / manifest_fail_retry / poison_quarantine /
+  progress_once_per_file / retention_skip_{peekfail,same_run,stale} /
+  state_hygiene; `io_retry` streak-field index shifts (.4 -> .5/.6) with the
+  7-tuple identity; `config_overlap.rs` IngestCfg literal gains the new key.
+
+### 14.7 New counters / exit codes summary
+
+* NO new named Prometheus counters. E3b advances only the existing
+  `wxpoint_errors_total` (missing-grid notes, sweep/quarantine delete failures)
+  and reuses `skipped_messages` / `quarantined_files` exactly as before.
+* Exit-code table EXTENDED with `7` (provisional wind-pair enforcement);
+  0/1/2/3/4/5/6/8 keep their established meanings.

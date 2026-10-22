@@ -146,7 +146,7 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
     // (b) it went down the NORMAL path: quarantined as a FAILED decode
     assert!(p.counters.errors == 1);
     assert!(p.counters.quarantined_files == 1);
-    match p.state.find(bad.to_string()) {
+    match p.state.find("gfs", bad.as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_FAILED); }
     }
@@ -158,7 +158,7 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
     assert!(p.counters.retention_skipped_files == 0);
 
     // ---- the good run is still queryable and unaffected ------------------
-    match p.state.find(join_path(&ing, "gfs_small.grib2").to_string()) {
+    match p.state.find("gfs", join_path(&ing, "gfs_small.grib2").as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_OK); }
     }

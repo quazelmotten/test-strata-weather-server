@@ -57,24 +57,82 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
 
 // ---------------------------------------------------------------------------
 // recursive walk: every regular-file candidate under dir (depth-first, sorted
-// for determinism). Directories are detected by trying to list them, which
-// avoids depending on a file-type accessor in this dialect.
+// for determinism). V1.3 phase E3b SYMLINK SAFETY: the pre-E3b walk classified
+// directories by "read_dir succeeded", so a symlink pointing at an ANCESTOR
+// directory re-entered itself forever and hung the ingest thread (and the
+// startup wind preflight) INFINITELY. Directories are now classified with
+// `metadata()` (which follows symlinks) and recorded in a VISITED set keyed by
+// their CANONICAL path: a link to an ancestor resolves to an already-walked
+// identity and is skipped with a note instead of looping. A hard cap on
+// emitted paths bounds even pathological trees per round.
 // ---------------------------------------------------------------------------
 
+use std::collections::HashSet;
+use std::fs::canonicalize;
+use std::fs::metadata;
+
+/// Hard cap on paths emitted by ONE walk (V1.3 phase E3b). Production ingest
+/// dirs hold thousands of files; a million is orders of magnitude beyond that,
+/// so the cap only fires on genuinely pathological trees — and then loudly,
+/// once, through the caller's notes channel.
+pub const WALK_MAX_PATHS: usize = 1_000_000;
+
 pub fn walk_files(dir: &str) -> Vec<String> {
+    let mut notes: Vec<String> = Vec::<String>::new();
+    return walk_files_bounded(dir, WALK_MAX_PATHS, &mut notes);
+}
+
+/// The symlink-safe, capped walk. Anomalies (loop skips, unresolvable
+/// directories, cap hits) are APPENDED to `notes` for the caller to surface —
+/// `walk_files` keeps the old signature and simply drops them (callers that
+/// cannot log still get correct results, just silently).
+pub fn walk_files_bounded(dir: &str, cap: usize, notes: &mut Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::<String>::new();
     let mut stack: Vec<String> = Vec::<String>::new();
+    let mut visited: HashSet<String> = HashSet::<String>::new();
     stack.push(dir.to_string());
     while !stack.is_empty() {
         let cur_o = stack.pop();
-        match cur_o {
+        let cur = match cur_o {
             None => { break; }
-            Some(cur) => {
-        match read_dir(&cur) {
+            Some(c) => { c }
+        };
+        if out.len() >= cap {
+            // ONE loud note, then stop: the next scan round resumes where this
+            // one stopped adding (the break makes a repeat-note flag pointless).
+            notes.push(format!("walk of {}: reached the {}-path cap; remaining entries are IGNORED this round (the next scan round sees them)", dir, cap));
+            break;
+        }
+        // Classify FIRST (metadata FOLLOWS symlinks, so a symlink-to-directory
+        // is walked as a directory — under its canonical identity).
+        let md = metadata(&cur);
+        let is_dir = match md {
+            Err(_) => { false } // vanished or unreadable target: leaf candidate (old behavior)
+            Ok(m) => { m.is_dir() }
+        };
+        if !is_dir {
+            out.push(cur.to_string());
+            continue;
+        }
+        let cp = canonicalize(&cur);
+        let key = match cp {
             Err(_) => {
-                // not a directory: a file candidate (or vanished entry)
-                out.push(cur.to_string());
+                // Directory exists but cannot be resolved (permissions on some
+                // path component): skipping the SUBTREE is the safe choice —
+                // descending an unresolvable path re-opens exactly the loop
+                // hole this fix closes. Noted, never silent.
+                notes.push(format!("walk of {}: cannot canonicalize {} (permissions?): skipping that subtree", dir, cur));
+                continue;
             }
+            Ok(pc) => { path_to_str(&pc) }
+        };
+        if visited.contains(&key) {
+            notes.push(format!("walk of {}: {} resolves to the ALREADY-WALKED directory {} (symlink loop?) — skipped", dir, cur, key));
+            continue;
+        }
+        visited.insert(key.to_string());
+        match read_dir(&cur) {
+            Err(_) => {} // vanished between metadata and read_dir: fine
             Ok(it) => {
                 for e in it {
                     match e {
@@ -85,8 +143,6 @@ pub fn walk_files(dir: &str) -> Vec<String> {
                         }
                     }
                 }
-            }
-        }
             }
         }
     }

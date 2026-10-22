@@ -5,10 +5,10 @@
 
 use wx_core::grid::{GridDef};
 use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times, GribErr};
-use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES};
+use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES, glob_overlap_warnings};
 use serde_json::from_str;
-use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, join_path};
-use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str, MonoClock};
+use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, STATE_VERSION, join_path};
+use crate::discovery::{glob_match, walk_files_bounded, WALK_MAX_PATHS, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str, MonoClock};
 use crate::store::{write_grid_bin, merge_write_field_batch, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, le_u32_at, GRID_VERSION};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
 use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot, StatMeta,
@@ -28,6 +28,7 @@ use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
 use std::io::Read;
+use std::io::ErrorKind;
 use serde::Deserialize;
 
 
@@ -468,6 +469,14 @@ pub struct Pipeline {
     // Live per-FILE mirror shared with the HTTP side (phase B).
     pub live: Arc<LiveCounters>,
     pub wind_violation: bool,
+    // V1.3 phase E3b: resolved `[ingest].wind_pair_enforce` (default TRUE).
+    // When true AND `wind_violation` becomes set (a half-configured model met
+    // a grid-relative wind grid during decode), the MAIN thread exits with
+    // code 7 after that scan round — fail-closed enforcement of spec §4.4 for
+    // models whose ingest dir was empty/unstable at boot, where the startup
+    // preflight could only DEFER. False keeps the pre-E3b sticky-note behavior
+    // (documented deviation).
+    pub wind_pair_enforce: bool,
     // V1.2 phase C: bounded memo of retention-skip VERDICTS already noted/counted
     // ((path, content hash)). A stale file stays in the ingest dir and is re-peeked
     // every round — cheap by design — but must not spam the log or inflate the
@@ -475,11 +484,13 @@ pub struct Pipeline {
     // ONE note plus ONE count, mirroring the kind=FAILED quarantine rule.
     pub stale_verdicts: Vec<(String, String)>,
     // V1.3 phase E3a TRANSIENT-I/O BACKOFF: consecutive read-failure counts per
-    // candidate IDENTITY (path, size, mtime_ns, content hash — empty hash when
-    // the failure happened BEFORE a hash could be taken, e.g. the open itself).
-    // IN-MEMORY ONLY (restart clears). Sixth field = already escalated (suppresses
-    // repeat notes/counts/records past the threshold). See io_failure().
-    pub io_streaks: Vec<(String, u64, i64, String, u32, bool)>,
+    // candidate IDENTITY (model, path, size, mtime_ns, content hash — empty hash
+    // when the failure happened BEFORE a hash could be taken, e.g. the open
+    // itself; model scoping added by phase E3b alongside the per-model state
+    // keys). IN-MEMORY ONLY (restart clears). Sixth field = attempt count,
+    // seventh = already escalated (suppresses repeat notes/counts/records past
+    // the threshold). See io_failure().
+    pub io_streaks: Vec<(String, String, u64, i64, String, u32, bool)>,
     pub queue: WatchQueue,
     pub watchers: Vec<RecommendedWatcher>,
     pub pool: ThreadPool,
@@ -994,6 +1005,9 @@ impl Pipeline {
             None => { DEFAULT_DECODE_BATCH_FILES }
             Some(k) => { k }
         };
+        // V1.3 phase E3b: fail-closed default TRUE (clippy's unwrap_or form is
+        // exactly the semantics: absent key == enforce).
+        let enforce = cfg.ingest.wind_pair_enforce.unwrap_or(true);
         let q = Arc::new(Mutex::new(Vec::<String>::new()));
         let mut p = Pipeline {
             models: models,
@@ -1010,8 +1024,9 @@ impl Pipeline {
             counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0, stat_collisions: 0 },
             live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
+            wind_pair_enforce: enforce,
             stale_verdicts: Vec::<(String, String)>::new(),
-            io_streaks: Vec::<(String, u64, i64, String, u32, bool)>::new(),
+            io_streaks: Vec::<(String, String, u64, i64, String, u32, bool)>::new(),
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
             pool: pool.unwrap(),
@@ -1039,6 +1054,29 @@ impl Pipeline {
                 }
             }
         }
+        // V1.3 phase E3b LOUD STATE-UPGRADE NOTE: a files.json written by a
+        // different format version was discarded by StateStore::load (records
+        // from v1 carry no model field and would silently resurrect the
+        // path-only keying); say so EXACTLY ONCE at boot. This is an expected
+        // upgrade event, not an error: it costs one full re-ingest, which is
+        // idempotent (merge dedup + atomic renames) — same philosophy as the
+        // E0/E1 storage-format recovery traps.
+        if p.state.discarded_legacy {
+            p.note(format!("STATE UPGRADE: {} was written by format version {}, this build expects version {} — DISCARDED {} record(s) LOUDLY; every source file will be RE-INGESTED exactly once (idempotent), then normal warm-start resumes",
+                p.state.file_path, p.state.found_version, STATE_VERSION, p.state.discarded_records));
+        }
+        // V1.3 phase E3b SHARED-DIRECTORY WARNING (non-fatal): models with
+        // equal-or-nested ingest dirs and non-disjoint globs now BOTH ingest
+        // (per-model records); operators who meant them separate hear it once.
+        let owarn = glob_overlap_warnings(&p.models);
+        for w in &owarn {
+            p.note(w.to_string());
+        }
+        // V1.3 phase E3b: finish any retention deletion a crash interrupted
+        // BEFORE anything is indexed, so a half-deleted quarantined husk can
+        // never answer queries (its name already fails parse_run_dir, but the
+        // disk state gets cleaned rather than merely ignored).
+        sweep_deleting_dirs(&mut p);
         rebuild_from_disk(&mut p);
         p.publish();
         return Ok(p);
@@ -1094,7 +1132,21 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
     let gp = format!("{}/grid.bin", run_dir);
     let gb = read_bytes_maybe(&gp);
     match gb {
-        None => { return; }
+        None => {
+            // V1.3 phase E3b MISSING-GRID LOUDNESS: a CORRUPT grid.bin gets the
+            // storage-format recovery treatment above (loud note + delete +
+            // forget), but a MISSING (or unreadable) one used to `return`
+            // SILENTLY, leaving an orphan run tree that /v1/inventory never
+            // shows and nobody ever mentions. Now: ONE loud note per run per
+            // rebuild + one error. Deliberately NOT auto-deleted: the source
+            // files may re-deliver the grid on the next scan round (unlike the
+            // version-mismatch case, there is nothing wrong to repair — just
+            // something absent), and deleting could race a producer that is
+            // mid-write when boot happens.
+            p.note(format!("MISSING GRID: run dir {} has no readable grid.bin — the run stays INVISIBLE to queries until its source re-delivers it (not deleted on purpose); errors counter advanced", run_dir));
+            p.counters.errors += 1;
+            return;
+        }
         Some(b) => {
             let gd = decode_grid(&b);
             match gd {
@@ -1117,7 +1169,7 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                         run_dir, e, found_ver, GRID_VERSION, mdl.name));
                     p.counters.errors += 1;
                     delete_tree(&run_dir);
-                    let dropped = p.state.drop_under(&mdl.ingest_dir);
+                    let dropped = p.state.drop_under(mdl.name.as_str(), &mdl.ingest_dir);
                     p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
                     p.save_state();
                     return;
@@ -1152,7 +1204,7 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                                 bp.0, run_dir, bp.1, BIN_VERSION, mdl.name));
                             p.counters.errors += 1;
                             delete_tree(&run_dir);
-                            let dropped = p.state.drop_under(&mdl.ingest_dir);
+                            let dropped = p.state.drop_under(mdl.name.as_str(), &mdl.ingest_dir);
                             p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
                             p.save_state();
                             return;
@@ -1451,7 +1503,15 @@ impl Pipeline {
                     cands.push(e.to_string());
                 }
             }
-            for f in walk_files(&mdl.ingest_dir) {
+            // V1.3 phase E3b: symlink-safe CAPPED walk; anomalies (loop skips,
+            // unresolvable subtrees, cap hits) surface through self.note() —
+            // they used to be either infinite (hang) or invisible.
+            let mut wnotes: Vec<String> = Vec::<String>::new();
+            let wf = walk_files_bounded(mdl.ingest_dir.as_str(), WALK_MAX_PATHS, &mut wnotes);
+            for n in &wnotes {
+                self.note(n.to_string());
+            }
+            for f in wf {
                 if glob_match(&mdl.file_glob, base_name(f.to_string()).as_str()) {
                     cands.push(f);
                 }
@@ -1474,13 +1534,13 @@ impl Pipeline {
                         // the bounded streak so persistent failures escalate
                         // loudly after IO_FAIL_ESCALATION_ROUNDS rounds and
                         // transient ones cost one note total.
-                        self.io_failure(path.to_string(), sm2.0, sm2.1,
+                        self.io_failure(mdl.name.to_string(), path.to_string(), sm2.0, sm2.1,
                                         "".to_string(), "content hash", e);
                         continue;
                     }
                     Ok(v1) => { v1 }
                 };
-                let rec = self.state.find(path.to_string());
+                let rec = self.state.find(mdl.name.as_str(), path.as_str());
                 match rec {
                     Some(r) => {
                         if r.size == sm2.0 && r.mtime_ns == sm2.1 && r.hash == hv2 {
@@ -1571,7 +1631,7 @@ impl Pipeline {
                             // contradicting its own comment. Now the streak
                             // policy applies and the candidate is genuinely
                             // retried with no record until escalation.
-                            self.io_failure(rpath.to_string(), rsize, rmtime,
+                            self.io_failure(mdl.name.to_string(), rpath.to_string(), rsize, rmtime,
                                             rhash.to_string(), "magic precheck", e);
                             self.progress(format!("io-retry {0}: magic precheck unreadable, streak tracked", rpath));
                             cj += 1;
@@ -1580,7 +1640,7 @@ impl Pipeline {
                         Ok(v) => { v }
                     };
                     if !isg {
-                        let prior = self.state.find(rpath.clone());
+                        let prior = self.state.find(mdl.name.as_str(), rpath.as_str());
                         let already = match prior {
                             None => { false }
                             Some(pr) => { pr.kind == REC_IGNORED && pr.hash == rhash }
@@ -1592,8 +1652,9 @@ impl Pipeline {
                         }
                         self.progress(format!("ignored {0}: not a GRIB2 stream", rpath));
                         // A definitive content verdict clears any I/O streak.
-                        self.io_streak_clear(rpath.as_str());
+                        self.io_streak_clear(mdl.name.as_str(), rpath.as_str());
                         self.state.upsert(FileRec {
+                            model: mdl.name.to_string(),
                             path: rpath,
                             size: rsize,
                             mtime_ns: rmtime,
@@ -1632,7 +1693,7 @@ impl Pipeline {
                                 // in-memory streak, ONE note, escalation to the
                                 // full quarantine only after
                                 // IO_FAIL_ESCALATION_ROUNDS consecutive rounds.
-                                self.io_failure(rd.0.clone(), rd.1, rd.2, rd.3.clone(),
+                                self.io_failure(mdl.name.to_string(), rd.0.clone(), rd.1, rd.2, rd.3.clone(),
                                                 "decode", "open/mmap I/O error".to_string());
                                 self.progress(format!("io-retry {0}: transient I/O at decode, quarantines after {1} consecutive failed rounds", rd.0, IO_FAIL_ESCALATION_ROUNDS));
                             }
@@ -1643,7 +1704,7 @@ impl Pipeline {
                                 // until its CONTENT changes, and advance `errors`
                                 // only when a NEW FAILED record is created or the
                                 // hash changed (never once per scan round).
-                                let prior = self.state.find(rd.0.clone());
+                                let prior = self.state.find(mdl.name.as_str(), rd.0.as_str());
                                 let same = match prior {
                                     None => { false }
                                     Some(pr) => { pr.kind == REC_FAILED && pr.hash == rd.3 }
@@ -1655,8 +1716,9 @@ impl Pipeline {
                                     self.live.add(1, 0, 0, 0, 1, 0);
                                 }
                                 // A content verdict clears any I/O streak.
-                                self.io_streak_clear(rd.0.as_str());
+                                self.io_streak_clear(mdl.name.as_str(), rd.0.as_str());
                                 self.state.upsert(FileRec {
+                                    model: mdl.name.to_string(),
                                     path: rd.0.clone(),
                                     size: rd.1,
                                     mtime_ns: rd.2,
@@ -1692,6 +1754,7 @@ impl Pipeline {
                                         rd.0, out.failed_groups, out.groups + out.failed_groups));
                                 } else {
                                     self.state.upsert(FileRec {
+                                        model: mdl.name.to_string(),
                                         path: rd.0.clone(),
                                         size: rd.1,
                                         mtime_ns: rd.2,
@@ -1699,7 +1762,7 @@ impl Pipeline {
                                         kind: REC_OK,
                                     });
                                     // Success ends any I/O streak for this path.
-                                    self.io_streak_clear(rd.0.as_str());
+                                    self.io_streak_clear(mdl.name.as_str(), rd.0.as_str());
                                     // V1.3 phase E3a: no per-file save — the
                                     // dirty-gated chunk-end / round-end saves
                                     // persist it (a crash loses at most one
@@ -1846,12 +1909,16 @@ impl Pipeline {
     /// and the unchanged-skip check then lets the file through); a REAL hash
     /// (decode-stage failures) keeps the pre-E3a "until content changes"
     /// hammering stop, which is the right trade once the bytes were readable.
-    pub fn io_failure(self: &mut Self, path: String, size: u64, mtime_ns: i64,
+    /// V1.3 phase E3b: the identity (and the escalated record) is MODEL-scoped,
+    /// matching the per-model state keys — two models sharing an ingest dir
+    /// keep independent streaks for the same unreadable file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn io_failure(self: &mut Self, model: String, path: String, size: u64, mtime_ns: i64,
                       hash: String, stage: &str, detail: String) -> bool {
         let mut at: Option<usize> = None;
         for k in 0 .. self.io_streaks.len() {
             let e = &self.io_streaks[k];
-            if e.0 == path && e.1 == size && e.2 == mtime_ns && e.3 == hash {
+            if e.0 == model && e.1 == path && e.2 == size && e.3 == mtime_ns && e.4 == hash {
                 at = Some(k);
                 break;
             }
@@ -1861,29 +1928,30 @@ impl Pipeline {
                 while self.io_streaks.len() >= IO_STREAK_CAP {
                     let _x = self.io_streaks.remove(0);
                 }
-                self.io_streaks.push((path.to_string(), size, mtime_ns, hash.to_string(), 1, false));
-                self.note(format!("I/O prevented reading {} at the {} stage (attempt 1/{}, {}): retrying next round; {} consecutive I/O-failed rounds for the same identity quarantine it as FAILED",
-                    path, stage, IO_FAIL_ESCALATION_ROUNDS, detail, IO_FAIL_ESCALATION_ROUNDS));
+                self.io_streaks.push((model.to_string(), path.to_string(), size, mtime_ns, hash.to_string(), 1, false));
+                self.note(format!("I/O prevented reading {} (model {}) at the {} stage (attempt 1/{}, {}): retrying next round; {} consecutive I/O-failed rounds for the same identity quarantine it as FAILED",
+                    path, model, stage, IO_FAIL_ESCALATION_ROUNDS, detail, IO_FAIL_ESCALATION_ROUNDS));
                 return false;
             }
             Some(k) => {
-                self.io_streaks[k].4 += 1;
-                let n = self.io_streaks[k].4;
-                if n < IO_FAIL_ESCALATION_ROUNDS || self.io_streaks[k].5 {
+                self.io_streaks[k].5 += 1;
+                let n = self.io_streaks[k].5;
+                if n < IO_FAIL_ESCALATION_ROUNDS || self.io_streaks[k].6 {
                     return false;
                 }
-                self.io_streaks[k].5 = true;
+                self.io_streaks[k].6 = true;
                 let tail_note = if hash.is_empty() {
                     "quarantining kind=FAILED with an EMPTY content hash: nothing about the bytes was ever observed, so the file re-enters the normal path automatically once it becomes readable again".to_string()
                 } else {
                     "quarantining kind=FAILED WITH its content hash: it stops being retried until the content changes".to_string()
                 };
-                self.note(format!("repeated I/O failure on {}: {} consecutive scan rounds could not read it (last stage {}, {}) — this is NOT a decode verdict",
-                    path, n, stage, tail_note));
+                self.note(format!("repeated I/O failure on {} (model {}): {} consecutive scan rounds could not read it (last stage {}, {}) — this is NOT a decode verdict",
+                    path, model, n, stage, tail_note));
                 self.counters.errors += 1;
                 self.counters.quarantined_files += 1;
                 self.live.add(1, 0, 0, 0, 1, 0);
                 self.state.upsert(FileRec {
+                    model: model.to_string(),
                     path: path.to_string(),
                     size: size,
                     mtime_ns: mtime_ns,
@@ -1895,13 +1963,13 @@ impl Pipeline {
         }
     }
 
-    /// Forget every I/O streak for a path (success, definitive IGNORED verdict,
-    /// or escalation via another path). Identity changes need no clearing: they
-    /// simply start a fresh entry under a new key.
-    pub fn io_streak_clear(self: &mut Self, path: &str) {
-        let mut kept: Vec<(String, u64, i64, String, u32, bool)> = Vec::<(String, u64, i64, String, u32, bool)>::new();
+    /// Forget every I/O streak for one (model, path) pair (success, definitive
+    /// IGNORED verdict, or escalation via another path). Identity changes need
+    /// no clearing: they simply start a fresh entry under a new key.
+    pub fn io_streak_clear(self: &mut Self, model: &str, path: &str) {
+        let mut kept: Vec<(String, String, u64, i64, String, u32, bool)> = Vec::<(String, String, u64, i64, String, u32, bool)>::new();
         for e in &self.io_streaks {
-            if e.0 != path {
+            if e.0 != model || e.1 != path {
                 kept.push(e.clone());
             }
         }
@@ -2614,14 +2682,62 @@ pub fn retention_prune(p: &mut Pipeline) {
             p.publish();
             let mdir2 = join_path(&p.data_dir, p.registry[mi].name.as_str());
             let path = join_path(&mdir2, victim_dir.as_str());
-            delete_tree(&path);
+            // V1.3 phase E3b ATOMIC QUARANTINE-THEN-DELETE. The pre-E3b flow
+            // called delete_tree directly: a crash MID-DELETE left a PARTIAL
+            // oldest run whose name still parses, so it RE-INDEXED on restart
+            // and answered (incomplete) queries until the next prune evicted
+            // it. Now the victim is first RENAMED to `<name>.deleting.<stamp>`
+            // — one atomic operation that parse_run_dir rejects, making the run
+            // instantly invisible — and only then removed recursively. If the
+            // process dies between the two steps, the startup sweep
+            // ([`sweep_deleting_dirs`]) finishes the job BEFORE anything is
+            // indexed. A rename that cannot happen (permissions, EXDEV) falls
+            // back to the old direct delete, loudly.
+            let mut target = format!("{}.deleting.{}", path, p.clock.elapsed_ns());
+            let mut rr = std::fs::rename(&path, &target);
+            let mut attempt = 0u32;
+            loop {
+                let gone = match &rr {
+                    Err(e) => { e.kind() == ErrorKind::NotFound }
+                    Ok(_) => { true }
+                };
+                if gone || attempt >= 8 {
+                    break;
+                }
+                attempt += 1;
+                target = format!("{}.deleting.{}.{}", path, p.clock.elapsed_ns(), attempt);
+                rr = std::fs::rename(&path, &target);
+            }
+            match rr {
+                Err(e) => {
+                    p.note(format!("retention quarantine rename FAILED for {} ({}): falling back to in-place delete", path, e));
+                    let f = delete_tree(&path);
+                    if f > 0 {
+                        p.note(format!("retention: in-place delete of {} left {} failed removal(s); errors advanced", path, f));
+                        p.counters.errors += 1;
+                    }
+                }
+                Ok(_) => {
+                    let f = delete_tree(&target);
+                    if f > 0 {
+                        // Crash-restart sweep owns the remainder from here.
+                        p.note(format!("retention: partial delete of quarantined {} — {} removal(s) failed; the startup sweep will finish it next boot; errors advanced", target, f));
+                        p.counters.errors += 1;
+                    }
+                }
+            }
         }
     }
 }
 
-fn delete_tree(dir: &str) {
+/// Delete `dir` recursively. Returns the number of FAILED removals (ENOENT
+/// counts as success — the goal was "it is gone"). V1.3 phase E3b: the old
+/// version swallowed every error, which is exactly how a crash mid-delete
+/// produced an unnoticed partial run dir that re-indexed on restart.
+fn delete_tree(dir: &str) -> usize {
+    let mut fails = 0usize;
     match read_dir(&dir) {
-        Err(_) => {}
+        Err(_) => { return 0; } // already gone or never a directory: nothing to do
         Ok(it) => {
             for e in it {
                 match e {
@@ -2629,13 +2745,75 @@ fn delete_tree(dir: &str) {
                     Ok(de) => {
                         let pth = path_to_str(&de.path());
                         match read_dir(&pth) {
-                            Ok(_) => { delete_tree(&pth); }
-                            Err(_) => { let _r = remove_file(&pth); }
+                            Ok(_) => { fails += delete_tree(&pth); }
+                            Err(_) => {
+                                match remove_file(&pth) {
+                                    Err(er) => {
+                                        if er.kind() != ErrorKind::NotFound {
+                                            fails += 1;
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     }
-    let _d = remove_dir(&dir);
+    match remove_dir(&dir) {
+        Err(er) => {
+            if er.kind() != ErrorKind::NotFound {
+                fails += 1;
+            }
+        }
+        Ok(_) => {}
+    }
+    return fails;
+}
+
+/// V1.3 phase E3b STARTUP SWEEP — run BEFORE any indexing. Retention now
+/// renames a victim run dir into `<name>.deleting.<stamp>` before removing it;
+/// a crash between rename and rmdir leaves the husk sitting under the model's
+/// data dir forever (its name no longer parses, so neither rebuild nor
+/// retention ever touches it). Sweep every model's data dir top level, finish
+/// every such deletion, and say so LOUDLY (count + note; failures noted and
+/// counted in `errors`, left in place for the next boot).
+pub fn sweep_deleting_dirs(p: &mut Pipeline) {
+    let mc = p.models.len();
+    for mi in 0 .. mc {
+        let mdir = join_path(&p.data_dir, p.models[mi].name.as_str());
+        let names: Vec<String> = match read_dir(&mdir) {
+            Err(_) => { continue; }
+            Ok(it) => {
+                let mut v: Vec<String> = Vec::<String>::new();
+                for e in it {
+                    match e {
+                        Err(_) => {}
+                        Ok(de) => {
+                            let bn = base_name(path_to_str(&de.path()));
+                            if bn.contains(".deleting.") {
+                                v.push(bn);
+                            }
+                        }
+                    }
+                }
+                v
+            }
+        };
+        if names.is_empty() {
+            continue;
+        }
+        let mut fails = 0usize;
+        for nm in &names {
+            let full = join_path(&mdir, nm.as_str());
+            fails += delete_tree(&full);
+        }
+        p.note(format!("startup sweep: finished deleting {} quarantined run dir(s) under {}", names.len(), mdir));
+        if fails > 0 {
+            p.note(format!("startup sweep: {} removal(s) FAILED under {} — left in place, swept again next boot; errors advanced", fails, mdir));
+            p.counters.errors += 1;
+        }
+    }
 }

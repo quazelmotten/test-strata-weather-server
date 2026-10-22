@@ -175,12 +175,19 @@ fn unwritable_group_dir_fails_once_and_retries_cleanly() {
     assert!(p.scan_round() == 0);   // observation round
     assert!(p.scan_round() == 0);   // attempted: groups fail -> NOT ingested
 
-    // ---- exactly ONE error for the whole file, not one per failed group ---
-    assert!(p.counters.errors == 1);
+    // ---- exactly ONE error for the FILE, not one per failed group. V1.3
+    // phase E3b adds a SECOND, DISTINCT error source here: this test pre-
+    // creates the run dir skeleton (no grid.bin) before Pipeline::open, and
+    // boot now LOUDLY reports a missing grid.bin instead of returning silently
+    // (audit defect 2) — so total errors == 1 (boot MISSING GRID note for the
+    // planted skeleton) + 1 (this file's group-write failure). Assert both
+    // explicitly rather than loosening the original intent.
+    assert!(count_notes(&p, "MISSING GRID") == 1);
+    assert!(p.counters.errors == 2);
     assert!(count_notes(&p, "group write failed") >= 1);
 
     // ---- the source file is NOT marked ingested -> next round retries ----
-    match p.state.find(src.to_string()) {
+    match p.state.find("gfs", src.as_str()) {
         Some(_) => { assert!(false); return; }
         None => {}
     }
@@ -221,7 +228,7 @@ fn unwritable_group_dir_fails_once_and_retries_cleanly() {
     let cm_rw = unsafe { libc_chmod(&rw[0], 0o755) };
     assert!(cm_rw == 0);
     assert!(p.scan_round() == 1);   // retried IN FULL, idempotent merge
-    assert!(p.counters.errors == 1); // no NEW error
+    assert!(p.counters.errors == 2); // no NEW error (baseline: boot MISSING GRID + group failure)
     assert!(p.counters.ingested_files == 1);
 
     let snap2 = p.shared.get_index();

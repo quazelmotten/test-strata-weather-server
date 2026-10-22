@@ -21,6 +21,13 @@ retention_runs = 4
 # directory. K=1 means strictly sequential per-file ingest (lowest RAM, slightly
 # later first output); larger K trades RAM for earlier output.
 #decode_batch_files = 4
+# Provisional wind-pair enforcement (V1.3 phase E3b; default true). The startup
+# preflight can only probe files that already exist AND are stable; when a model
+# configuring ONLY ONE of UGRD/VGRD later decodes a GRID-relative wind field, the
+# ingest thread exits with code 7 (fail-closed, spec §4.4 intent) instead of
+# skipping winds + inflating errors forever. Set false to keep the old
+# sticky-note-and-skip behavior.
+#wind_pair_enforce = true
 
 [[models]]
 name = "gfs"

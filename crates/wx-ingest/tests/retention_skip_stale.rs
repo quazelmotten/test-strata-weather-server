@@ -120,7 +120,7 @@ fn cfg_text(data: &str, ing: &str) -> String {
 
 #[allow(clippy::needless_return)]
 fn has_record_for(p: &Pipeline, path: String) -> bool {
-    match p.state.find(path.clone()) {
+    match p.state.find("gfs", path.as_str()) {
         None => { return false; }
         Some(_) => { return true; }
     }

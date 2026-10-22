@@ -124,7 +124,7 @@ fn same_run_second_file_is_never_skipped_and_merges_into_the_kept_run() {
     assert!(p.counters.retention_skipped_files == 0);
     assert!(p.counters.errors == 0);
     assert!(p.counters.ingested_files == 2);
-    match p.state.find(twin.to_string()) {
+    match p.state.find("gfs", twin.as_str()) {
         None => { assert!(false); return; }
         Some(r) => { assert!(r.kind == REC_OK); }
     }

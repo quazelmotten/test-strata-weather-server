@@ -195,7 +195,7 @@ fn transient_io_retries_then_escalates_then_self_clears() {
     // exactly ONE note total (the first occurrence).
     for r in 2 .. 6usize {
         assert!(p.scan_round() == 0, "round {r} unexpectedly consumed the file");
-        match p.state.find(xp.to_string()) {
+        match p.state.find("gfs", xp.as_str()) {
             Some(rec) => { println!("round {r} wrote record kind {} for an I/O failure", rec.kind); assert!(false); return; }
             None => {}
         }
@@ -206,14 +206,14 @@ fn transient_io_retries_then_escalates_then_self_clears() {
     }
     // the streak is real and bounded
     assert!(p.io_streaks.len() == 1);
-    assert!(p.io_streaks[0].4 == 4);
+    assert!(p.io_streaks[0].5 == 4);
 
     // Round 6: the FIFTH consecutive failed round escalates — loud note naming
     // the policy, one error + one quarantine, kind=FAILED with an EMPTY hash
     // (nothing about the bytes was ever observed), persisted by the round-end
     // batched save.
     assert!(p.scan_round() == 0);
-    let rec = match p.state.find(xp.to_string()) {
+    let rec = match p.state.find("gfs", xp.as_str()) {
         None => { println!("escalation wrote no record"); assert!(false); return; }
         Some(rr) => { rr }
     };
@@ -236,7 +236,7 @@ fn transient_io_retries_then_escalates_then_self_clears() {
     }
     assert!(p.scan_round() == 1);
     assert!(p.counters.ingested_files == 1);
-    let rec2 = match p.state.find(xp.to_string()) {
+    let rec2 = match p.state.find("gfs", xp.as_str()) {
         None => { assert!(false); return; }
         Some(rr) => { rr }
     };

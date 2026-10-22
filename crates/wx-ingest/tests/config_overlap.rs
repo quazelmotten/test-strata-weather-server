@@ -42,6 +42,7 @@ fn one_model_cfg(data: String, ing: String) -> PointConfig {
             stable_window_secs: Some(0),
             ingest_threads: Some(2),
             decode_batch_files: Some(1),
+            wind_pair_enforce: None,
         },
         models: ms,
     };

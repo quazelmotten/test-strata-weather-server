@@ -2,10 +2,12 @@
 //
 // Two problems fixed:
 //   * `StateStore.find` was a LINEAR SCAN over every file ever ingested, called
-//     once per candidate per scan round. It is now an O(1) HashMap keyed by path,
-//     DERIVED from `recs` (`recs` stays the SERIALIZED order, so the ON-DISK
-//     FORMAT IS UNCHANGED, `kind` included, and pre-V1.2 files without `kind`
-//     still load as kind=OK).
+//     once per candidate per scan round. It is now an O(1) HashMap keyed by
+//     (model, path) — the model namespace added by V1.3 phase E3b so two
+//     models sharing an ingest dir no longer starve each other (`recs` stays
+//     the SERIALIZED order; on-disk format is version 2 with a `model` key per
+//     record, and pre-E3b VERSION-1 FILES ARE DISCARDED LOUDLY once, costing
+//     exactly one re-ingest; inside v2 a missing `kind` still defaults to OK).
 //   * The record list grew MONOTONICALLY: products deleted upstream left their
 //     rows forever. `prune_missing` forgets records whose SOURCE FILE VANISHED,
 //     bounded to ONE stat per record located under ONE model's ingest dir per
@@ -85,6 +87,7 @@ fn index_of(hay: &str, pat: &str) -> i64 {
 #[allow(clippy::needless_return)]
 fn rec(path: String, size: u64, kind: u8) -> FileRec {
     return FileRec {
+        model: "m".to_string(),
         path: path.to_string(),
         size: size,
         mtime_ns: 1000,
@@ -131,7 +134,7 @@ fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
     // index-backed lookups agree with the record vector for EVERY row
     for k in 0 .. st.recs.len() {
         let want = st.recs[k].clone();
-        match st.find(want.path.to_string()) {
+        match st.find("m", want.path.as_str()) {
             None => { assert!(false); return; }
             Some(got) => {
                 assert!(got.size == want.size);
@@ -139,20 +142,21 @@ fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
             }
         }
     }
-    match st.find("/root/a/f1.grib2".to_string()) {
+    match st.find("m", "/root/a/f1.grib2") {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.size == 11); }
     }
     assert!(st.recs[0].path == "/root/a/f1.grib2".to_string()); // ORDER PRESERVED
 
     // structural change rebuilds the index: drop everything under /root/a
-    assert!(st.drop_under("/root/a") == 2);
+    // (V1.3 phase E3b: drop_under is MODEL-scoped; every record here is model "m")
+    assert!(st.drop_under("m", "/root/a") == 2);
     assert!(st.recs.len() == 1);
-    match st.find("/root/a/f1.grib2".to_string()) {
+    match st.find("m", "/root/a/f1.grib2") {
         None => {}
         Some(_) => { assert!(false); return; }
     }
-    match st.find("/root/b/f3.grib2".to_string()) {
+    match st.find("m", "/root/b/f3.grib2") {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.kind == REC_IGNORED); }
     }
@@ -192,15 +196,15 @@ fn prune_missing_forgets_only_records_whose_source_actually_vanished() {
     // sibling `ing-archive` is NOT under `ing` (prefix matched on `<dir>/`).
     assert!(st.prune_missing(&ing) == 2);
     assert!(st.recs.len() == 2);
-    match st.find(present.to_string()) {
+    match st.find("m", present.as_str()) {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.kind == REC_OK); }
     }
-    match st.find(kept_sib.to_string()) {
+    match st.find("m", kept_sib.as_str()) {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.kind == REC_IGNORED); }
     }
-    match st.find(join_path(&ing, "gone.grib2")) {
+    match st.find("m", join_path(&ing, "gone.grib2").as_str()) {
         None => {}
         Some(_) => { assert!(false); return; }
     }
@@ -210,7 +214,7 @@ fn prune_missing_forgets_only_records_whose_source_actually_vanished() {
     touch(poison.to_string());
     st.upsert(rec(poison.to_string(), 5, REC_FAILED));
     assert!(st.prune_missing(&ing) == 0);
-    match st.find(poison.to_string()) {
+    match st.find("m", poison.as_str()) {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.kind == REC_FAILED); }
     }
@@ -237,18 +241,20 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
         Ok(_) => {}
     }
 
-    // THE WRITER IS UNCHANGED BY PHASE C: same keys, same ORDER, `kind` present.
+    // THE WRITER since V1.3 phase E3b: same keys, same ORDER, `kind` present,
+    // VERSION IS NOW 2 and every record carries its `"model"` namespace key.
     let f = join_path(&st_dir, "files.json");
     let txt = match read_to_string(&f) {
         Err(_) => { assert!(false); return; }
         Ok(t) => { t }
     };
-    assert!(txt.contains("{\"version\":1,\"recs\":["));
+    assert!(txt.contains("{\"version\":2,\"recs\":["));
     assert!(txt.contains("\"kind\":0"));
     assert!(txt.contains("\"kind\":1"));
     assert!(txt.contains("\"kind\":2"));
     assert!(txt.contains("\"path\":\"/r/ok.grib2\""));
     assert!(txt.contains("\"hash\":\"00000000000000ab\""));
+    assert!(txt.contains("\"model\":\"m\""));
     let a = index_of(&txt, "{\"path\":\"/r/ok.grib2\"");
     let b = index_of(&txt, "{\"path\":\"/r/bad.grib2\"");
     assert!(a >= 0);
@@ -261,24 +267,48 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
         Ok(s) => { s }
     };
     assert!(st2.recs.len() == 3);
-    match st2.find("/r/bad.grib2".to_string()) {
+    assert!(!st2.discarded_legacy);
+    match st2.find("m", "/r/bad.grib2") {
         None => { assert!(false); return; }
         Some(g) => { assert!(g.kind == REC_FAILED); }
     }
 
-    // LEGACY pre-V1.2 file (no `kind` key at all) still loads as OK
+    // LEGACY version-1 file (pre-E3b: no `model`, version 1): since E3b the
+    // VERSION GATE DISCARDS it loudly instead of partially interpreting it —
+    // one full re-ingest after the upgrade, exactly the documented migration.
     let legacy = "{\"version\":1,\"recs\":[{\"path\":\"/r/old.grib2\",\"size\":7,\"mtime_ns\":9,\"hash\":\"00000000000000cd\"}]}";
     write_bytes(&f, legacy.as_bytes());
     let st3_r = StateStore::load(st_dir.to_string());
     match st3_r {
         Err(_e) => { assert!(false); return; }
         Ok(s3) => {
-            assert!(s3.recs.len() == 1);
-            match s3.find("/r/old.grib2".to_string()) {
+            assert!(s3.discarded_legacy);
+            assert!(s3.found_version == 1);
+            assert!(s3.discarded_records == 1);
+            assert!(s3.recs.len() == 0);
+            match s3.find("m", "/r/old.grib2") {
+                None => {}
+                Some(_) => { assert!(false); return; }
+            }
+        }
+    }
+
+    // A CURRENT-version doc missing ONLY the `kind` key still defaults to OK
+    // (the pre-V1.2 serde-default contract survives INSIDE version 2).
+    let v2_nokind = "{\"version\":2,\"recs\":[{\"model\":\"m\",\"path\":\"/r/new.grib2\",\"size\":8,\"mtime_ns\":10,\"hash\":\"00000000000000ce\"}]}";
+    write_bytes(&f, v2_nokind.as_bytes());
+    let st4_r = StateStore::load(st_dir.to_string());
+    match st4_r {
+        Err(_e) => { assert!(false); return; }
+        Ok(s4) => {
+            assert!(!s4.discarded_legacy);
+            assert!(s4.recs.len() == 1);
+            match s4.find("m", "/r/new.grib2") {
                 None => { assert!(false); return; }
                 Some(g) => {
                     assert!(g.kind == REC_OK);
-                    assert!(g.size == 7);
+                    assert!(g.size == 8);
+                    assert!(g.model == "m".to_string());
                 }
             }
         }
