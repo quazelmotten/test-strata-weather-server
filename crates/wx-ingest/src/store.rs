@@ -399,15 +399,17 @@ pub fn merge_write_field_batch(path: String, code: u8, nx: u32, ny: u32, scan_ns
     return Ok(count);
 }
 
-/// Public alias of the atomic byte writer used for grid.bin/manifest.json:
-/// UNIQUE temp file (`<path>.tmp.<pid>.<seq>`, shared naming with the .bin writer)
-/// in the SAME directory, write, flush, REAL fsync of the temp inode (libc via
-/// `wx_core::storage::fsync_path`; this std has no fsync API), atomic rename, then
-/// REAL fsync of the parent directory so the rename survives a crash. ANY failure
-/// path unlinks the temp file. These writers keep their OWN directory fsync: they
-/// publish SINGLE small files, not the multi-megabyte field planes the batching
-/// work targets. Durability failures are reported, not swallowed. All actions
-/// feed the wx-core counters (`count_rename` / `count_bytes_written` /
+/// Public alias of the atomic byte writer used for grid.bin and manifest.json.
+/// It uses a UNIQUE temp file (`<path>.tmp.<pid>.<seq>`, shared naming with the
+/// .bin writer) in the SAME directory, write, flush, REAL fsync of the temp
+/// inode (via `wx_core::storage::fsync_path`, which since V1.2 phase D is
+/// `File::open` + `sync_all()` — `File::flush` alone is only a userspace-buffer
+/// flush), atomic rename, then REAL fsync of the parent directory so the rename
+/// survives a crash.
+/// ANY failure path unlinks the temp file. These writers keep their OWN directory
+/// fsync: they publish SINGLE small files, not the multi-megabyte field planes the
+/// batching work targets. Durability failures are reported, not swallowed. All
+/// actions feed the wx-core counters (`count_rename` / `count_bytes_written` /
 /// `fsync_path`).
 pub fn write_bytes_atomic_pub(path: &str, bytes: &[u8]) -> Result<(), String> {
     let tmp = unique_tmp_path(path);

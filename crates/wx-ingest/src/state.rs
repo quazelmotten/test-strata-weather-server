@@ -358,8 +358,10 @@ pub fn deserialize_text(text: &str) -> Result<StateDoc, String> {
 
 /// Atomic byte writer: `<path>.tmp` in same dir, write, flush, REAL fsync of
 /// the temp inode, rename, then REAL fsync of the parent directory. Uses
-/// `wx_core::storage::fsync_path` because this toolchain's std has no fsync
-/// API (`File::flush` is only a userspace-buffer flush).
+/// `wx_core::storage::fsync_path` (which is `File::open(path)` + `sync_all()`
+/// since V1.2 phase D — `File::flush` alone is only a userspace-buffer flush
+/// and emits no syscall). NOTE: this writer is NOT routed through the wx-core
+/// storage counters (documented limitation of phase A).
 pub fn write_bytes_atomic(path: &str, text: &str) -> Result<(), String> {
     let tmp = format!("{}.tmp", path);
     let f = File::create(&tmp);

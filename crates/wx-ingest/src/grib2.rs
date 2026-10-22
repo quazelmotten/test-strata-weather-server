@@ -741,9 +741,18 @@ pub fn nan_f32() -> f32 {
 /// differencing with sign-magnitude vmn and unsigned extra seed values.
 fn dec_complex(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize,
                allow_spatial: bool) -> Result<Vec<f32>, GribErr> {
-    if s5.len() < 44 {
+    // Section-5 LENGTH differs by template (measured on tools/wgrib2-full output
+    // and read off complex_pk.c, which writes a 47-BYTE section 5 for DRT 5.2
+    // vs 49 for DRT 5.3): a 5.2 payload ENDS at the group-length-width byte
+    // (offset 41), i.e. it has NO Code Table 5.6 spatial-differencing byte (42)
+    // and NO extra-octets byte (43) -- and correspondingly its section 7 has NO
+    // seed/min-value phase. `unpk_complex.c` mirrors exactly that: `extra_octets
+    // = (pack == 2) ? 0 : sec[5][48]`. So a SHORT section 5 means "template 5.2:
+    // no spatial differencing, zero extra octets", NOT a truncated file.
+    if s5.len() < 42 {
         return Err(GribErr::Truncated);
     }
+    let no_spatial_fields = s5.len() < 44;
     let np = be_u32(s5, 0) as usize;      // defined points (or ngrid, no bm)
     let ref0 = ieee_f4(s5, 6) as f64;
     let e_exp = sm_i2(s5, 10) as i32;
@@ -757,8 +766,8 @@ fn dec_complex(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize,
     let len_factor = s5[36] as i64;
     let len_last = be_u32(s5, 37) as usize;
     let lbits = s5[41];
-    let spatial = s5[42];                 // CT 5.6: 0 none, 1 first, 2 second
-    let eo = s5[43];                      // extra octets (seeds + vmn)
+    let spatial = if no_spatial_fields { 0 } else { s5[42] };  // CT 5.6: 0 none, 1 first, 2 second
+    let eo = if no_spatial_fields { 0 } else { s5[43] };       // extra octets (seeds + vmn)
     if spatial != 0 && !allow_spatial {
         return Err(GribErr::BadField("spatial diff flag on template 5.2"));
     }

@@ -257,7 +257,19 @@ pub struct LiveCounters {
     /// Newest per-file progress line ("ingested <file>: G groups, W bytes, X ms"
     /// or a failure/quarantine note), published together with `progress_seq`.
     pub last_msg: Mutex<String>,
+    /// V1.2 phase D: FIFO of per-FILE progress lines NOT YET printed by the
+    /// server's LIVE printer. `last_msg` alone could not do this: it keeps only
+    /// the NEWEST line, so when two files finish between two 0.1 s polls the
+    /// earlier line was LOST from operator output, and the round streamer then
+    /// replayed the WHOLE ingest log, printing some lines a SECOND time (the
+    /// double-INGEST red herring in the phase-D benchmark log). Bounded so a
+    /// starved printer cannot grow memory without limit; overflow drops the OLDEST
+    /// lines (they remain in `Pipeline.progress_log` for diagnostics).
+    pub progress_queue: Mutex<Vec<String>>,
 }
+
+/// Cap on the un-printed progress FIFO (see `progress_queue`).
+pub const PROGRESS_QUEUE_CAP: usize = 256;
 
 impl LiveCounters {
     pub fn new_live() -> LiveCounters {
@@ -272,7 +284,24 @@ impl LiveCounters {
             last_mtime_ns: AtomicI64::new(0),
             progress_seq: AtomicU64::new(0),
             last_msg: Mutex::<String>::new("".to_string()),
+            progress_queue: Mutex::<Vec<String>>::new(Vec::<String>::new()),
         };
+    }
+
+    /// Take EVERY pending progress line OUT of the FIFO (oldest first). The
+    /// server's LIVE printer calls this ONCE per observed `progress_seq` advance,
+    /// which is what makes each per-file line print EXACTLY ONCE: nothing is
+    /// lost (FIFO, unlike `last_msg`) and nothing repeats.
+    pub fn drain_progress(self: &Self) -> Vec<String> {
+        let q = self.progress_queue.lock();
+        match q {
+            Err(_) => { return Vec::<String>::new(); }
+            Ok(mut g) => {
+                let out = g.clone();
+                g.clear();
+                return out;
+            }
+        }
     }
 
     /// Add deltas for every counter in ONE logical step (relaxed: single writer).
@@ -381,6 +410,13 @@ pub struct Pipeline {
     pub watchers: Vec<RecommendedWatcher>,
     pub pool: ThreadPool,
     pub log: Vec<String>,
+    /// V1.2 phase D: per-FILE progress lines live HERE, NOT in `log`, because
+    /// `main` streams `log` once per round AND the LIVE printer emits progress
+    /// lines as they happen. Sharing one vector made every progress line appear
+    /// TWICE in the server's stdout (and once more when the LIVE printer echoed
+    /// its newest message again). Notes stay in `log`; progress lines are
+    /// diagnostic-only here and reach operators through the LIVE printer.
+    pub progress_log: Vec<String>,
 }
 
 impl Pipeline {
@@ -391,19 +427,32 @@ impl Pipeline {
         }
     }
 
-    /// Record ONE per-FILE progress line (V1.2 phase B): appended to the bounded
-    /// ingest log (which `main` streams), emitted through `tracing` for operators
-    /// who installed a backend, and mirrored into [`LiveCounters`] so the server
-    /// binary can print it WHILE the scan round is still running.
+    /// Record ONE per-FILE progress line (V1.2 phase B, de-duplicated in phase D):
+    /// appended to the bounded progress log (diagnostics only), emitted through
+    /// `tracing` for operators who installed a backend, and pushed into the
+    /// [`LiveCounters`] FIFO so the server binary prints it WHILE the scan round
+    /// is still running. Each line reaches operator output EXACTLY ONCE: the
+    /// round streamer in `main` never sees these lines (they are not in `log`).
     pub fn progress(self: &mut Self, msg: String) {
         tracing::info!("{0}", msg);
-        if self.log.len() < 512 {
-            self.log.push(msg.clone());
+        if self.progress_log.len() < 512 {
+            self.progress_log.push(msg.clone());
         }
         let m = self.live.last_msg.lock();
         match m {
             Err(_) => {}
-            Ok(mut g) => { *g = msg; }
+            Ok(mut g) => { *g = msg.clone(); }
+        }
+        let q = self.live.progress_queue.lock();
+        match q {
+            Err(_) => {}
+            Ok(mut g) => {
+                if g.len() >= PROGRESS_QUEUE_CAP {
+                    // drop the OLDEST un-printed line (still in progress_log)
+                    g.remove(0);
+                }
+                g.push(msg.clone());
+            }
         }
         let _q = self.live.progress_seq.fetch_add(1, Ordering::Relaxed);
     }
@@ -875,6 +924,7 @@ impl Pipeline {
             watchers: Vec::<RecommendedWatcher>::new(),
             pool: pool.unwrap(),
             log: Vec::<String>::new(),
+            progress_log: Vec::<String>::new(),
         };
         rebuild_from_disk(&mut p);
         p.publish();

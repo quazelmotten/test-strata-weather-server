@@ -5,6 +5,10 @@
 // `-checksum data`; here they are validated against the simple-packed original,
 // whose own bit patterns are pinned to wgrib2 by checksum_parity.rs.
 //
+//   _c2    DRT 5.2  complex packing WITHOUT spatial differencing (written by
+//          wgrib2 with `-set_grib_type complex1`; measured on this build, `complex1`
+//          -> 5.2 while `complex2`/`complex3` -> 5.3, so the twin is named after the
+//          DATA REPRESENTATION TEMPLATE, not the CLI token)
 //   _c3    DRT 5.3  complex packing + spatial differencing (written by wgrib2)
 //   _jpeg  DRT 5.40 JPEG2000           (hayro-jpeg2000 0.4.1)
 //   _png   DRT 5.41 PNG, filter None   (scripts/make_png_twin.py)
@@ -45,6 +49,7 @@ fn f_is_nan(x: f32) -> bool {
 /// Twin suffixes exercised on both model fixtures.
 fn tags() -> Vec<String> {
     let mut v: Vec<String> = Vec::<String>::new();
+    v.push("c2".to_string());
     v.push("c3".to_string());
     v.push("jpeg".to_string());
     v.push("png".to_string());

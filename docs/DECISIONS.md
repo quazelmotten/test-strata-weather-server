@@ -849,11 +849,12 @@ forecast hours are VALID data and NEVER count as errors; only a NEGATIVE offset
 fails LOUD as an ingest error — that keeps the packing-twin guard (`packing_twins.rs`)
 working: a decoder that silently returns zeros must not look like a skip.
 
-## Durability: real fsync requires libc here
+## Durability: real fsync — the libc detour was based on a WRONG claim (corrected in V1.2 phase D)
 
-This toolchain's `std::fs::File` exposes only `flush()`; `strace` confirms it emits
-NO `fsync` syscall, and there is no `fd()`/`FileDescriptor`/`flush_sync` accessor
-to reach the descriptor. So `wx_core::storage::fsync_path()` binds libc directly:
+**Original claim (phases 1-3, kept here as the audit trail):** this toolchain's
+`std::fs::File` exposes only `flush()`; `strace` confirmed it emits NO `fsync`
+syscall and there is no `fd()`/`FileDescriptor`/`flush_sync` accessor, so
+`wx_core::storage::fsync_path()` bound libc directly:
 
 ```rust
 extern "C" {
@@ -862,13 +863,23 @@ extern "C" {
     #[link_name = "close"] fn libc_close(fd: i32) -> i32;
 }
 ```
-(`extern "C"` block + explicit `#[link_name]` + `*const i8` avoids the suspicious-
-runtime-symbol warning this toolchain emits for an implicit `open`, and keeps the
-declaration from colliding with the runtime's own symbol.) Order per file:
-write → flush → fsync(inode) → rename → **fsync(parent dir)**, so a crash cannot
-resurrect a renamed-but-unlinked name. Errors are surfaced, not swallowed. Used by
-`write_bin_atomic`, the state-file writer, and the manifest/grid writer. The earlier
-README claim "(+dir fsync)" was aspirational; it is now literally true.
+
+(`extern "C"` block + explicit `#[link_name]` + `*const i8` avoided the suspicious-
+runtime-symbol warning this toolchain emits for an implicit `open`.)
+
+**Phase-D correction:** that premise was FALSE. A compile probe OUTSIDE the repo
+(`/tmp/opencode/fsync_probe.rs`, `/tmp/opencode/fsync_probe2.rs`) shows
+`std::fs::File::sync_all()` EXISTS in this toolchain (rustc resolves it to
+`library/std/src/fs.rs:774`) and `strace` of the probe shows a REAL `fsync(3)` —
+including on a DIRECTORY handle (`File::open(dir)` → `fsync(4) = 0`). The libc
+bindings were therefore REPLACED by `File::open(path)` + `sync_all()`: identical
+syscalls (`openat` O_RDONLY → `fsync` → `close`), identical signature, identical
+counter placement and error taxonomy, one fewer FFI surface. Order per file is
+unchanged: write → flush → fsync(inode) → rename → **fsync(parent dir)** (batched
+per DISTINCT directory since phase B), so a crash cannot resurrect a renamed-but-
+unlinked name. Errors are surfaced, not swallowed. Lesson recorded: an
+"unsupported in this environment" conclusion needs a compile probe, not an
+error-message inference.
 
 `write_bin_atomic`'s error type widened from `&'static str` to `String` (callers
 only match Ok/Err) so fsync messages can carry the path.
@@ -1329,8 +1340,10 @@ static naming — `RENAMES_TOTAL`, `BYTES_WRITTEN_TOTAL`, `FSYNCS_TOTAL` (+
 `counters_snapshot() -> StorageCounters { renames, bytes_written, fsyncs }`,
 `counters_reset()`, plus `count_rename()` / `count_bytes_written(n)` so wx-ingest's
 byte writer feeds the SAME totals. `fsync_path` counts every fsync it performs
-(file AND directory); a failed `open` costs no fsync. Not wired into `/metrics`
-yet (later phase).
+(file AND directory); a failed `open` costs no fsync. As of V1.2 phase D these three
+totals ARE exported by `/metrics` as `wxpoint_storage_renames_total`,
+`wxpoint_storage_bytes_written_total` and `wxpoint_storage_fsyncs_total`, which is
+what `scripts/ingestbench.sh` reads for the AFTER-side amplification numbers.
 
 ## Tests added (names)
 
@@ -1903,3 +1916,248 @@ lib+bin targets; the only stderr line is cargo's future-incompat note about the 
 `bitflags` deps). Three new lints had to be satisfied in phase-C source itself
 (`manual_range_contains` ×2 in `wx-core::tables`, `comparison_to_empty` ×2 in
 `wx-ingest::config`, `needless_return` in `main.rs`) — fixed rather than allowed.
+
+# V1.2 phase D decisions — production-scale ingest benchmark, packing-coverage closure, honesty fixes
+
+## 0. What this phase was FOR
+
+Phases A/B/C optimized the ingest writer against the milestone-5 perf dataset, whose
+isobaric stacks are SHORT (L≈8 planes per GROUP). The tester's complaint was about
+PRODUCTION scale: a real GFS delivery has ~25-40 isobaric levels per parameter per
+forecast hour, so any O(L^2) merge behaviour is invisible in the old benchmark and
+dominant in reality. Phase D therefore builds a dataset at REAL geometry, re-measures
+BEFORE (tag v1.1 = `82f4998`, i.e. phases A/B0/B/C ABSENT) vs AFTER, closes the two
+remaining data-representation-template gaps the audit found unexercised (5.2 and
+5.200), and corrects three documentation claims that were not literally true.
+
+## 1. The PRODUCTION-SCALE realistic dataset (`--real-out`, `scripts/gen_realistic.sh`)
+
+* Geometry: regular lat/lon template 3.0, **1440 x 720**, lon 0..359.75, lat 89.875
+  down to -89.875, N->S scan — the real GFS 0.25 deg node rectangle.
+* Levels: **every 25 hPa from 1000 to 100 = 37 levels**. That is a SUPERSET of the
+  real NWS pgrb2 stack (25 levels: 1000,975,950,925,900,850,800,...,100); the 12
+  extras (875,825,725,675,625,575,525,475,425,375,325,275) exist ONLY to make the
+  per-GROUP merge cost visible. Documented deviation from the brief's "~40 levels"
+  (the real list is 25; 37 is closer to "every level a model can carry" and strictly
+  harder).
+* Params TMP + HGT + UGRD + VGRD, ALL on `isobaric:*` -> **148 messages per file**;
+  THREE runs (2026-10-19T00Z/T06Z/T12Z) x TWO forecast hours (f000, f006) as SIX
+  SEPARATE files = the "6-file reality" retention must cope with.
+* Filenames are AUTHENTIC NWS style (`gfs.t191200z.pgrb2.0p25.f006.grib2`) and
+  deliberately carry NO 10-digit `YYYYMMDDHH` stamp, so the phase-C filename run-hint
+  CANNOT help and ordering falls back to path order. Measured and documented rather
+  than hidden: hint-less names cost nothing here because retention peeks SECTION 1.
+* Wind messages carry flag-table-3.3 bit 0x08 (grid-relative components) ON a
+  REGULAR lat/lon grid. For regular grids our rotation is the IDENTITY (documented
+  decision matching wgrib2: a lat/lon grid's components are already earth-tangent),
+  so stored values equal decoded values. This exercises the wind PAIR rule, the
+  startup preflight probe and the rotate-to-earth code path end to end; it does NOT
+  test rotation ANGLES (those stay covered by the LCC fixtures + pyproj checks).
+* Values stay analytic and EXACT in f32: `BASE(param,level) + ((row*1440+col) %
+  1024) + fc_hour*10`, so simple packing needs only 10-11 bits. Consequence stated
+  honestly: files are ~192 MB each (1.15 GB for six) where a real JPEG-compressed
+  NWS product would be ~30 MB — the fixture is BIGGER on disk than production, which
+  makes the write-amplification numbers CONSERVATIVE in absolute bytes.
+* Truth source: `scripts/validate_realistic.py` drives `tools/wgrib2-full` over all
+  six files — 148 records/file, every record DRT 5.0, label order incl. the SECTION-1
+  reference time, **592 node probes per file** (4 points x 148 records, chosen to hit
+  the seam, both hemispheres and the last row/column) matching the analytic formula,
+  and a section-3 flag-byte tally of 74 grid-relative / 74 earth-relative per file.
+
+## 2. DRT 5.2 (complex packing WITHOUT spatial differencing): a real decoder gap, FOUND and FIXED
+
+The audit's packing-coverage claim was incomplete: no fixture ever exercised 5.2, and
+when one was added the decoder FAILED with `Truncated`. Root cause: wgrib2 writes a
+**47-byte** section 5 for 5.2 but **49-byte** for 5.3 (the two spatial-differencing
+octets are absent), and `dec_complex` required `s5.len() >= 44`. Fix in
+`crates/wx-ingest/src/grib2.rs`: accept `s5.len() >= 42`, derive
+`no_spatial_fields = s5.len() < 44` so the spatial-differencing parameters and
+`eo` DEFAULT to 0 when absent, and keep `extra_octets = (pack == 2) ? 0 : sec[5][48]`
+for 5.3 exactly as before. 5.3 behaviour is unchanged (its twin tests still pass).
+
+Twin naming: `_c2` is named after the DATA REPRESENTATION TEMPLATE (like the existing
+`_c3` = 5.3), not after a wgrib2 switch, because the mapping was MEASURED on this
+build: `-set_grib_type complex1` -> **5.2**, while `complex2`, `complex3`, `c2`, `c3`
+all -> 5.3. `rle` and `png` are REJECTED by this wgrib2 build (`bad type`).
+`packing_twins.rs` now tags `_c2` and asserts element-wise equality plus point-probe
+reproduction on it like every other twin (8 tests green).
+
+## 3. DRT 5.200 (run-length): hand-crafted fixture because NO reference encoder exists
+
+`wgrib2 -set_grib_type rle` fails on this build ("*** FATAL ERROR: set_grib_type:
+bad type rle ***"), and no other wgrib2 option emits 5.200. So the fixture is
+hand-written by `scripts/gen_grib2.py` (`sec5_runlength` / `pack_runs`: 33 runs x 7
+points on a 21 x 11 regular grid) and the TRUTH CHAIN is instead:
+
+1. **wgrib2's OWN rle DECODER** reads our file (it implements 5.200 even though its
+   writer cannot emit it) — that pins the bit layout against a reference reader;
+2. `-checksum data` of the 5.200 file EQUALS that of a SIMPLE-PACKED twin carrying
+   the same values (both `3596891385`), pinning the decoded ARRAY;
+3. our Rust decoder must reproduce the same array, run positions and NaN handling.
+
+Tests: `runlength_5200_matches_simple_packing_and_wgrib2_checksum`,
+`runlength_runs_land_on_the_right_grid_positions`,
+`corrupt_runlength_stream_is_a_typed_error_not_garbage` (truncated run stream ->
+typed error, never garbage). The absence of a reference ENCODER is a documented
+limitation, not a silent gap.
+
+## 4. Honesty fixes (three claims that were not literally true)
+
+* **"fsync requires libc here" was WRONG.** A compile probe OUTSIDE the repo
+  (`/tmp/opencode/fsync_probe.rs`, `fsync_probe2.rs`) shows `std::fs::File::sync_all()`
+  EXISTS in this toolchain (rustc resolves it into `library/std/src/fs.rs`) and `strace`
+  shows a REAL `fsync(3)` — including on a DIRECTORY handle (`File::open(dir)` ->
+  `fsync(4) = 0`). The libc `open`/`fsync`/`close` bindings were REPLACED by
+  `File::open(path)` + `sync_all()`: identical syscalls, signature, counter placement
+  and error taxonomy, one fewer FFI surface. README §4 and the DECISIONS entry now
+  record the original claim AS the audit trail and the correction. Lesson kept: an
+  "unsupported in this environment" conclusion needs a COMPILE PROBE, not an
+  error-message inference.
+* **"real files" in the correctness map meant wgrib2-generated fixtures.** README §8
+  rows 1-3 now say SYNTHETIC-FIXTURE-WITH-wgrib2-GROUND-TRUTH explicitly, with a note
+  that production NOAA bytes are NOT fetched in CI (spec §13) and an optional MANUAL
+  `scripts/fetch_real_sample.sh` (range-limited curl from the public aws-nws bucket,
+  then replay the same probes) to close the gap by hand.
+* **Clippy gate scope stated with numbers, not vibes.** The gate is
+  `cargo clippy --workspace -- -D warnings` (**rc=0, zero diagnostics**). `--all-targets`
+  is NOT clean: in the phase-D sweep it reports **153 diagnostics across 10 files, ALL
+  of them in `crates/wx-core/tests/*` and `crates/wx-core/benches/*`** (dominated by
+  `assert(false)`-style `always_false` ×53, `needless_return` ×41, `manual_op` ×12,
+  doc-list-indentation, `vec_without_push`, single-pattern `match`, index-loop idioms).
+  Six of those had been in `wx-ingest/src/store.rs` doc comments and WERE fixed when
+  phase D touched that file; the test-code debt is deliberately left alone (fixing 150
+  lint sites in test bodies would churn the very tests that pin correctness) and is
+  recorded here instead of being described vaguely as "pre-existing debt".
+* Stale instrumentation note removed: the storage counters ARE exported by `/metrics`
+  as `wxpoint_storage_renames_total` / `_bytes_written_total` / `_fsyncs_total`.
+
+## 5. Benchmark harness (`scripts/ingestbench.sh` rewritten)
+
+* Measures WALL-TO-FIRST-QUERYABLE (`/ready` 200), WALL-TO-ALL-VISIBLE (every expected
+  `model:run-dir:forecast-hour` triple present in `/v1/inventory`, retention-aware:
+  the newest `min(runs, retention_runs)` run dirs), PEAK RSS via a `VmHWM` poller every
+  100 ms, SERVER CPU time, PER-FILE ingest milliseconds (the pipeline's own progress
+  lines), and storage accounting: renames, bytes-written vs FINAL store size
+  (amplification ratio), fsyncs.
+* AFTER-side counters come from `/metrics`; the v1.1 build has none, so BEFORE-side
+  counters come from `strace -f -e trace=rename,renameat,renameat2,fsync,write,sendfile`
+  LAUNCH mode, with a SECOND untraced run for wall/RSS so the syscall tracer does not
+  contaminate the timing numbers.
+* Dataset files are HARD-LINKED into the bench root when possible (192 MB x 6 copies
+  otherwise), then `touch`ed so the delivery looks fresh — note this also bumps the
+  SOURCE file's mtime, since a hard link shares the inode.
+* Correctness rides along: `scripts/_probe_realistic.py` queries the LIVE server over
+  the realistic dataset (exact nodes at 4 points x 4 params x 4 levels x 3 runs x 2
+  fhs, plus vertical 837.5 mb between 850/825 and time fh3 between f000/f006) and
+  compares against the SAME analytic formula wgrib2 confirmed.
+
+## 6. The "DOUBLE INGEST" red herring in the benchmark log — diagnosed, NOT a decode bug
+
+The phase-D benchmark log appeared to show the SAME file ingested TWICE (identical
+path, identical byte counts, IDENTICAL millisecond timings), once even three times.
+Verdict from the evidence: **NO second decode happened.**
+
+* `/metrics` reported `wxpoint_ingested_files_total = 6` for six distinct paths (a real
+  re-decode would have made it 12), `wxpoint_skipped_messages_total = 0`, and the ingest
+  log's own `scan_round ingested 6 file(s)` line agrees. The SINGLE-RECORD property is
+  pinned directly by the new regression test rather than by post-hoc inspection of that
+  run's state file (its scratch dir is deleted): `progress_once_per_file.rs` asserts
+  `p.state.recs.len() == 1`, exactly one record whose path equals the delivered file,
+  `kind == REC_OK`, and `counters.ingested_files == 1` across FOUR scan rounds.
+* A genuine second decode cannot reproduce an identical timing; the duplicates carried
+  byte-identical strings INCLUDING the `ms` field, i.e. they were the SAME recorded
+  EVENT printed more than once.
+
+Root cause was TWO independent emitters of the same line, plus a visibility-parser bug
+that made the bench hang (see §7):
+
+1. per-FILE progress lines were pushed into `Pipeline.log`, which `main` streams once
+   per scan round (`printed_logs` loop), AND
+2. the server's LIVE printer thread echoed `LiveCounters.last_msg` whenever
+   `progress_seq` advanced — so every progress line printed at least twice, sometimes
+   three times, while lines that arrived faster than the printer's 0.1 s cadence were
+   LOST entirely (the log showed 5 of 6 lines before the round summary).
+
+Fix (minimal, product-side): progress lines no longer share the note log. `Pipeline`
+gains `progress_log` (diagnostics only); `LiveCounters` gains a bounded FIFO
+`progress_queue` (+ `drain_progress()`); the LIVE printer DRAINS the FIFO and prints
+EVERY line EXACTLY ONCE oldest-first; the round streamer therefore only ever prints
+NOTES. `last_msg` is kept for diagnostics/back-compat. Regression test
+`crates/wx-ingest/tests/progress_once_per_file.rs`: one stable file across FOUR scan
+rounds ⇒ `counters.ingested_files == 1`, exactly ONE progress record, ZERO progress
+lines in the streamed note log, `progress_seq == 1`, FIFO drains ONCE then stays
+empty across further rounds; then a CONTENT CHANGE (same path, DRT 5.2 packing of the
+same fields) re-arms EXACTLY ONE ingest + ONE progress line. `restart_midchunk.rs`
+was updated to count progress lines in the new channel and asserts they are ABSENT
+from the streamed log.
+
+## 7. Benchmark harness bugs found by the hang (script-side, both fixed)
+
+* `scripts/_visible.py` did not know `/v1/inventory` wraps its per-model blocks under
+  an `"inventory"` key, so the "all visible" condition could NEVER fire. It now accepts
+  all three shapes (`{"inventory": [...]}`, `{"models": [...]}`, bare model/list) so a
+  shape change can never masquerade as "data not visible", and supports an optional
+  `:min_levels` component so a HALF-PUBLISHED parameter stack does not count as visible
+  (the realistic spec demands 37 levels per field).
+* `run_one` had NO success exit at all: it polled its whole budget (7200 x 0.1 s) even
+  after ingest completed. It now breaks as soon as BOTH milestones are reached, has an
+  explicit deadline (`MAXPOLLS`, default 1200 x 0.1 s), reports WHY it stopped
+  (`exit=ok|deadline(...)|server-died`), prints what is still PENDING, snapshots
+  `/metrics` regardless of how it stopped, and exits rc=3 on a deadline.
+* Value probes run against the LIVE server (`scripts/_probe_realistic.py`) inside the
+  timed window, so the benchmark measures correctness AND latency together.
+
+## 8. Measured BEFORE/AFTER at production scale (bounded, honest about what is measured vs analytic)
+
+The full-scale pre-V1.2 measurement was ABANDONED on purpose: at L=37 the old writer
+needs `(L+1)/2 = 19x` its own output (~70 GB for a 3.68 GB store) and tracing that
+under `strace` stalled the tracer — a PATHOLOGICAL measurement, not a product signal.
+So the BEFORE side is measured on a REDUCED-BUT-SAME-SHAPE dataset (`--real-levels
+16 --real-runs 1`: same 1440x720 geometry, same four params on `isobaric:*`, same
+grid-relative wind flags, ONE run x f000+f006, 2 files x 83 MB) and extrapolated
+ANALYTICALLY to L=37, labelled as such.
+
+| column | pre-V1.2 (tag `v1.1`) reduced L=16 MEASURED | V1.2 K=4 reduced L=16 MEASURED | V1.2 realistic L=37 MEASURED |
+|---|---|---|---|
+| first-queryable | 2.49 s | 3.08 s | 5.62 s |
+| all-visible | **20.93 s** | **3.69 s** | 15.73 s (K=4) / 25.35 s (K=1) |
+| peak RSS | 766 MB | 670 MB | 3079 MB (K=4) / 1087 MB (K=1) |
+| server CPU | 18.4 s | 3.8 s | 26.0 s (K=4) / 24.0 s (K=1) |
+| renames | n/a (untraced by design) | 11 | 33 |
+| bytes written / final store | ANALYTIC **(L+1)/2 = 8.50x** at L=16 (~4.5 GB for a 531 MB store) | 530.8/530.8 = **1.0000x** | 3682.7/3682.7 = **1.0000x** |
+| fsyncs | n/a | 30 | 82 |
+| per-file ingest | n/a (v1.1 emitted no per-file line in this capture) | 739 ms | 1.35-1.64 s |
+
+Two measured points pin the law: phase B at L=8 gave **3.55x** (78 plane serializations
+where 8 suffice, 45 renames per GFS hour) and V1.2 gives **1.0000x** at L=16 AND L=37.
+`(L(L+1)/2)/L = (L+1)/2` predicts 4.5 / 8.5 / 19.0 for L=8 / 16 / 37; the L=8 case
+measured slightly below prediction (3.55x) because manifest/grid rewrites and small
+stacks dilute the ratio - recorded rather than smoothed over.
+
+Honest regression recorded: wall-to-FIRST-QUERYABLE got WORSE (2.49 -> 3.08 s at L=16,
+5.62 s at L=37) because publish moved from PER-MESSAGE to PER-FILE and up to K files
+are decoded before any is published. The gain is 5.7x on all-visible, 4.8x on CPU,
+elimination of half-published level stacks (and their transient 422s), and write
+volume down to exactly the final store size.
+
+## 9. V1.2 scope statement (one line per fix, A -> D)
+
+* **A** streaming chunked writer + `TouchedDirs` batched directory fsync + storage
+  counters; output bit-identical to the golden file.
+* **B0** per-slot vertical level indices (silent wrong answer FIXED), monotonic
+  stability clock, automatic storage-format upgrade recovery (no silent empty inventory).
+* **B** chunked decode bounded by `decode_batch_files` (K), write-ONCE grouping (O(L^2)
+  -> O(L)), per-FILE publish, poison quarantine with content hash, live counter mirror.
+* **C** retention-aware skip BEFORE decode, filename run-hint used for ORDERING only,
+  data_dir/ingest_dir overlap guard, state hygiene (prune vanished records), drained-once
+  event queue, strict calendar dates, machine-observable exit codes, total+invertible
+  `run_dir_name`.
+* **D** production-scale benchmark harness (realistic + reduced datasets, value probes
+  against the live server), packing-coverage closure (DRT 5.2 decoder gap FIXED, DRT
+  5.200 hand-crafted fixture because no reference encoder exists), operator-log
+  de-duplication (`progress_once_per_file.rs`), three documentation honesty fixes
+  (fsync/libc claim, "real files" wording, clippy gate scope) and the stale
+  instrumentation note removed.
+
+Out of scope for V1.2 (unchanged): slant paths, bounding boxes, soundings, grid subsetting,
+unit conversion, derived quantities, authentication, downloading model data.

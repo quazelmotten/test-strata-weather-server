@@ -4,11 +4,16 @@
 //! plus a directory fsync, so a query never sees a partial file and a crash
 //! cannot resurrect a renamed-but-unlinked file.
 //!
-//! Durability note (V1.1 phase 3): this toolchain's `std::fs::File` exposes only
-//! `flush()` (userspace buffer flush, NOT fsync — verified with strace: no
-//! `fsync` syscall is emitted), so [`fsync_path`] calls libc `open`/`fsync`/
-//! `close` directly through `extern "C"`. That is the only way to get a genuine
-//! fsync here; the same helper backs the state file and manifest writers.
+//! Durability note (corrected in V1.2 phase D): `flush()` alone is only a
+//! userspace buffer flush (strace confirms it emits NO `fsync` syscall), which
+//! is why every writer here follows it with [`fsync_path`]. That helper used to
+//! bind libc `open`/`fsync`/`close` because an earlier phase concluded this
+//! toolchain had "no fsync surface at all" — that claim was WRONG. A compile+
+//! strace probe shows `std::fs::File` DOES have `sync_all()` here and it emits
+//! a real `fsync(fd)`, and it works on a DIRECTORY handle too (`File::open(dir)`
+//! → `fsync(4) = 0`). The libc bindings were therefore REPLACED by opening the
+//! path and calling `sync_all()`: same syscalls (`openat` O_RDONLY → `fsync` →
+//! `close`), same signature, same counter placement, one fewer FFI surface.
 //!
 //! ## V1.2 phase A: streaming writer + batched directory fsync
 //!
@@ -199,20 +204,15 @@ pub fn expected_size(hdr: &BinHeader) -> usize {
 // write path: temp file in same dir, fsync file+dir, atomic rename (spec §4.5)
 // ---------------------------------------------------------------------------
 
-// Direct libc durability primitives. This std has no fsync surface at all
-// (`File::flush` only flushes the userspace buffer), so we bind the C library
-// functions ourselves. `open` is declared under a Rust-side name with
-// `#[link_name]` so the compiler does not confuse it with the runtime's own
-// `open`. Verified against strace: these emit real `openat`/`fsync`/`close`
-// syscalls, including on a directory fd (Linux accepts fsync on directories).
-extern "C" {
-    #[link_name = "open"]
-    fn libc_open(path: *const i8, flags: i32, ...) -> i32;
-    #[link_name = "fsync"]
-    fn libc_fsync(fd: i32) -> i32;
-    #[link_name = "close"]
-    fn libc_close(fd: i32) -> i32;
-}
+// Durability via std (V1.2 phase D correction). An earlier phase believed this
+// toolchain exposed NO fsync surface and bound libc `open`/`fsync`/`close`
+// through `extern "C"`. That was FALSE: `std::fs::File` has `sync_all()`, and
+// verified with strace it emits exactly the same syscall sequence as the libc
+// version did — `openat(AT_FDCWD, path, O_RDONLY|O_CLOEXEC)` then `fsync(fd)`,
+// including for a DIRECTORY opened read-only (Linux accepts fsync on a directory
+// fd). So the FFI bindings are GONE; behaviour (and the counter placement below)
+// is unchanged. `File::flush()` alone would NOT be enough — it only flushes the
+// userspace buffer and emits no syscall.
 
 // ---------------------------------------------------------------------------
 // instrumentation counters (regression gates now, /metrics later)
@@ -267,38 +267,34 @@ pub fn count_bytes_written(n: u64) {
     let _b = BYTES_WRITTEN_TOTAL.fetch_add(n, Ordering::Relaxed);
 }
 
-/// fsync the inode behind `path` (a regular file OR a directory). O_RDONLY is
-/// enough for fsync. Returns Some(message) on failure (missing path, EACCES,
-/// filesystems that reject directory fsync) so callers can decide whether the
-/// write is good enough.
+/// fsync the inode behind `path` (a regular file OR a directory). Opening READ-
+/// ONLY is enough for fsync. Returns Some(message) on failure (missing path,
+/// EACCES, filesystems that reject directory fsync) so callers can decide
+/// whether the write is good enough. Counter placement is UNCHANGED from the
+/// libc version: a failed OPEN costs no fsync, an attempted fsync counts ONCE.
 pub fn fsync_path(path: &str) -> Result<(), String> {
-    let ub: Vec<u8> = path.as_bytes().to_vec();
-    if ub.is_empty() {
+    if path.is_empty() {
         return Err("empty path".to_string());
     }
-    // NUL-terminated C string copy (Rust strings are not NUL-terminated).
-    let mut buf: Vec<i8> = Vec::<i8>::new();
-    for k in 0 .. ub.len() {
-        buf.push(ub[k] as i8);
+    let h = std::fs::File::open(path);
+    match h {
+        Err(_) => {
+            return Err("open-for-fsync failed".to_string());
+        }
+        Ok(f) => {
+            // Count the fsync we are about to attempt (the open already happened).
+            let _fc = FSYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let r = f.sync_all();
+            match r {
+                Ok(()) => {
+                    return Ok(());
+                }
+                Err(_) => {
+                    return Err("sync_all failed".to_string());
+                }
+            }
+        }
     }
-    buf.push(0);
-    let ptr: *const i8 = &buf[0];
-    let fd = unsafe { libc_open(ptr, 0) };
-    if fd < 0 {
-        return Err("open-for-fsync failed".to_string());
-    }
-    // Count the fsync we are about to attempt (the open already happened; a
-    // failed open costs no fsync syscall).
-    let _fc = FSYNCS_TOTAL.fetch_add(1, Ordering::Relaxed);
-    let r = unsafe { libc_fsync(fd) };
-    let c = unsafe { libc_close(fd) };
-    if r != 0 {
-        return Err(format!("fsync rc={0}", r));
-    }
-    if c != 0 {
-        return Err(format!("close rc={0}", c));
-    }
-    return Ok(());
 }
 
 // ---------------------------------------------------------------------------

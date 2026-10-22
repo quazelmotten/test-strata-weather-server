@@ -85,7 +85,21 @@ fn rm_tree(dir: &str) {
     let _d = remove_dir(&dir);
 }
 
-/// How many log lines mention a given marker.
+// V1.2 phase D: per-FILE OUTCOME lines (ingested / failed-quarantined / ignored /
+// skipped) moved out of `log` into `progress_log`, because they were printed TWICE
+// (LIVE printer + round streamer). NOTES (magic-byte precheck, recovery, skips
+// counted per message) stay in `log`. Both channels are asserted separately below.
+fn count_progress(p: &Pipeline, marker: &str) -> usize {
+    let mut hits = 0;
+    for l in &p.progress_log {
+        if l.contains(marker) {
+            hits += 1;
+        }
+    }
+    return hits;
+}
+
+/// How many note-log lines mention a given marker.
 fn count_notes(p: &Pipeline, marker: &str) -> usize {
     let mut hits = 0;
     for l in &p.log {
@@ -149,7 +163,8 @@ fn poison_files_are_quarantined_not_retried() {
     assert!(p.counters.quarantined_files == 1);
     assert!(p.counters.errors == 1);
     assert!(count_notes(&p, "never decoded") == 1);
-    assert!(count_notes(&p, "quarantined") == 1);
+    assert!(count_progress(&p, "quarantined") == 1);
+    assert!(count_notes(&p, "quarantined") == 0);   // live channel only, never replayed
 
     let rg = p.state.find(good.to_string());
     let rs = p.state.find(sidecar.to_string());
@@ -177,7 +192,8 @@ fn poison_files_are_quarantined_not_retried() {
     assert!(p.counters.quarantined_files == 1);
     assert!(p.counters.ignored_files == 1);
     assert!(p.counters.ingested_files == 1);
-    assert!(count_notes(&p, "quarantined") == 1);
+    assert!(count_progress(&p, "quarantined") == 1);
+    assert!(count_notes(&p, "quarantined") == 0);   // live channel only, never replayed
     assert!(count_notes(&p, "never decoded") == 1);
 
     // ---- content change RE-ARMS the quarantined file ---------------------

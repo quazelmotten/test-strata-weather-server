@@ -36,6 +36,17 @@ check_twin() {
 }
 
 for base in gfs_small hrrr_small; do
+  # complex packing WITHOUT spatial differencing (DRT 5.2), written by wgrib2
+  # itself. TOKEN MEASURED on tools/wgrib2-full v3.1.3: `complex1` (alias `c1`)
+  # -> DRT 5.2, while `complex2`/`complex3` (aliases `c2`/`c3`) -> DRT 5.3. The
+  # twin is named after the DATA REPRESENTATION TEMPLATE it carries (like the
+  # existing `_c3` = 5.3), NOT after the CLI token.
+  "$WG" "tests/fixtures/${base}.grib2" -set_grib_type complex1 \
+      -grib_out "tests/fixtures/${base}_c2.grib2" >/dev/null
+  check_twin "$base" 2 c2
+done
+
+for base in gfs_small hrrr_small; do
   # complex packing + spatial differencing (DRT 5.3), written by wgrib2 itself
   "$WG" "tests/fixtures/${base}.grib2" -set_grib_type c3 \
       -grib_out "tests/fixtures/${base}_c3.grib2" >/dev/null
@@ -77,6 +88,27 @@ check_twin stat_small 40 jpeg
   echo "FATAL: wgrib2 did not recognize the accumulation message"; exit 1; }
 "$WG" tests/fixtures/stat_small.grib2 | grep -q 'ave' || {
   echo "FATAL: wgrib2 did not recognize the average message"; exit 1; }
+
+# ---------------------------------------------------------------------------
+# DRT 5.200 run length packing: wgrib2 DECODES rle but cannot ENCODE it
+# (`-set_grib_type rle` -> "FATAL ERROR: set_grib_type: bad type rle"; the
+# encoder lives in g2clib, which this build disables), so the fixture is
+# hand-written by scripts/gen_grib2.py and validated through wgrib2's OWN rle
+# decoder: template byte must read 200, and `-checksum data` must equal the
+# SAME field written with simple packing (runlength_plain.grib2). Truth chain
+# = two independent decoders (wgrib2's unpk_run_length.c and ours) agreeing on
+# every value, plus Code Table 5.0's documented layout.
+# ---------------------------------------------------------------------------
+badrl=$("$WG" tests/fixtures/runlength_small.grib2 -code_table_5.0 | { grep -vc "code table 5.0=200 Run length packing" || true; })
+if [ "${badrl}" != "0" ]; then
+  echo "FATAL: runlength_small.grib2: ${badrl} record(s) not DRT 5.200"; exit 1
+fi
+a="$(cksums tests/fixtures/runlength_small.grib2)"
+b="$(cksums tests/fixtures/runlength_plain.grib2)"
+if [ "$a" != "$b" ] || [ -z "$a" ]; then
+  echo "FATAL: runlength_small (5.200) decoded array differs from runlength_plain (5.0)"; exit 1
+fi
+echo "ok runlength_small (DRT 5.200, checksum-equal to runlength_plain)"
 
 # The unsupported-template guard fixture declares DRT 5.1 (dictionary packing),
 # which nothing in the wgrib2 ecosystem can decode. A bare listing never touches

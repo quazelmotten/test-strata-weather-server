@@ -88,6 +88,19 @@ fn rm_tree(dir: &str) {
     let _d = remove_dir(&dir);
 }
 
+// V1.2 phase D: per-FILE progress lines moved OUT of `log` into `progress_log`
+// (they were being printed TWICE: once by the LIVE printer, once by the round
+// streamer). Notes (skips, failures, recovery) stay in `log`.
+fn count_progress(p: &Pipeline, marker: &str) -> usize {
+    let mut hits = 0;
+    for l in &p.progress_log {
+        if l.contains(marker) {
+            hits += 1;
+        }
+    }
+    return hits;
+}
+
 fn count_notes(p: &Pipeline, marker: &str) -> usize {
     let mut hits = 0;
     for l in &p.log {
@@ -144,7 +157,8 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
 
     assert!(p.scan_round() == 0);   // observation round
     assert!(p.scan_round() == 3);   // all three consumed, ONE publish each
-    assert!(count_notes(&p, "ingested ") == 3);
+    assert!(count_progress(&p, "ingested ") == 3);
+    assert!(count_notes(&p, "ingested ") == 0);   // NOT in the streamed log
     assert!(p.live.progress_seq.load(Ordering::Relaxed) >= 3);
     assert!(p.counters.ingested_files == 3);
     assert!(p.counters.errors == 0);
@@ -181,7 +195,8 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
     assert!(p2.scan_round() == 1);
     assert!(p2.counters.ingested_files == 1);
     assert!(p2.counters.errors == 0);
-    assert!(count_notes(&p2, "ingested ") == 1);
+    assert!(count_progress(&p2, "ingested ") == 1);
+    assert!(count_notes(&p2, "ingested ") == 0);
     // and a further round changes nothing at all
     assert!(p2.scan_round() == 0);
     assert!(p2.counters.ingested_files == 1);

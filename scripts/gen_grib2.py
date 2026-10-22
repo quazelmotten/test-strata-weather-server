@@ -390,6 +390,48 @@ def encode_field_np(incs, base, e_exp):
             sec7(pack_bits_np(shifted, nbits)))
 
 
+def sec5_runlength(npoints, nbits, mv, mvl, dec_scale, levels_int):
+    """Section 5 for DRT **5.200 run length packing** (Code Table 5.0 template
+    200). Offsets verified against wgrib2 `unpk_run_length.c`, which reads them
+    from sec[5] as: n_bits=[11], mv=uint2(+12), mvl=uint2(+14), decimal_scale=
+    [16], levels[i]=int2(+15+i*2) for i=1..mvl — i.e. payload offsets 6, 7, 9,
+    11 and 10+i*2 here. NOTE this layout is NOT the simple-packing one: there is
+    no IEEE reference value and no binary scale; the value table replaces them."""
+    p = bytearray()
+    p += u4(npoints)          # number of grid points (wgrib2 uses sec3's count)
+    p += u2(200)              # data representation template 5.200
+    p += bytes([nbits])       # bits per packed index/repetition code
+    p += u2(mv)               # maximum level index (codes > mv are repetitions)
+    p += u2(mvl)              # number of distinct levels in the table
+    p += bytes([dec_scale])   # decimal scale (levels are value * 10^-dec_scale)
+    for i in range(1, mvl + 1):
+        p += i2sm(levels_int[i - 1])
+    assert len(p) == 12 + 2 * mvl
+    return section(5, bytes(p))
+
+
+def pack_runs(runs, mv, nbits):
+    """Run-length bitstream (mirror of wgrib2 unpk_run_length.c's inverse):
+    a run of length L of level index v emits `v` followed by the base-`range`
+    digits of (L-1), LEAST significant first, each digit d written as the
+    continuation code mv+1+d, where range = 2^nbits - 1 - mv. The decoder
+    recomputes n = 1 + sum(factor * (code - mv - 1)), factor *= range, so digits
+    MUST be little-endian in that base or the run length comes out wrong."""
+    rng = (1 << nbits) - 1 - mv
+    if rng < 1:
+        raise ValueError("nbits too small for mv (range must be >= 1)")
+    codes = []
+    for (v, length) in runs:
+        if v < 1 or v > mv:
+            raise ValueError("level index out of range")
+        codes.append(v)
+        rem = length - 1
+        while rem > 0:
+            codes.append(mv + 1 + (rem % rng))
+            rem //= rng
+    return pack_bits(codes, nbits), len(codes)
+
+
 def sec5_simple(nvals, ref, e_exp, s_stored, nbits):
     p = bytearray()
     p += u4(nvals)
@@ -467,6 +509,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True, help="output dir for small fixtures")
     ap.add_argument("--perf-out", default=None, help="dir for full-size perf fixture")
+    ap.add_argument("--real-levels", type=int, default=37,
+                    help="isobaric levels in the realistic dataset (16 = the REDUCED "
+                         "variant used for the bounded pre-V1.2 measurement)")
+    ap.add_argument("--real-runs", type=int, default=3,
+                    help="run cycles in the realistic dataset (1 = single-run variant)")
+    ap.add_argument("--real-out", default=None,
+                    help="dir for the PRODUCTION-SCALE realistic GFS-like dataset "
+                         "(V1.2 phase D ingest benchmark: 3 runs x 2 forecast hours)")
     a = ap.parse_args()
 
     import os
@@ -671,6 +721,51 @@ def main():
         for r in rrecs:
             f.write(r)
 
+    # ------- DRT 5.200 run length packing (V1.2 phase D coverage close) -------
+    # wgrib2 can DECODE run-length packing (`Supported decoding: ... rle ...`)
+    # but has NO ENCODER for it: `-set_grib_type rle` -> "FATAL ERROR: set_grib_
+    # type: bad type rle" (measured on tools/wgrib2-full v3.1.3; the encoder
+    # lives in g2clib, which this build disables). So the truth chain here is
+    # TWO-PART: (a) our hand-written 5.200 message is read back by WGrib2's OWN
+    # rle DECODER and its `-checksum data` must equal that of the SAME field
+    # written with simple packing -- an independent implementation agreeing on
+    # every value; (b) our Rust decoder must reproduce those same values. Layout
+    # follows Code Table 5.0 / unpk_run_length.c offsets exactly (see
+    # `sec5_runlength`). No bitmap: the rle path's bitmap convention is INVERTED
+    # vs simple/complex (bit=1 marks UNDEFINED), documented in grib2.rs, and
+    # deliberately NOT exercised by this fixture.
+    rnx, rny = 21, 11                       # 231 points = 33 runs x 7
+    rl_grid = sec3_latlon(rnx, rny, 350.0, 10.0, 0.5, -0.5)
+    rl_th = sec1(2026, 10, 19, 12, 0, 0)
+    rl_levels_int = [2500, 2560, 2600]      # decimal scale 1 -> 250.0/256.0/260.0
+    rl_dec_scale = 1
+    rl_mvl = len(rl_levels_int)             # 3 distinct levels
+    rl_mv = rl_mvl                          # max level INDEX (codes > mv repeat)
+    rl_nbits = 4                            # range = 15 - 3 = 12 >= run-1 = 6
+    rl_level_of = [(k // 7) % 3 + 1 for k in range(rnx * rny)]
+    rl_runs = []
+    for v in rl_level_of:
+        if rl_runs and rl_runs[-1][0] == v:
+            rl_runs[-1][1] += 1
+        else:
+            rl_runs.append([v, 1])
+    assert all(len(r) == 2 and r[1] == 7 for r in rl_runs) and len(rl_runs) == 33
+    rl_bits, rl_ncodes = pack_runs([(r[0], r[1]) for r in rl_runs], rl_mv, rl_nbits)
+    assert rl_ncodes * rl_nbits == len(rl_bits) * 8   # no padding codewords
+    rl_s5 = sec5_runlength(rnx * rny, rl_nbits, rl_mv, rl_mvl, rl_dec_scale,
+                           rl_levels_int)
+    rl_s4 = sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_ISOBARIC, 850 * 100, 0)
+    with open(os.path.join(a.out, "runlength_small.grib2"), "wb") as f:
+        f.write(build_record(rl_th, rl_grid, rl_s4, rl_s5, sec7(rl_bits), None))
+
+    # Same field, simple packing: the reference whose `-checksum data` the rle
+    # file must match (values 250.0 / 256.0 / 260.0, exact in f32).
+    rl_incs = [0, 6, 10]
+    rl_plain_incs = [rl_incs[v - 1] for v in rl_level_of]
+    p5b, p7b, p6b, _ = encode_field(rl_plain_incs, 250.0, 0, None)
+    with open(os.path.join(a.out, "runlength_plain.grib2"), "wb") as f:
+        f.write(build_record(rl_th, rl_grid, rl_s4, p5b, p7b, p6b))
+
     # ------- unsupported representation guard (DRT 5.1 dictionary) ---------
     # Structurally valid message whose section 5 declares a data representation
     # template no decoder in the wgrib2 ecosystem implements (dictionary packing
@@ -776,6 +871,88 @@ def main():
             with open(os.path.join(a.perf_out, "hrrr_perf_f%03d.grib2" % fh), "wb") as f:
                 for r in recs:
                     f.write(r)
+
+    # ------------- PRODUCTION-SCALE REALISTIC GFS-LIKE DATASET ---------------
+    # V1.2 phase D: the tester's exact pain — a REAL delivery shape at production
+    # geometry, so the ingest benchmark measures the merge path at L ~ 37 levels
+    # instead of L ~ 8. Everything a real NWS pgrb2 delivery has, and nothing else:
+    #   * full GFS geometry: regular lat/lon 1440 x 720, lon 0..359.75, lat 89.875
+    #     down to -89.875, N->S scan (template 3.0);
+    #   * 37 isobaric levels: EVERY 25 hPa from 1000 to 100. That is a SUPERSET of
+    #     the real NWS pgrb2 stack (25 levels: 1000,975,950,925,900,850,800,...,100);
+    #     the 12 extras (875,825,725,675,625,575,525,475,425,375,325,275) exist only
+    #     to make the per-group merge cost O(L^2)-vs-O(L) visible at ingest. Documented
+    #     deviation from the brief's "~40 levels" (the REAL NWS list is 25).
+    #   * params TMP + HGT + UGRD + VGRD, ALL on isobaric:* -> 148 messages/file;
+    #   * the WIND messages carry flag-table-3.3 bit 0x08 (grid-relative components)
+    #     ON a regular lat/lon grid, which exercises the wind PAIR rule, the startup
+    #     preflight probe and the rotate-to-earth code path end to end. NOTE: for
+    #     REGULAR grids our rotation is the IDENTITY (documented decision matching
+    #     wgrib2: a lat/lon grid's components are already earth-tangent), so stored
+    #     values equal decoded values -- probes prove the plumbing, not a rotation
+    #     angle (angles are covered by the LCC fixtures + pyproj checks);
+    #   * THREE RUNS x TWO forecast hours = SIX FILES (the "6-file reality" the
+    #     retention settings must cope with): runs 2026-10-19T00Z / T06Z / T12Z,
+    #     each delivering f000 and f006 as SEPARATE files, named like the real
+    #     NWS products (`gfs.t191200z.pgrb2.0p25.f006.grib2`) -- deliberately WITHOUT
+    #     a 10-digit YYYYMMDDHH stamp, so the phase-C filename run-hint CANNOT help
+    #     and ordering falls back to path order (measured, documented);
+    #   * values stay analytic and EXACT in f32: value = BASE(param,level) +
+    #     ((row*1440+col) % 1024) + fh*10, so every node probe is predictable and
+    #     simple packing needs only 10-11 bits (files ~150 MB, vs ~30 MB for a
+    #     real JPEG-compressed NWS product -- honest about being BIGGER on disk).
+    if a.real_out:
+        import numpy as np
+        os.makedirs(a.real_out, exist_ok=True)
+
+        rnx, rny = 1440, 720
+        rgrid_scalar = sec3_latlon(rnx, rny, 0.0, 89.875, 0.25, -0.25,
+                                   wind_grid=False)
+        rgrid_wind = sec3_latlon(rnx, rny, 0.0, 89.875, 0.25, -0.25,
+                                 wind_grid=True)   # flag 0x08 on a lat/lon grid
+        jj = np.repeat(np.arange(rny, dtype=np.int64), rnx)
+        ii = np.tile(np.arange(rnx, dtype=np.int64), rny)
+        mod_inc = (jj * rnx + ii) % 1024           # 10-bit span -> compact packing
+
+        # every 25 hPa from 1000 down to 100 (37 levels, superset of the NWS list);
+        # --real-levels / --real-runs slice that stack so a REDUCED-BUT-SAME-SHAPE
+        # variant can be generated (used by the bounded pre-V1.2 measurement: L=16
+        # keeps the geometry, params, wind flags and file shape identical while
+        # cutting the O(L^2) write volume to something a strace-free run can finish)
+        ALL_LEVELS = list(range(1000, 75, -25))
+        assert len(ALL_LEVELS) == 37
+        LEVELS_25 = ALL_LEVELS[:a.real_levels]
+        assert len(LEVELS_25) == a.real_levels
+
+        def base_of(pname, lv):
+            if pname == "TMP":       # plausible troposphere->stratosphere temps
+                return 290 - (1000 - lv) // 4
+            if pname == "HGT":       # plausible heights (gpm) rising with height
+                return (1000 - lv) * 45 // 100
+            if pname == "UGRD":      # zonal flow: weak near surface, strong aloft
+                return 5 + (1000 - lv) // 40
+            return -3 - (1000 - lv) // 60          # VGRD meridional
+
+        RUN_HS = (0, 6, 12)[:a.real_runs]
+        for run_h in RUN_HS:
+            rt = sec1(2026, 10, 19, run_h, 0, 0)
+            for fh in (0, 6):
+                recs = []
+                for lv in LEVELS_25:
+                    for pname in ("TMP", "HGT", "UGRD", "VGRD"):
+                        incs = mod_inc + fh * 10
+                        s5b, s7b = encode_field_np(incs, float(base_of(pname, lv)), 0)
+                        wgrid = pname in ("UGRD", "VGRD")
+                        s4 = sec4(PARAMS[pname][0], PARAMS[pname][1],
+                                  LEVEL_ISOBARIC, lv * 100, fh)
+                        recs.append(build_record(rt, rgrid_wind if wgrid else rgrid_scalar,
+                                                 s4, s5b, s7b, None))
+                name = "gfs.t%02d0000z.pgrb2.0p25.f%03d.grib2" % (run_h, fh)
+                with open(os.path.join(a.real_out, name), "wb") as f:
+                    for r in recs:
+                        f.write(r)
+        print("realistic dataset written (%d files, %d levels, runs %s)"
+              % (len(RUN_HS) * 2, len(LEVELS_25), ",".join(str(h) for h in RUN_HS)))
 
     print("fixtures written")
 

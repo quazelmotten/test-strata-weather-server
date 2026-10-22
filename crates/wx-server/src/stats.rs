@@ -1,11 +1,15 @@
 //! /metrics counters (spec §7): query latency histogram (manual µs buckets +
 //! atomics, no heavy dependency), per-status-class query counts, ingest lag
 //! and ingest error count. Latency is measured from request entry to response
-//! start using CLOCK_MONOTONIC via libc (this toolchain has no std clock API).
-//! Since V1.2 phase B the exposition also carries `wxpoint_ignored_files_total`,
+//! start using CLOCK_MONOTONIC via libc (this toolchain's `Instant` has no
+//! absolute-time form, so epoch-ns mtimes need CLOCK_REALTIME). Since V1.2
+//! phase B the exposition also carries `wxpoint_ignored_files_total`,
 //! `wxpoint_quarantined_files_total` and `wxpoint_ingest_groups_written_total`,
 //! and every ingest-side gauge reads max(legacy store, LIVE pipeline mirror) so
-//! a scan round in flight is visible immediately.
+//! a scan round in flight is visible immediately. Since V1.2 phase D it ALSO
+//! exposes the wx-core storage counters as `wxpoint_storage_renames_total`,
+//! `wxpoint_storage_bytes_written_total` and `wxpoint_storage_fsyncs_total` —
+//! the write-amplification evidence an ingest benchmark needs (README §7.3).
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicI64;
@@ -14,6 +18,7 @@ use libc::timespec;
 use libc::clock_gettime;
 use libc::CLOCK_MONOTONIC;
 use libc::CLOCK_REALTIME;
+use wx_core::storage::{counters_snapshot};
 use std::sync::Arc;
 use std::sync::Mutex;
 use wx_ingest::pipeline::{LiveCounters};
@@ -204,6 +209,19 @@ impl QueryStats {
         }
         out = format!("{0}{1}", out, "\nwxpoint_retention_skipped_files_total ");
         out = format!("{0}{1}", out, v_stale);
+        // V1.2 phase D: write-amplification observability straight from the wx-core
+        // storage counters (renames / bytes handed to writers / fsync syscalls).
+        // These are PROCESS-WIDE totals since boot, which is exactly what an ingest
+        // benchmark needs (a fresh process starts at zero): compare the bytes gauge
+        // with the final on-disk store size to see the amplification factor, and the
+        // renames/fsyncs gauges against the number of FIELD FILES.
+        let sc = counters_snapshot();
+        out = format!("{0}{1}", out, "\nwxpoint_storage_renames_total ");
+        out = format!("{0}{1}", out, sc.renames);
+        out = format!("{0}{1}", out, "\nwxpoint_storage_bytes_written_total ");
+        out = format!("{0}{1}", out, sc.bytes_written);
+        out = format!("{0}{1}", out, "\nwxpoint_storage_fsyncs_total ");
+        out = format!("{0}{1}", out, sc.fsyncs);
         // ingest lag: file mtime -> now, seconds (mtime is epoch ns).
         let mtime = self.last_mtime_ns.load(Ordering::Relaxed);
         let mt2 = lv.last_mtime_ns.load(Ordering::Relaxed);

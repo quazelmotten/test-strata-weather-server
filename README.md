@@ -25,7 +25,7 @@ cargo build --release -p wx-server          # binary: target/release/wxpoint
 
 Stable Rust (`rustc 1.99.1` here), workspace crates `wx-core` (no async/HTTP
 deps), `wx-ingest`, `wx-server`. Release profile: `lto = "fat"`,
-`codegen-units = 1`, `panic = "abort"` (portable — see §7.4 for the
+`codegen-units = 1`, `panic = "abort"` (portable — see §7.5 for the
 `target-cpu=native` verdict). The bench profile mirrors release but always
 unwinds (criterion requirement; this cargo ignores `panic` there — documented
 in Cargo.toml).
@@ -46,22 +46,26 @@ one without reading logs.
 | 8 | the HTTP server itself returned an error |
 
 
-Gate, as measured in the phase-6 acceptance sweep:
+Gate, as measured in the V1.2 phase-D acceptance sweep (this machine):
 
-* `cargo test --workspace` → **rc=0, 149 tests passed across 58 test binaries (+8 empty
-  lib targets), 0 failed** (54.0 s wall; re-measured after V1.2 phase C, green on three
-  consecutive back-to-back runs).
+* `cargo test --workspace` → **rc=0, 153 tests passed across 68 test binaries, 0
+  failed**, TWICE back-to-back (both runs identical counts).
 * `cargo clippy --workspace -- -D warnings` → **rc=0**, zero lint diagnostics
   (the only stderr line is cargo's future-incompat note about the vendored
   `bitflags` 0.4.0/0.7.0 deps, not a lint). This is the documented gate scope
-  (workspace lib+bin targets); a wider `--all-targets` probe shows pre-existing
-  lint debt in wx-core test/bench code only — see docs/DECISIONS.md.
-* `bash scripts/gen_fixtures.sh` → rc=0, idempotent (fixture md5s identical
-  across consecutive runs), 17 packing-twin assertions green.
+  (workspace lib+bin targets). A wider `--all-targets` run is NOT clean: it reports
+  pre-existing lint debt in test/bench code only (count recorded in docs/DECISIONS.md
+  phase D) — stated, not hidden.
+* `bash scripts/gen_fixtures.sh` → rc=0, idempotent (all 25 fixture md5s identical
+  across consecutive runs), 8 packing-twin assertions green incl. the DRT 5.2 `_c2`
+  twins; the DRT 5.200 run-length fixtures are asserted by `runlength_5200.rs`.
 * `bash scripts/smoke.sh` → **SMOKE PASS**, all 17 `probes.tsv` ground-truth
   probes replayed with 0 failures.
-* `bash scripts/loadtest.sh 20` → §8 targets MET (see §7.2).
-* `python3 scripts/validate_rotation.py` → rc=0, 42 expected-angle rows.
+* `bash scripts/loadtest.sh 15` → §8 targets MET (see §7.2).
+* `python3 scripts/validate_rotation.py` → rc=0, 42 expected-angle rows, both earth
+  shapes.
+* `bash scripts/ingestbench.sh` (realistic dataset) → 6 files ingested, 481 live
+  value probes OK, write amplification 1.0000x (see §7.4).
 
 ## 2. Configuration
 
@@ -281,18 +285,22 @@ data_dir/
 * Atomicity and durability chain: every write is temp-file → `flush` → **fsync of
   the file inode** → atomic rename → directory fsync, so a query never sees a partial
   file and a crash cannot resurrect a renamed-but-unlinked name. How fsync is obtained
-  here: this toolchain's `std::fs::File` exposes only `flush()` (a userspace buffer
-  flush — verified with `strace`, it emits no `fsync` syscall), so
-  `wx_core::storage::fsync_path()` binds libc `open`/`fsync`/`close` through
-  `extern "C"` and fsyncs by path. Since V1.2 phase B the PARENT-DIRECTORY fsync is
-  BATCHED: field writes record their directory in a `TouchedDirs` collector and the
-  pipeline flushes every DISTINCT directory ONCE per source file (the file inode is
-  still fsynced BEFORE its rename, so the crash rule is unchanged — a crash can only
-  lose the directory ENTRY of a file whose data is already durable). Durability
-  failures surface as ingest notes/errors, never swallowed. Visibility granularity
-  is ONE SOURCE FILE (registry published once per file after all its GROUPS are
-  written), which still satisfies spec §4.5 because products arrive forecast-hour
-  by forecast-hour — see the transient-publish caveat in §9.
+  here: `wx_core::storage::fsync_path()` opens the path read-only and calls
+  `std::fs::File::sync_all()`, which emits a real `fsync(fd)` — verified out-of-repo
+  with a compile + `strace` probe (`/tmp/opencode/fsync_probe*.rs`), which also showed
+  it works on a DIRECTORY handle (`File::open(dir)` → `fsync(4) = 0`). An earlier
+  phase had claimed this toolchain had "no fsync surface at all" and bound libc
+  `open`/`fsync`/`close` through `extern "C"` on that basis; that claim was WRONG and
+  the bindings were replaced (same syscalls, same signature, one fewer FFI surface).
+  Since V1.2 phase B the PARENT-DIRECTORY fsync is BATCHED: field writes record their
+  directory in a `TouchedDirs` collector and the pipeline flushes every DISTINCT
+  directory ONCE per source file (the file inode is still fsynced BEFORE its rename,
+  so the crash rule is unchanged — a crash can only lose the directory ENTRY of a
+  file whose data is already durable). Durability failures surface as ingest
+  notes/errors, never swallowed. Visibility granularity is ONE SOURCE FILE (registry
+  published once per file after all its GROUPS are written), which still satisfies
+  spec §4.5 because products arrive forecast-hour by forecast-hour — see the
+  transient-publish caveat in §9.
 * `manifest.json` is human-facing inventory; the index is authoritative. Per
   field it records `units`, `stat_processed`, `stat_kind`, `levels`, decimal
   `forecast_hours` (informational only — the filename is the exact key) and
@@ -430,19 +438,31 @@ refactor; the **phase-6 acceptance sweep** re-ran all three bench files again
 (`cargo bench --workspace`, 100 samples each). Milestone-5 numbers kept for
 reference; session variance on the pure kernels is ~±2%.
 
-| Kernel | milestone-5 | phase 5 before | phase 5 after | phase-6 sweep median |
-|---|---|---|---|---|
-| regular lat/lon project (per point) | 20.6 ns | 20.5 ns | 20.5 ns | **20.430 ns** |
-| LCC project, precomputed consts | 84.7 ns | 86.4 ns | 86.5 ns | **86.187 ns** |
-| bilinear over heap f32 slab | 30.7 ns | 30.9 ns | 31.0 ns | **30.746 ns** |
-| bilinear over mmap field (server h_at pattern) | 32.5 ns | 33.1 ns | 33.0 ns | **32.663 ns** |
-| full vertical+time point query via index accessor | 364.5 ns | 354.6 ns → 135.0 ns (−62%) | **136.62 ns** (+2.0% vs phase-5 record — inside the ±2% session band; criterion itself flagged it as noise-level) |
-| `/v1/point` handler: parse + lookup + render | 879.2 ns | 828.8 ns → 694.3 ns (−16%) | **681.74 ns** (same-session re-run of `-p wx-server`: 699.05 ns) |
+| Kernel | milestone-5 | phase 5 before | phase 5 after | phase-6 sweep median | V1.2 phase-D sweep median |
+|---|---|---|---|---|---|
+| regular lat/lon project (per point) | 20.6 ns | 20.5 ns | 20.5 ns | **20.430 ns** | unchanged (prior row stands; not re-measured in D) |
+| LCC project, precomputed consts | 84.7 ns | 86.4 ns | 86.5 ns | **86.187 ns** | unchanged (prior row stands; not re-measured in D) |
+| bilinear over heap f32 slab | 30.7 ns | 30.9 ns | 31.0 ns | **30.746 ns** | **30.85 ns** |
+| bilinear over mmap field (server h_at pattern) | 32.5 ns | 33.1 ns | 33.0 ns | **32.663 ns** | **32.90 ns** |
+| full vertical+time point query via index accessor | 364.5 ns | 354.6 ns → 135.0 ns (−62%) | **136.62 ns** | **147.55 ns (+8.0% — see note below)** |
+| `/v1/point` handler: parse + lookup + render | 879.2 ns | 828.8 ns → 694.3 ns (−16%) | **681.74 ns** | **671.08 ns (−1.6%, improved)** |
 
 Handler-level percentile pass (200k iterations, no HTTP, warm page cache;
-criterion 0.5 prints medians only): **p50 = p90 = p99 = 1 µs, max 60 µs, mean
-1.0068 µs, single-thread throughput ≈ 993,000 ops/s** (the sweep also corrected a
-mislabelled unit on that printed line: `ops/s`, previously rendered `Mops/s`).
+criterion 0.5 prints medians only): **p50 = p90 = p99 = 1 µs, mean 1.007 µs,
+single-thread throughput ≈ 993,000 ops/s** (re-measured in the V1.2 phase-D sweep;
+the sweep also corrected a mislabelled unit on that printed line: `ops/s`,
+previously rendered `Mops/s`).
+
+**Why the point-query bench moved 136.6 -> 147.6 ns (+8%).** V1.2 phase B0 made
+vertical interpolation carry PER-SLOT level indices (a silent wrong answer when one
+time's bracket differs from the other's: the old code reused ONE bracket pair across
+both forecast hours). Composing those per-slot brackets costs extra work on exactly
+the differing-bracket path this bench exercises, so the median rose ~8%. This is an
+accepted correctness-over-speed trade, explicitly per the spec's priority order
+(correctness first; a fast wrong answer is a bug), and it stays 2.5x faster than
+milestone-5 and far inside the §8 latency budget (server-side p50 ≤10 µs, p99 ≤50
+µs measured under load). The handler itself got FASTER in the same sweep (681.7 ->
+671.1 ns), so the end-to-end request path did not regress.
 
 The −62% on the index accessor is the removal of the per-query units `String`
 clone, the per-slot level `Vec<f64>`, the forecast-hour scratch `Vec<f64>` and
@@ -457,17 +477,20 @@ oha mix: 8 URLs (exact-node GFS, seam, vertical interp, time interp,
 multi-param, HRRR LCC, 404 unknown model, 422 bad level), `--worker-threads 8
 -c 64 -z 20s --no-tui --urls-from-file`, keep-alive.
 
-| Metric | portable (phase 5 before) | portable (phase 5 after) | portable (phase-6 sweep, 2 runs) | target-cpu=native (pre-phase-5 / phase-6 sweep) |
-|---|---|---|---|---|
-| throughput (client, 8 workers) | 286,868 req/s | 286,872 req/s | **287,451 / 286,342 req/s** | 275,293 req/s / 281,305 req/s |
-| server-side mean latency (/metrics delta) | 12.5 µs | 10.0 µs | **9.4 µs** (n = 5,752,100 / 5,730,170 queries) | 13.4 µs / 9.9 µs |
-| server-side p50 / p99 (histogram buckets) | ≤20 µs / ≤50 µs | ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** | ≤20 µs / ≤50 µs / ≤10 µs / ≤50 µs |
-| client p50 / p99 (oha) | 0.21 ms / 0.42 ms | 0.21 ms / 0.42 ms | **0.211 ms / 0.431 ms** | similar |
-| status mix in the mix | — | — | **200: 4,297,215 · 422: 717,234 · 404: 715,667** (run B) | — |
+| Metric | portable (phase 5 before) | portable (phase 5 after) | portable (phase-6 sweep, 2 runs) | target-cpu=native (pre-phase-5 / phase-6 sweep) | V1.2 phase-D sweep (15 s) |
+|---|---|---|---|---|---|
+| throughput (client, 8 workers) | 286,868 req/s | 286,872 req/s | **287,451 / 286,342 req/s** | 275,293 req/s / 281,305 req/s | **272,647 req/s** |
+| server-side mean latency (/metrics delta) | 12.5 µs | 10.0 µs | **9.4 µs** (n = 5,752,100 / 5,730,170 queries) | 13.4 µs / 9.9 µs | **10.3 µs** (n = 4,091,386) |
+| server-side p50 / p99 (histogram buckets) | ≤20 µs / ≤50 µs | ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** | ≤20 µs / ≤50 µs / ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** |
+| client p50 / p99 (oha) | 0.21 ms / 0.42 ms | 0.21 ms / 0.42 ms | **0.211 ms / 0.431 ms** | similar | similar (shorter 15 s window) |
+| status mix in the mix | — | — | **200: 4,297,215 · 422: 717,234 · 404: 715,667** (run B) | — | — |
 
 §8 targets: **p50 < 50 µs MET** (bucket ≤10 µs), **p99 < 250 µs MET** (bucket
-≤50 µs), **≥50k req/s on 8 cores MET ×5.7**. Client-side throughput did NOT move
-across phases (expected): §7.4 profiling showed the sustained path is kernel-I/O-bound
+≤50 µs), **≥50k req/s on 8 cores MET ×5.5** (272,647 req/s in the V1.2 phase-D 15 s
+run; ×5.7 in the phase-6 runs). Same sweep, `scripts/smoke.sh`: **SMOKE PASS**, all
+17 `probes.tsv` ground-truth probes replayed with 0 failures, release-build average
+point-query latency **16.9 µs** across its 422 correctness queries. Client-side throughput did NOT move
+across phases (expected): §7.5 profiling showed the sustained path is kernel-I/O-bound
 (one `writev` per response dominates); the allocation removal shows up where
 it belongs — server-side mean latency 12.5→10.0→9.4 µs and the p50 bucket
 tightening ≤20→≤10 µs. No gap analysis needed: first measurement hit all
@@ -524,7 +547,74 @@ and manifest writing (once per field), never the per-message decode loop. Both
 paths stay far inside the "few seconds" §8 target, and packed products cut
 transfer volume by ~33x.
 
-### 7.4 Profiling pass (`scripts/profile.sh [secs]`, optional `STRACE=1`)
+### 7.4 Ingest performance & memory (V1.2 production-scale benchmark)
+
+The milestone-5 perf dataset has SHORT isobaric stacks (L≈8 planes per GROUP), which
+hid the merge-path cost that matters in production. V1.2 phase D therefore measures
+PRODUCTION-SHAPE datasets generated by `scripts/gen_realistic.sh`:
+
+* **realistic** — full GFS geometry 1440 x 720, **37 isobaric levels** (every 25 hPa
+  1000..100, a superset of the real NWS 25-level stack), TMP+HGT+UGRD+VGRD on
+  `isobaric:*` = 148 messages/file, SIX files (3 runs x f000+f006, ~192 MB each,
+  authentic NWS names WITHOUT a `YYYYMMDDHH` stamp), wind messages carrying the
+  grid-relative flag. Measured on the V1.2 build only: the pre-V1.2 writer needs
+  `(L+1)/2 = 19x` its own output volume here (~70 GB), which made a traced run
+  pathological, so the BEFORE side is measured on the reduced variant below and
+  extrapolated ANALYTICALLY (labelled as such).
+* **reduced** — SAME shape, ONE run, f000+f006, **16 isobaric levels** (2 files, 83
+  MB each): the bounded-but-representative BEFORE-vs-AFTER pair.
+
+| metric (this machine, release, scan=1 s, stable_window=0, threads=16) | pre-V1.2 (tag `v1.1`) reduced L=16 MEASURED | V1.2 `decode_batch_files=4` reduced L=16 MEASURED | V1.2 realistic L=37 MEASURED |
+|---|---|---|---|
+| wall-to-first-queryable (`/ready`) | 2.49 s | 3.08 s | 5.62 s |
+| wall-to-all-visible (all run/fh tuples WITH the whole level stack) | **20.93 s** | **3.69 s** | 15.73 s (K=4) / 25.35 s (K=1) |
+| peak RSS (`VmHWM`, 100 ms poller) | 766 MB | 670 MB | 3079 MB (K=4) / 1087 MB (K=1) |
+| server CPU time to that point | 18.4 s | 3.8 s | 26.0 s (K=4) / 24.0 s (K=1) |
+| renames | n/a (untraced) | 11 (8 field files + grid.bin + manifest) | 33 (24 field files + 3 grid.bin + 6 manifest) |
+| bytes written vs final store | ANALYTIC **(L+1)/2 = 8.50x** at L=16 (~4.5 GB for a 531 MB store) | 530.8 MB vs 530.8 MB (**1.0000x**) | 3682.7 MB vs 3682.7 MB (**1.0000x**) |
+| fsyncs | n/a (untraced) | 30 | 82 |
+| per-file ingest (64 msgs / 148 msgs, 4 GROUPS) | n/a (no per-file lines in v1.1 output) | 739 ms | 1.35–1.64 s |
+
+The amplification law is the headline and it lands exactly on theory: for L levels
+per GROUP the pre-V1.2 writer serialized `1+2+...+L` planes where L suffice, i.e.
+`(L(L+1)/2)/L = (L+1)/2` — **8.50x expected at L=16**, **19.0x at L=37** — while V1.2
+writes each GROUP ONCE: **1.0000x measured at both scales**. The same law was MEASURED
+directly at L=8 in phase B (3.55x = 78 plane serializations where 8 suffice, 45
+renames per GFS hour), so the analytic column is an extrapolation of two measured
+points, not a guess. Wall-to-all-visible improved **5.7x** at L=16 (20.9 -> 3.7 s)
+and CPU time **4.8x** (18.4 -> 3.8 s).
+
+One honest REGRESSION to record: wall-to-FIRST-queryable got slightly WORSE at L=16
+(2.49 s -> 3.08 s, and 5.62 s at L=37) because visibility is published PER SOURCE
+FILE instead of PER MESSAGE, and up to K files are decoded before any is written.
+Partial visibility earlier is exactly what produced half-stacks of levels and the
+transient 422s; the trade is deliberate (see §9 Limitations and docs/DECISIONS.md
+phase D), and every query answered after publish is complete for its file.
+
+Spec §8's ingest target at production scale is MET with margin: ONE realistic GFS
+forecast hour (148 messages, 192 MB file, 4 params x 37 levels) became queryable
+**1.35-1.64 s** after the file was stable, and the whole six-file delivery was
+queryable **15.7 s** after the scan started (K=4).
+
+**Memory guidance for `decode_batch_files` (K).** Peak RSS scales with K because a
+consumed file's GROUP planes stay resident until that file is written: one realistic
+file's planes are 4 params x 37 levels x 1440 x 720 x 4 B = **614 MB**, so K=1
+measured **1087 MB** and K=4 measured **3079 MB** (planes plus decode/publish
+overhead). Rule of thumb: `RSS ~= K x (largest concurrent source file's plane set)`.
+Use K=1 when RAM-constrained (it halves the footprint again and is still ~5x faster
+than pre-V1.2 all-visible); keep the default K=4 for best all-visible latency; raise
+K only with several GB of headroom per additional concurrent file.
+
+Correctness rode along with the benchmark: `scripts/_probe_realistic.py` queried the
+LIVE server over the realistic dataset - 481 probes covering exact nodes (4 points x
+4 params x 4 levels x 3 runs x 2 forecast hours), vertical interpolation at 837.5 mb
+between stored 850/825, and time interpolation at fh3 between f000/f006 - and ALL
+481 matched the analytic formula wgrib2 had confirmed. One honesty note: during warm-up
+the bench's `/ready` polls return 503 (`not_ready`), which `/metrics` counts under
+`wxpoint_queries_total{status="5xx"}`; those are readiness probes, not query failures.
+
+
+### 7.5 Profiling pass (`scripts/profile.sh [secs]`, optional `STRACE=1`)
 
 This machine has `perf_event_paranoid=4` AND yama `ptrace_scope=1`: perf
 stat/record fail outright, gdb attach refused. The pass therefore uses
@@ -553,12 +643,13 @@ materially; the §8 margin (≤10 µs bucket vs 50 µs target) stands without an
 ## 8. Correctness map (spec §9 items 1..9)
 
 Every spec-mandated verification, as a named test with its truth source and
-tolerance. All green in the phase-6 sweep (`cargo test --workspace`: 95 tests,
-0 failed; `scripts/smoke.sh`: SMOKE PASS, 17 probes replayed, 0 failures).
+tolerance. All green in the V1.2 phase-D sweep (`cargo test --workspace`: 153 tests,
+0 failed, twice back-to-back; `scripts/smoke.sh`: SMOKE PASS, 17 probes replayed,
+0 failures).
 
 | # | Spec requirement | Test(s) | Truth source | Tolerance |
 |---|---|---|---|---|
-| 1 | Exact grid points match `wgrib2 -lon` / `grib_get_data` on real files | `gfs_wgrib2_point_checks`, `hrrr_nearest_node_matches_wgrib2` (nearest-node for LCC nodes), `perf_gfs_hour_ingest_and_query`; smoke `probes.tsv` replay + `point_endpoint_truth_table` | wgrib2 `-lon` output captured into the tests; `tests/perfdata/probes.tsv` generated with the perf dataset by `gen_perfdata.sh`/`validate_perf.py` | exact for values chosen exact-in-f32; otherwise ≤1 ulp of f32 |
+| 1 | Exact grid points match `wgrib2 -lon` / `grib_get_data` on real files | `gfs_wgrib2_point_checks`, `hrrr_nearest_node_matches_wgrib2` (nearest-node for LCC nodes), `perf_gfs_hour_ingest_and_query`; smoke `probes.tsv` replay + `point_endpoint_truth_table` | **wgrib2-generated synthetic fixtures** (see the note under this table): wgrib2 `-lon` output captured into the tests; `tests/perfdata/probes.tsv` generated with the perf dataset by `gen_perfdata.sh`/`validate_perf.py` | exact for values chosen exact-in-f32; otherwise ≤1 ulp of f32 |
 | 2 | LCC lat/lon → (i,j) matches wgrib2/pyproj at corners, centre, ≥20 random points | `lcc_matches_wgrib2_ll2ij`, `lcc_corner_center_coverage`, `lcc_inverse_roundtrip`, `oblate_projection_matches_wgrib2_ll2ij` | wgrib2 `-ll2ij` on `hrrr_small.grib2` (CT 3.2 = 6 sphere) and `hrrr_ellip_small.grib2` (CT 3.2 = 3 inline WGS 84 axes); pyproj cross-check via `scripts/validate_rotation.py` | ≤1e-4 grid units |
 | 3 | Rotated HRRR U/V match `wgrib2 -new_grid_winds earth` | `rotation_matches_pyproj_within_1e_6_deg`, `rotation_equals_convergence_relation_of_own_projection`, `rotation_shape_axes_are_distinct_earths`, `hrrr_rotation_invariants`, `oblate_rotation_and_inverse_roundtrip_at_nodes` | **golden blocked here** (IPOLATES Fortran-only, see §9); replaced by independent pyproj conformal angles for BOTH earth shapes: `scripts/validate_rotation.py` → `tests/fixtures/rotation_expected.csv` (42 rows), plus the identity β = 90 + n·(λ−LoV) relation of our own cone math | ≤1e-6 deg (observed worst **4.80469e-11 deg** this sweep); identity relation ≤1e-12 deg |
 | 4 | Bilinear / vertical / time reproduce analytic fields exactly | `affine_exact_interior`, `exact_node_bitexact`, `bilinear_kernel_affine_nan`, `vertical_gap_bracket`, `time_guard_stat_and_none`, `empty_field_never_brackets`, `e2e_roundtrip_through_index`, `fractional_hours_storage_and_manifest`, `fractional_hours_queries_and_run_selection` | synthetic grids whose fields are affine in x,y,p,t (answers known analytically) | bit-exact (no blending on exact nodes; bracket selection identical to the reference implementation in `alloc_free_kernels.rs` / `alloc_free_select.rs` randomized sweeps) |
@@ -567,6 +658,18 @@ tolerance. All green in the phase-6 sweep (`cargo test --workspace`: 95 tests,
 | 7 | Masked points return `null`, never a blended number | `nan_neighbor_missing_data`, `masked_points_are_nan_for_every_codec`, `bilinear_kernel_affine_nan` | fixture bitmap masking every 97th node, re-checked through all seven packings | must be exactly `null` + `missing_data` (NaN positions preserved per codec) |
 | 8 | Time interpolation of accumulations is rejected | `stat_small_messages`, `stat_point_checks`, `jpeg_twin_keeps_pdt48_metadata_and_values`, `time_guard_stat_and_none`, `error_status_table` (422 `stat_time_guard`), `fractional_hours_over_http` guard cases | PDT 4.8 fixtures `stat_small.grib2` (+ JPEG twin) validated against wgrib2 readback/checksums | n/a — status/token equality |
 | 9 | Ingest under hammering queries: no error, no partial data | `concurrent_publishers_and_readers_never_tear`, `ingest_churn_vs_queries_http`, `retention_evicts_after_publish_stale_snapshot_still_reads` | invariant assertions over live publish/evict churn (zero 5xx, zero torn JSON bodies, settled-state batch proves transient 422s disappear) | n/a — invariants; documented transient 422s counted separately (§9) |
+
+**What "real files" means here (honesty note, V1.2 phase D).** Every fixture in
+`tests/fixtures/` and `tests/perfdata/` is SYNTHETIC: written by our own generator
+(`scripts/gen_grib2.py`) or re-packed by `tools/wgrib2-full`, using authentic GRIB2
+section layouts, authentic GFS/HRRR grid geometry and authentic NWS product names —
+but NOT NOAA's bytes. The independent truth source in rows 1-3 is therefore
+**wgrib2 reading those same synthetic files**, which validates our decoder, projection
+and rotation against a mature reference implementation without validating against
+production products. Real NWS files are not fetched in CI (spec §13: no downloading).
+To close that gap manually, run `scripts/fetch_real_sample.sh` (curl from the public
+`aws-nws` S3 bucket, a few MB) and point `scripts/validate_realistic.py`-style probes
+at it; see §9 Limitations for what remains unverified until you do.
 
 Beyond §9 (V1.1 additions): packing parity — each small fixture exists in six
 extra packings (`_c3` 5.3, `_jpeg` 5.40, `_png` 5.41 filter None, `_png_f` 5.41
@@ -588,13 +691,19 @@ proofs named in §6.
 
 Scripts: `scripts/smoke.sh` (release server over the full perf dataset, 17
 probes replayed from `tests/perfdata/probes.tsv`, SMOKE PASS/FAIL),
-`scripts/loadtest.sh`, `scripts/ingestbench.sh`, `scripts/profile.sh`,
-`scripts/gen_perfdata.sh` + `scripts/validate_perf.py` (regenerate perf data +
-wgrib2 ground truth), `scripts/gen_fixtures.sh` + `scripts/regen_expected.sh`
-(small fixtures, idempotent), `scripts/validate_rotation.py` (expected-angle
-table), `scripts/validate_rotation_wgrib2.sh` (stub that runs the IPOLATES golden
-where it is available). `tools/` (gitignored) holds the local wgrib2 build trees
-(`wgrib2`, `wgrib2-full` with jasper/libpng/libaec codecs) and oha.
+`scripts/loadtest.sh`, `scripts/ingestbench.sh` (+ its inventory helper
+`scripts/_visible.py`), `scripts/profile.sh`, `scripts/gen_perfdata.sh` +
+`scripts/validate_perf.py` (regenerate perf data + wgrib2 ground truth),
+`scripts/gen_realistic.sh` + `scripts/validate_realistic.py` (V1.2 phase D:
+production-scale realistic GFS-like dataset, 6 files x 148 records, validated
+against wgrib2), `scripts/gen_fixtures.sh` + `scripts/regen_expected.sh`
+(small fixtures incl. all packing twins, idempotent), `scripts/validate_rotation.py`
+(expected-angle table), `scripts/validate_rotation_wgrib2.sh` (stub that runs the
+IPOLATES golden where it is available), and `scripts/fetch_real_sample.sh`
+(MANUAL ONLY: range-limited curl of a real NWS product so the same probes can be
+replayed against production bytes; nothing automated depends on it). `tools/`
+(gitignored) holds the local wgrib2 build trees (`wgrib2`, `wgrib2-full` with
+jasper/libpng/libaec codecs) and oha.
 
 ## 9. Limitations
 
@@ -649,20 +758,64 @@ live in §10 and docs/DECISIONS.md.
   `scripts/validate_rotation_wgrib2.sh` prints how to run the real golden on a
   machine whose wgrib2 links IPOLATES. Full rationale: docs/DECISIONS.md (phase
   4 "Remaining §9.3 deviation").
-* **Transient publish window.** Visibility is published after every field store
-  (§4.5 incremental visibility, spec-mandated), so mid-file a run can momentarily
-  expose a parameter without its whole level stack; a request for a NON-STORED
-  level then answers 422 `level_out_of_range` instead of extrapolating. Spec-correct
-  but noisy; coarser publish granularity (per forecast-hour group) is the
-  documented follow-up (docs/DECISIONS.md phase 2 + §10).
-* **True-pole (±90) fixtures are limited by wgrib2.** Real-file fixtures reaching
-  lat ±90 could not be produced and verified with wgrib2 point probing in this
-  environment, so exact-pole behaviour is asserted on synthetic global grids
-  (`poles_global_grid`, whose top row IS lat 90). The full-geometry perf fixture
-  uses the standard GFS 720-row node rectangle (89.875…−89.875), where a
-  true-pole query falls OUTSIDE it and answers 422 `out_of_domain` — confirmed by
-  probe this sweep (`lat=90` → 422, `lat=89.9` → 422, `lat=89.875` → 200 exact
-  node). Everything up to the node rectangle edges is exercised on real geometry.
+* **Poison quarantine (V1.2 phase B).** A file whose decode FAILS is recorded in the
+   persistent ingest state WITH its content hash (`kind=FAILED`), so an identical
+   corrupt file is not re-decoded every scan round; a CONTENT CHANGE produces a new
+   hash and re-arms EXACTLY ONE attempt plus one note (same rule as the retention
+   verdict memo). Counted in `wxpoint_quarantined_files_total`. We NEVER delete or
+   move the operator's file — quarantine is a RECORD, not a filesystem action.
+* **Retention skip (V1.2 phase C).** A candidate whose SECTION-1 reference time is
+   older than the newest `retention_runs` runs is NOT decoded: it is PEEKED (sections
+   1 only), noted once per (path, content hash) and counted in
+   `wxpoint_retention_skipped_files_total`. The peek repeats every scan round (cheap
+   by design), so widening `retention_runs` in the config or losing the newer source
+   files makes the same file ingest on the NEXT round without a restart. Skipped
+   files are absent from `/v1/inventory`, which is the intended steady state, not a
+   bug — check the counter to tell "pruned upstream" from "never delivered".
+* **Exit codes** (`crates/wx-server/src/main.rs`, asserted nowhere but documented
+   behaviour): `0` normal shutdown; `2` usage error (no `--config` and no
+   `WXPOINT_CONFIG`, nothing started); `1` config validation failed loudly (spec
+   §3); `3` pipeline initialisation failed (data dir/state unreadable); `4` the
+   startup wind-pair PREFLIGHT rejected the config (grid-relative model with only
+   one of UGRD/VGRD) BEFORE any data was ingested or any port bound.
+* **Residual publish window (per-file granularity).** Because visibility flips once
+  per SOURCE FILE, a scan round that consumes several files can momentarily expose
+  one forecast hour without the next (normal: products DO arrive hour by hour) or
+  one run without the following run. A request for a level the run has NEVER stored
+  answers 422 `level_out_of_range` rather than extrapolating (spec-correct). Within
+  ONE file there is NO half-stack window any more: all of that file's GROUPS are
+  written before its registry entry is swapped in, and in-flight readers keep the
+  previous snapshot alive by reference count until it is no longer reachable.
+* **Publish granularity is ONE SOURCE FILE (V1.2 phase B), and that is a deliberate
+  trade.** Visibility flips when a source file's GROUPS are all written, NOT per
+  message: wall-to-FIRST-queryable is therefore slightly WORSE than pre-V1.2 (measured
+  2.49 s -> 3.08 s at L=16; 5.62 s at L=37) while wall-to-all-visible improved 5.7x
+  and no query can ever see a HALF-PUBLISHED parameter stack mid-file. The older
+  per-message publish (phase-2 behaviour) produced exactly those transient 422
+  `level_out_of_range` answers; they are gone at file granularity, and §4.5's
+  "forecast hour by forecast hour" requirement still holds because products arrive
+  one forecast hour at a time.
+* **Operator log lines are emitted ONCE (V1.2 phase D).** Per-FILE OUTCOME lines
+  (`ingested …`, `failed … quarantined`, `ignored …`, `skipped …`) travel through
+  the LIVE printer's FIFO only; the round streamer prints NOTES. Before this fix the
+  SAME line appeared up to three times in server stdout, which looked like a DOUBLE
+  INGEST in the phase-D benchmark log (it was not: counters and state records showed
+  one decode per file — see docs/DECISIONS.md phase D §6). Consequence: if the LIVE
+  printer thread is starved, outcome lines appear LATE (they are never lost unless
+  more than 256 un-printed lines pile up, in which case the OLDEST drop from stdout
+  while remaining in `Pipeline.progress_log`).
+* **`decode_batch_files` (K) is a RAM knob, not just a latency knob.** Peak RSS ~=
+  K x the largest concurrent source file's plane set (measured: K=1 -> 1087 MB, K=4
+  -> 3079 MB for a 614 MB-per-file realistic stack). See §7.4 for guidance.
+* **True-pole (±90) fixtures are limited by wgrib2.** Fixtures reaching lat ±90
+  could not be produced and verified with wgrib2 point probing in this environment,
+  so exact-pole behaviour is asserted on synthetic global grids (`poles_global_grid`,
+  whose top row IS lat 90). The full-geometry perf fixture uses the standard GFS
+  720-row node rectangle (89.875…−89.875), where a true-pole query falls OUTSIDE it
+  and answers 422 `out_of_domain` — confirmed by probe this sweep (`lat=90` → 422,
+  `lat=89.9` → 422, `lat=89.875` → 200 exact node). Everything up to the node
+  rectangle edges is exercised on production-scale geometry (still synthetic bytes,
+  per the §8 honesty note).
 
 ## 10. Decision log (V1.1)
 

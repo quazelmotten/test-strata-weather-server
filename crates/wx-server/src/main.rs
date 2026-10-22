@@ -140,11 +140,13 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) -> i64 {
     };
     let app = build_router(st);
 
-    // --- LIVE progress printer (V1.2 phase B): prints the pipeline's newest
-    // per-file line ("ingested <file>: G groups, W bytes, X ms", or an
-    // ignore/failure note) whenever `progress_seq` advances. It runs on its OWN
-    // thread because the ingest thread is blocked inside `scan_round` while
-    // those lines are produced, which is exactly when operators want them.
+    // --- LIVE progress printer (V1.2 phase B, de-duplicated in phase D): drains
+    // the pipeline's per-FILE progress FIFO whenever `progress_seq` advances,
+    // printing EVERY line ONCE (oldest first). The previous version printed only
+    // `last_msg`, which lost lines when files finished faster than the 0.1 s poll
+    // cadence AND let the round streamer below replay them a second time. It runs
+    // on its OWN thread because the ingest thread is blocked inside `scan_round`
+    // while those lines are produced, which is exactly when operators want them.
     let live_p = p.live.clone();
     let _printer = spawn(move || {
         let mut seen: u64 = 0;
@@ -152,10 +154,9 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) -> i64 {
             let seq = live_p.progress_seq.load(Ordering::Relaxed);
             if seq != seen {
                 seen = seq;
-                let m = live_p.last_msg.lock();
-                match m {
-                    Err(_) => {}
-                    Ok(g) => { println!("{0}", g.clone()); }
+                let lines = live_p.drain_progress();
+                for l in &lines {
+                    println!("{0}", l);
                 }
             }
             unsafe { usleep(100000); } // 0.1 s polling granularity
