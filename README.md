@@ -252,14 +252,21 @@ never increment `wxpoint_ingest_errors_total`), `wxpoint_ignored_files_total`
 `wxpoint_retention_skipped_files_total` (V1.2 phase C: candidates whose SECTION-1 reference
 time made them PROVABLY obsolete — vetoed before decode, never counted as errors, and NO
 state record is written for them), `wxpoint_quarantined_files_total` (decode failures recorded WITH their content
-hash so a corrupt file is not retried every round), `wxpoint_ingest_groups_written_total`
+hash so a corrupt file is not retried every round; since V1.3 phase E3a ALSO
+counting the rare escalation of FIVE consecutive unreadable rounds — transient
+I/O alone no longer quarantines), `wxpoint_ingest_groups_written_total`
 (the write-once grouping unit — compare it with a message count to see the
 amplification phase B removed), `wxpoint_stat_collisions_total` (V1.3 phase E1:
 statistically-distinct groups REJECTED because an earlier group of the same
 source file already claimed their field file — first-in-message-order wins;
-skipped and logged, never counted as errors), and `wxpoint_ingest_lag_seconds`
+skipped and logged, never counted as errors), `wxpoint_ingest_lag_seconds`
 (newest ingested
-file mtime → now). Every ingest-side gauge reads `max(legacy store, LIVE pipeline
+file mtime → now), and — V1.3 phase E3a — `wxpoint_state_writes_total` /
+`wxpoint_state_bytes_written`: successful `state/files.json` saves and the
+bytes they serialized. The storage counters above deliberately EXCLUDE this
+writer, so these two gauges close the observability gap; batched per-chunk
+persistence keeps them small (see §7.4 scope note). Every ingest-side gauge
+reads `max(legacy store, LIVE pipeline
 mirror)`, and the live mirror advances after EVERY consumed FILE, so `/metrics`
 reflects a scan round that is still running.
 
@@ -372,7 +379,13 @@ data_dir/
   FAILED quarantined WITH its hash) prevents re-ingest after restart; same path with
   different content hash IS re-ingested (a FAILED record is retried ONLY then). Records
   without a `kind` key (pre-V1.2 files) load as kind=0. The index is rebuilt from disk
-  before any scan.
+  before any scan. V1.3 phase E3a: the two windows are read with plain
+  `File`+`seek`+`read_exact` (no mmap on unstable candidates ⇒ no SIGBUS surface),
+  digest and format UNCHANGED; a kind=2 record with an EMPTY hash marks the rare
+  escalation of five consecutive unreadable rounds and self-clears once the file
+  is readable again; saves are DIRTY-GATED and batched (once per decode chunk +
+  round end), so a crash loses at most one unfinished chunk's records — those
+  re-ingest idempotently.
 
 ## 5. Interpolation semantics (exactly as implemented)
 
@@ -458,9 +471,14 @@ skips, removed, never stored half-rotated), GROUPING of every plane by
 `(run, param, level type, forecast hour)` so each field file is merged and written
 ONCE (`merge_write_field_batch`) instead of once per message, registry update,
 manifest refresh ONCE per affected run, directory fsyncs ONCE per distinct directory,
-ONE publish, ONE progress line, and a state upsert+save. A decode failure records
+ONE publish, ONE progress line, and a state upsert (persisted in BATCH since
+V1.3 phase E3a: dirty flag + one save per decode chunk + round end, replacing the
+per-file full-state rewrite). A CONTENT decode failure records
 kind=FAILED with the content hash (so `errors` advances ONCE per new/changed corrupt
-file, not once per round) and a group-write failure leaves the file UNMARKED so the
+file, not once per round); a TRANSIENT I/O failure (open/mmap: EMFILE/EACCES/EIO/
+ENOMEM…) only bumps an in-memory streak — one note, silent retries, and the FAILED
+record only after FIVE consecutive unreadable rounds (V1.3 E3a, see §9). A
+group-write failure leaves the file UNMARKED so the
 next round retries it idempotently. Full rationale + measured numbers: docs/DECISIONS.md.
 
 **Retention-aware skip + state hygiene (V1.2 phase C).** Before the magic-byte precheck,
@@ -650,6 +668,21 @@ directly at L=8 in phase B (3.55x = 78 plane serializations where 8 suffice, 45
 renames per GFS hour), so the analytic column is an extrapolation of two measured
 points, not a guess. Wall-to-all-visible improved **5.7x** at L=16 (20.9 -> 3.7 s)
 and CPU time **4.8x** (18.4 -> 3.8 s).
+
+**SCOPE of the 1.0000x headline (V1.3 phase E3a clarification).** Those columns come
+from the wx-core storage counters (`wxpoint_storage_bytes_written_total`), which
+cover FIELD/GROUP + grid.bin + manifest writers and deliberately EXCLUDE the state
+writer. Pre-E3a `state/files.json` was rewritten after EVERY ingested/ignored/failed
+file — O(N²) bytes and fsyncs across thousands of files, invisible to the headline.
+Since E3a saves are dirty-gated and batched (once per decode chunk + round end),
+and `/metrics` reports them separately as `wxpoint_state_writes_total` /
+`wxpoint_state_bytes_written` (also printed by `scripts/ingestbench.sh`). Exact
+counts pinned by the E3a gate (`state_batching.rs`, 4 files at K=2): **2 saves per
+ingest round** (one per chunk; observation and idle rounds cost ZERO writes) versus
+5 full rewrites pre-E3a; total state bytes scale as ~(files/K + rounds) x
+records-size instead of files x records-size. The tables above PREDATE the split,
+so their bytes columns never included state traffic — the clarification keeps the
+comparison honest.
 
 One honest REGRESSION to record: wall-to-FIRST-queryable got slightly WORSE at L=16
 (2.49 s -> 3.08 s, and 5.62 s at L=37) because visibility is published PER SOURCE
@@ -855,12 +888,37 @@ live in §10 and docs/DECISIONS.md.
   `scripts/validate_rotation_wgrib2.sh` prints how to run the real golden on a
   machine whose wgrib2 links IPOLATES. Full rationale: docs/DECISIONS.md (phase
   4 "Remaining §9.3 deviation").
-* **Poison quarantine (V1.2 phase B).** A file whose decode FAILS is recorded in the
+* **Poison quarantine (V1.2 phase B; CONTENT errors only since V1.3 phase E3a).**
+   A file whose decode FAILS ON CONTENT is recorded in the
    persistent ingest state WITH its content hash (`kind=FAILED`), so an identical
    corrupt file is not re-decoded every scan round; a CONTENT CHANGE produces a new
    hash and re-arms EXACTLY ONE attempt plus one note (same rule as the retention
    verdict memo). Counted in `wxpoint_quarantined_files_total`. We NEVER delete or
    move the operator's file — quarantine is a RECORD, not a filesystem action.
+* **Transient I/O is retryable, never silently permanent (V1.3 phase E3a).** An
+   `open`/`mmap` failure (`GribErr::Io`: EMFILE, EACCES, EIO, ENOMEM, NFS-ESTALE…)
+   is NOT a content verdict and no longer writes a FAILED record on first sight.
+   A bounded IN-MEMORY streak per (path,size,mtime,hash) notes the FIRST failure
+   once, retries silently, and escalates only after `IO_FAIL_ESCALATION_ROUNDS`
+   (5) consecutive unreadable rounds: loud note + one `errors` + one
+   `quarantined_files` + a kind=FAILED record so a permanently unreadable file
+   stops hammering. Records written before a hash could be taken carry an EMPTY
+   hash and therefore SELF-CLEAR once reading works again (the stored "" can never
+   equal a real digest). Streaks reset on success/identity change and die with a
+   restart. Same policy covers the content-hash and magic-precheck read stages.
+   Residual documented risk: decode itself still mmaps AFTER the stability window
+   (page-cache sharing with queries); a truncation inside that window remains a
+   SIGBUS surface, accepted because the window makes it vanishingly rare and the
+   pre-stability reads — where the race was live — are now plain reads
+   (`io_retry.rs`, `hash_compat.rs`).
+* **State durability granularity (V1.3 phase E3a).** `state/files.json` saves are
+   dirty-gated and batched: once per decode chunk plus at end of round (before
+   retention pruning), replacing the per-file full rewrite that cost O(N²) bytes
+   and fsyncs at thousands of files. Worst case a crash between two opportunities
+   loses AT MOST one unfinished chunk's records (≤ K files); they re-ingest
+   idempotently (merge dedup + atomic renames). A failed save keeps the store
+   dirty, logs loudly and counts one error WITHOUT blocking ingestion; the next
+   opportunity retries (`state_batching.rs`, `restart_midchunk.rs`).
 * **Retention skip (V1.2 phase C).** A candidate whose SECTION-1 reference time is
    older than the newest `retention_runs` runs is NOT decoded: it is PEEKED (sections
    1 only), noted once per (path, content hash) and counted in

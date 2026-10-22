@@ -305,14 +305,20 @@ if [ "$VARIANT" = "after" ]; then
   ign=$(grep -m1 '^wxpoint_ignored_files_total ' "$M" | awk '{print $2}')
   quar=$(grep -m1 '^wxpoint_quarantined_files_total ' "$M" | awk '{print $2}')
   rskip=$(grep -m1 '^wxpoint_retention_skipped_files_total ' "$M" | awk '{print $2}')
+  stw=$(grep -m1 '^wxpoint_state_writes_total ' "$M" | awk '{print $2}')
+  stb=$(grep -m1 '^wxpoint_state_bytes_written ' "$M" | awk '{print $2}')
   nf=$(find "$ROOT/data" -name 'f*.bin' | wc -l)
-  python3 - "$ren" "$bwr" "$fsy" "$grp" "$nf" "$STORE_BYTES" <<'PY'
+  python3 - "$ren" "$bwr" "$fsy" "$grp" "$nf" "$STORE_BYTES" "${stw:-0}" "${stb:-0}" <<'PY'
 import sys
-ren,bwr,fsy,grp,nf,store=[float(x) for x in sys.argv[1:7]]
+ren,bwr,fsy,grp,nf,store,stw,stb=[float(x) for x in sys.argv[1:9]]
 ratio=(bwr/store) if store else 0.0
 print(f"renames={int(ren)} (field files={int(nf)} + grid.bin/manifest writes)")
-print(f"bytes_written={bwr/1e6:.1f} MB vs final store {store/1e6:.1f} MB -> amplification {ratio:.4f}x")
+print(f"bytes_written={bwr/1e6:.1f} MB vs final store {store/1e6:.1f} MB -> amplification {ratio:.4f}x (FIELD-PATH counters only; state saves are reported separately below)")
 print(f"fsyncs={int(fsy)} groups_written={int(grp)}")
+# V1.3 phase E3a: the state writer is deliberately OUT of the storage counters
+# above; batched persistence (per decode chunk + dirty-gated round end) makes
+# these numbers small. Report them so the amplification headline stays honest.
+print(f"state_saves={int(stw)} state_bytes={int(stb)} (files.json rewrites, batched per chunk+round)")
 PY
 else
   if [ "$COUNTER_RUN" = "1" ] && [ -f "$ROOT/strace-counters.log" ]; then

@@ -4,7 +4,7 @@
 //! reconcile with a full recursive scan (authoritative on network mounts).
 
 use wx_core::grid::{GridDef};
-use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times};
+use crate::grib2::{decode_files_parallel, rotate_winds_to_earth, check_wind_pair, DecodedMessage, ParamFilter, StatKind, RunTime, grid_winds, epoch_secs, peek_ref_times, GribErr};
 use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, DEFAULT_INGEST_THREADS, DEFAULT_STABLE_WINDOW_SECS, DEFAULT_DECODE_BATCH_FILES};
 use serde_json::from_str;
 use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, join_path};
@@ -14,7 +14,6 @@ use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, 
 use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot, StatMeta,
                        BIN_VERSION, bin_version_of_path, stat_kind_code, stat_kind_name,
                        STAT_INSTANTANEOUS};
-use memmap2::Mmap;
 use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -28,6 +27,7 @@ use std::fs::create_dir_all;
 use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
+use std::io::Read;
 use serde::Deserialize;
 
 
@@ -474,6 +474,12 @@ pub struct Pipeline {
     // counter once per round. A CONTENT CHANGE produces a new hash, re-arms exactly
     // ONE note plus ONE count, mirroring the kind=FAILED quarantine rule.
     pub stale_verdicts: Vec<(String, String)>,
+    // V1.3 phase E3a TRANSIENT-I/O BACKOFF: consecutive read-failure counts per
+    // candidate IDENTITY (path, size, mtime_ns, content hash — empty hash when
+    // the failure happened BEFORE a hash could be taken, e.g. the open itself).
+    // IN-MEMORY ONLY (restart clears). Sixth field = already escalated (suppresses
+    // repeat notes/counts/records past the threshold). See io_failure().
+    pub io_streaks: Vec<(String, u64, i64, String, u32, bool)>,
     pub queue: WatchQueue,
     pub watchers: Vec<RecommendedWatcher>,
     pub pool: ThreadPool,
@@ -534,6 +540,23 @@ impl Pipeline {
 /// path). Sized generously: one entry per (file,content hash) whose staleness
 /// was judged, so ordinary churn never evicts anything.
 pub const STALE_VERDICT_CAP: usize = 4096;
+
+/// V1.3 phase E3a — CONSECUTIVE-I/O-FAILURE ESCALATION THRESHOLD. A candidate
+/// that cannot be READ (open/EACCES/EMFILE/EIO/mmap-ENOMEM at decode) is a
+/// TRANSIENT condition, not a content verdict: pre-E3a any such error wrote a
+/// kind=FAILED record keyed by content hash and the file stayed quarantined
+/// until its CONTENT changed, even though nothing about the content was ever
+/// observed. Now: rounds 1..N-1 only retry (ONE note at the first occurrence);
+/// at exactly N consecutive failed rounds for the SAME identity the pipeline
+/// escalates — loud note, `errors` + `quarantined_files` once, and a kind=FAILED
+/// record so a permanently unreadable file stops hammering the I/O path. The
+/// streak lives in memory only (restart clears it: a fresh process deserves
+/// fresh retries) and resets on success or on any identity change.
+pub const IO_FAIL_ESCALATION_ROUNDS: u32 = 5;
+
+/// Bound on the in-memory I/O streak table (evict-oldest; an evicted identity
+/// simply restarts its count, which can only DELAY escalation, never fake it).
+pub const IO_STREAK_CAP: usize = 512;
 
 /// FILENAME-DERIVED RUN-TIME HINT — AN ORDERING HEURISTIC, NOTHING MORE.
 /// Scans the BASENAME for digit runs of at least 10 characters and reads the
@@ -988,6 +1011,7 @@ impl Pipeline {
             live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
             stale_verdicts: Vec::<(String, String)>::new(),
+            io_streaks: Vec::<(String, u64, i64, String, u32, bool)>::new(),
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
             pool: pool.unwrap(),
@@ -1095,7 +1119,7 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                     delete_tree(&run_dir);
                     let dropped = p.state.drop_under(&mdl.ingest_dir);
                     p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
-                    let _ = p.state.save();
+                    p.save_state();
                     return;
                 }
                 Ok(grid) => {
@@ -1130,7 +1154,7 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                             delete_tree(&run_dir);
                             let dropped = p.state.drop_under(&mdl.ingest_dir);
                             p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
-                            let _ = p.state.save();
+                            p.save_state();
                             return;
                         }
                         None => {}
@@ -1365,20 +1389,18 @@ pub fn stat_ranges_json(fhs: &Vec<RegFh>, run_epoch: i64) -> String {
 // durable bytes.
 
 fn read_bytes_maybe(path: &str) -> Option<Vec<u8 > > {
-            let f = std::fs::File::open(&path);
+    // V1.3 phase E3a: plain read_to_end instead of mmap + byte-at-a-time copy.
+    // These reads target SMALL operational files (grid.bin, manifest.json),
+    // where mmap bought nothing and the manual loop cost one push per byte.
+    let mut buf: Vec<u8> = Vec::<u8>::new();
+    let f = std::fs::File::open(&path);
     match f {
         Err(_) => { return None; }
-        Ok(h) => {
-            let m = unsafe { Mmap::map(&h) };
-            match m {
+        Ok(mut h) => {
+            let r = h.read_to_end(&mut buf);
+            match r {
                 Err(_) => { return None; }
-                Ok(region) => {
-                    let mut copy: Vec<u8> = Vec::<u8>::new();
-                    for k in 0 .. region.len() {
-                        copy.push(region[k]);
-                    }
-                    return Some(copy);
-                }
+                Ok(_c) => { return Some(buf); }
             }
         }
     }
@@ -1445,7 +1467,17 @@ impl Pipeline {
                 };
                 let hv = content_hash_file(&path);
                 let hv2 = match hv {
-                    Err(_) => { continue; }
+                    Err(e) => {
+                        // V1.3 phase E3a: an unreadable candidate is TRANSIENT
+                        // I/O, not a content verdict. Pre-E3a this `continue`d
+                        // SILENTLY forever (no note, no counter); now it feeds
+                        // the bounded streak so persistent failures escalate
+                        // loudly after IO_FAIL_ESCALATION_ROUNDS rounds and
+                        // transient ones cost one note total.
+                        self.io_failure(path.to_string(), sm2.0, sm2.1,
+                                        "".to_string(), "content hash", e);
+                        continue;
+                    }
                     Ok(v1) => { v1 }
                 };
                 let rec = self.state.find(path.to_string());
@@ -1532,10 +1564,18 @@ impl Pipeline {
                     let hg = head_is_grib(&rpath);
                     let isg = match hg {
                         Err(e) => {
-                            // unreadable/short: NOT a verdict about the content, so
-                            // NO record is written and the candidate is retried.
-                            self.note(format!("magic-byte precheck could not read {} ({}): retrying next round", rpath, e));
-                            false
+                            // V1.3 phase E3a: I/O failure is NOT a verdict about
+                            // the content. Pre-E3a this arm noted "retrying" but
+                            // then FELL THROUGH into the IGNORED branch below
+                            // and wrote a permanent kind=IGNORED record anyway,
+                            // contradicting its own comment. Now the streak
+                            // policy applies and the candidate is genuinely
+                            // retried with no record until escalation.
+                            self.io_failure(rpath.to_string(), rsize, rmtime,
+                                            rhash.to_string(), "magic precheck", e);
+                            self.progress(format!("io-retry {0}: magic precheck unreadable, streak tracked", rpath));
+                            cj += 1;
+                            continue;
                         }
                         Ok(v) => { v }
                     };
@@ -1551,6 +1591,8 @@ impl Pipeline {
                             self.live.add(0, 0, 0, 1, 0, 0);
                         }
                         self.progress(format!("ignored {0}: not a GRIB2 stream", rpath));
+                        // A definitive content verdict clears any I/O streak.
+                        self.io_streak_clear(rpath.as_str());
                         self.state.upsert(FileRec {
                             path: rpath,
                             size: rsize,
@@ -1558,7 +1600,8 @@ impl Pipeline {
                             hash: rhash,
                             kind: REC_IGNORED,
                         });
-                        let _ = self.state.save();
+                        // V1.3 phase E3a: no per-file save — the dirty flag is
+                        // persisted at chunk end / round end instead.
                         cj += 1;
                         continue;
                     }
@@ -1576,9 +1619,27 @@ impl Pipeline {
                     for one in results {
                         let rd = dec.remove(0);
                         match one {
+                            Err(GribErr::Io) => {
+                                // V1.3 phase E3a TRANSIENT-I/O SPLIT (the audit
+                                // defect): File::open / Mmap::map failures come
+                                // back as GribErr::Io (EMFILE, ENOMEM, EACCES,
+                                // EIO, ESTALE...). Pre-E3a they fell into the
+                                // poison quarantine below and wrote a permanent
+                                // kind=FAILED record keyed by a content hash
+                                // that was NEVER observed bad — one transient
+                                // fd-table hiccup quarantined a perfectly good
+                                // file until its content changed. Now: bounded
+                                // in-memory streak, ONE note, escalation to the
+                                // full quarantine only after
+                                // IO_FAIL_ESCALATION_ROUNDS consecutive rounds.
+                                self.io_failure(rd.0.clone(), rd.1, rd.2, rd.3.clone(),
+                                                "decode", "open/mmap I/O error".to_string());
+                                self.progress(format!("io-retry {0}: transient I/O at decode, quarantines after {1} consecutive failed rounds", rd.0, IO_FAIL_ESCALATION_ROUNDS));
+                            }
                             Err(e) => {
-                                // POISON QUARANTINE part 2: record the failure WITH
-                                // its content hash, so later rounds skip this file
+                                // POISON QUARANTINE part 2 (CONTENT errors only
+                                // since V1.3 E3a): record the failure WITH its
+                                // content hash, so later rounds skip this file
                                 // until its CONTENT changes, and advance `errors`
                                 // only when a NEW FAILED record is created or the
                                 // hash changed (never once per scan round).
@@ -1593,6 +1654,8 @@ impl Pipeline {
                                     self.counters.quarantined_files += 1;
                                     self.live.add(1, 0, 0, 0, 1, 0);
                                 }
+                                // A content verdict clears any I/O streak.
+                                self.io_streak_clear(rd.0.as_str());
                                 self.state.upsert(FileRec {
                                     path: rd.0.clone(),
                                     size: rd.1,
@@ -1600,7 +1663,7 @@ impl Pipeline {
                                     hash: rd.3.clone(),
                                     kind: REC_FAILED,
                                 });
-                                let _ = self.state.save();
+                                // V1.3 phase E3a: persisted at chunk/round end.
                                 self.progress(format!("failed {0}: decode error quarantined ({1:?})", rd.0, e));
                             }
                             Ok(dr) => {
@@ -1635,7 +1698,12 @@ impl Pipeline {
                                         hash: rd.3.clone(),
                                         kind: REC_OK,
                                     });
-                                    let _ = self.state.save();
+                                    // Success ends any I/O streak for this path.
+                                    self.io_streak_clear(rd.0.as_str());
+                                    // V1.3 phase E3a: no per-file save — the
+                                    // dirty-gated chunk-end / round-end saves
+                                    // persist it (a crash loses at most one
+                                    // chunk of records, re-ingested idempotently).
                                     if rd.2 > self.counters.last_mtime_ns {
                                         self.counters.last_mtime_ns = rd.2;
                                     }
@@ -1651,12 +1719,22 @@ impl Pipeline {
                         }
                     }
                 }
+                // V1.3 phase E3a BATCHED PERSISTENCE: one dirty-gated save per
+                // DECODE CHUNK replaces the old per-file saves (O(N²) bytes +
+                // fsyncs across thousands of files). Covers OK, IGNORED and
+                // content-FAILED records of every file consumed in this chunk;
+                // while nothing changed the call costs nothing at all.
+                self.save_state();
                 ci = cend;
             }
         }
-        // Per-FILE state saves above are authoritative; this final save keeps the
-        // IGNORED/FAILED records of a chunk that produced no successful file.
-        let _ = self.state.save();
+        // V1.3 phase E3a: dirty-gated round-end save — catches records written
+        // outside any chunk loop (state prune hygiene notes aside, chiefly the
+        // IGNORED/FAILED bookkeeping of rounds whose chunks already saved: then
+        // this is a clean no-op) AND runs BEFORE retention pruning, so a pruned
+        // run never races an unpersisted record set. A failure here keeps the
+        // store dirty for the next round and costs one loud note + one error.
+        self.save_state();
         retention_prune(self);
         return ingested;
     }
@@ -1738,6 +1816,96 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// V1.3 phase E3a — BATCHED STATE PERSISTENCE HELPER. Calls the dirty-gated
+    /// [`StateStore::save`] (cheap no-op while clean) and turns a FAILURE into
+    /// a loud note + one `errors` increment WITHOUT blocking ingestion: the store
+    /// stays dirty and every later save opportunity (chunk end, round end, boot
+    /// recovery) retries the same records. Worst case a crash between two
+    /// opportunities loses at most one decode chunk's records, which re-ingest
+    /// idempotently (merge dedup + atomic renames, spec §4.1/§4.5).
+    fn save_state(self: &mut Self) {
+        match self.state.save() {
+            Err(e) => {
+                self.note(format!("state save FAILED: {} — records stay dirty and will be retried at the next save opportunity", e));
+                self.counters.errors += 1;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    /// V1.3 phase E3a — ONE consecutive I/O failure against a candidate
+    /// identity, with the escalation policy of [`IO_FAIL_ESCALATION_ROUNDS`].
+    /// `stage` names the read site ("content hash", "magic precheck", "decode")
+    /// and `detail` carries the OS/decoder message for the first-occurrence
+    /// note. Returns true iff THIS round wrote the escalating kind=FAILED record.
+    /// The record's hash is whatever was known at failure time: EMPTY for
+    /// failures before any hash could be taken, so the quarantine SELF-CLEARS
+    /// once reading works again (the stored "" can never equal a real digest,
+    /// and the unchanged-skip check then lets the file through); a REAL hash
+    /// (decode-stage failures) keeps the pre-E3a "until content changes"
+    /// hammering stop, which is the right trade once the bytes were readable.
+    pub fn io_failure(self: &mut Self, path: String, size: u64, mtime_ns: i64,
+                      hash: String, stage: &str, detail: String) -> bool {
+        let mut at: Option<usize> = None;
+        for k in 0 .. self.io_streaks.len() {
+            let e = &self.io_streaks[k];
+            if e.0 == path && e.1 == size && e.2 == mtime_ns && e.3 == hash {
+                at = Some(k);
+                break;
+            }
+        }
+        match at {
+            None => {
+                while self.io_streaks.len() >= IO_STREAK_CAP {
+                    let _x = self.io_streaks.remove(0);
+                }
+                self.io_streaks.push((path.to_string(), size, mtime_ns, hash.to_string(), 1, false));
+                self.note(format!("I/O prevented reading {} at the {} stage (attempt 1/{}, {}): retrying next round; {} consecutive I/O-failed rounds for the same identity quarantine it as FAILED",
+                    path, stage, IO_FAIL_ESCALATION_ROUNDS, detail, IO_FAIL_ESCALATION_ROUNDS));
+                return false;
+            }
+            Some(k) => {
+                self.io_streaks[k].4 += 1;
+                let n = self.io_streaks[k].4;
+                if n < IO_FAIL_ESCALATION_ROUNDS || self.io_streaks[k].5 {
+                    return false;
+                }
+                self.io_streaks[k].5 = true;
+                let tail_note = if hash.is_empty() {
+                    "quarantining kind=FAILED with an EMPTY content hash: nothing about the bytes was ever observed, so the file re-enters the normal path automatically once it becomes readable again".to_string()
+                } else {
+                    "quarantining kind=FAILED WITH its content hash: it stops being retried until the content changes".to_string()
+                };
+                self.note(format!("repeated I/O failure on {}: {} consecutive scan rounds could not read it (last stage {}, {}) — this is NOT a decode verdict",
+                    path, n, stage, tail_note));
+                self.counters.errors += 1;
+                self.counters.quarantined_files += 1;
+                self.live.add(1, 0, 0, 0, 1, 0);
+                self.state.upsert(FileRec {
+                    path: path.to_string(),
+                    size: size,
+                    mtime_ns: mtime_ns,
+                    hash: hash.to_string(),
+                    kind: REC_FAILED,
+                });
+                return true;
+            }
+        }
+    }
+
+    /// Forget every I/O streak for a path (success, definitive IGNORED verdict,
+    /// or escalation via another path). Identity changes need no clearing: they
+    /// simply start a fresh entry under a new key.
+    pub fn io_streak_clear(self: &mut Self, path: &str) {
+        let mut kept: Vec<(String, u64, i64, String, u32, bool)> = Vec::<(String, u64, i64, String, u32, bool)>::new();
+        for e in &self.io_streaks {
+            if e.0 != path {
+                kept.push(e.clone());
+            }
+        }
+        self.io_streaks = kept;
     }
 
     /// Already noted/counted this (path,content-hash) verdict?

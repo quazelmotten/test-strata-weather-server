@@ -1,11 +1,17 @@
-// V1.2 phase B gate #5: PER-FILE STATE SAVES SURVIVE A CRASH MID-CHUNK.
+// V1.2 phase B gate #5 (granularity updated by V1.3 phase E3a): STATE SAVES
+// SURVIVE A CRASH MID-CHUNK — at CHUNK granularity.
 //
 // `[ingest].decode_batch_files` (default 4) bounds how many candidate files are
-// DECODED before ANY is written, but the persistent record is upserted AND SAVED
-// after EVERY consumed FILE. So if the process dies in the middle of a chunk, the
-// restart sees durable records for exactly the files that had already been
-// consumed and re-ingests ONLY the rest. This test simulates the crash by truncating
-// the on-disk state file to the prefix that had been saved, then reopening.
+// DECODED before ANY is written. Pre-E3a the persistent record was upserted AND
+// SAVED after EVERY consumed FILE; E3a replaced that with a DIRTY flag persisted
+// ONCE PER DECODE CHUNK plus at end of round (the per-file saves were O(N^2)
+// bytes+fsyncs at scale). The crash-safety contract therefore now reads: a crash
+// loses AT MOST the records of ONE unfinished chunk, and those re-ingest
+// idempotently. This test simulates a crash inside the second chunk by truncating
+// the on-disk state file to the prefix the FIRST chunk's save had durably
+// written, then reopening: exactly the unsaved chunk's file is re-ingested —
+// identical observable outcome to the pre-E3a per-file granularity for this
+// scenario.
 //
 // Also gates the config validation of the new key (`decode_batch_files = 0` must
 // fail loudly at startup).
@@ -177,7 +183,8 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
     };
     assert!(doc.recs.len() == 3);
 
-    // ---- simulated crash: only the FIRST TWO saves reached the disk -----
+    // ---- simulated crash mid-chunk-2: only the FIRST chunk's batched save
+    // (records for two files) reached the disk; chunk 2's save never ran -----
     let mut keep: Vec<FileRec> = Vec::<FileRec>::new();
     keep.push(doc.recs[0].clone());
     keep.push(doc.recs[1].clone());

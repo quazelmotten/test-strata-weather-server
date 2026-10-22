@@ -6,20 +6,58 @@
 //!
 //! Content hash: FNV-1a 64 over first 64 KiB ++ last 64 KiB (whole file once
 //! when smaller than 128 KiB) — spec §4.1 "first/last 64 KiB is fine".
+//! V1.3 phase E3a: the windows are read with plain `File` + `seek` +
+//! `read_exact` (pread semantics), NOT mmap — a producer truncating a
+//! CANDIDATE file in place (before the stability verdict exists) could
+//! otherwise SIGBUS the ingest thread mid-page-fault, which no error handling
+//! can catch. The digest bytes and the 16-hex output format are UNCHANGED
+//! (`content_hash_bytes` over an equivalent whole-file buffer produces the
+//! identical string; pinned by `tests/hash_compat.rs`), so records written by
+//! older builds keep matching after an upgrade.
+//!
+//! Persistence cadence (V1.3 phase E3a): mutations set a DIRTY flag;
+//! [`StateStore::save`] is a cheap no-op while clean, so the pipeline persists
+//! ONCE PER DECODE CHUNK plus at end of round instead of after every single
+//! file (the old per-file save made durable state O(N²) bytes written and
+//! fsynced across thousands of files). A FAILED save leaves the store dirty
+//! for the next opportunity; worst case a crash loses at most one chunk's
+//! records, which re-ingest idempotently.
 
 use serde_json::from_str;
-use memmap2::Mmap;
 use wx_core::storage::{fsync_path};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::os::unix::fs::MetadataExt;
 use std::fs::metadata;
 use std::fs::read_to_string;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 
 /// Bytes of head/tail window hashed.
 pub const HASH_WINDOW: usize = 65536;
+
+// ---------------------------------------------------------------------------
+// V1.3 phase E3a STATE-WRITE INSTRUMENTATION
+// ---------------------------------------------------------------------------
+// The wx-core storage counters deliberately EXCLUDE this writer (see
+// write_bytes_atomic docs), which made the phase-D write-amplification
+// headline blind to state traffic. These dedicated relaxed counters close the
+// gap WITHOUT touching the field-path counters: /metrics renders them as
+// wxpoint_state_writes_total / wxpoint_state_bytes_written, and the batched
+// save cadence is what makes the numbers small.
+
+static STATE_WRITES_TOTAL: AtomicU64 = AtomicU64::new(0);
+static STATE_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide (successful state-file saves, bytes serialized) since boot.
+pub fn state_counters_snapshot() -> (u64, u64) {
+    return (STATE_WRITES_TOTAL.load(Ordering::Relaxed),
+            STATE_BYTES_WRITTEN.load(Ordering::Relaxed));
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct FileRec {
@@ -34,7 +72,12 @@ pub struct FileRec {
     ///                 logged ONCE, never retried until content changes.
     ///   2 = FAILED  — decode error; quarantined WITH its content hash so a
     ///                 corrupt file is not re-decoded every scan round; retried
-    ///                 only when the content hash changes.
+    ///                 only when the content hash changes. V1.3 phase E3a: a
+    ///                 TRANSIENT I/O failure reaches this kind only after
+    ///                 IO_FAIL_ESCALATION_ROUNDS consecutive failed rounds
+    ///                 ("repeated I/O failure"); such records may carry an
+    ///                 EMPTY hash (the content was never readable), which makes
+    ///                 them self-clear once reading works again.
     /// `#[serde(default)]` keeps pre-V1.2 `files.json` (no `kind` key) loadable:
     /// absent means 0 = OK, exactly what those records always were.
     #[serde(default)]
@@ -66,6 +109,13 @@ pub struct StateStore {
     /// `idx` is derived state, rebuilt by `reindex()` after every structural
     /// change (load / upsert / drop_under / prune_missing).
     pub idx: HashMap<String, usize>,
+    /// V1.3 phase E3a BATCHED PERSISTENCE: true whenever `recs` diverged from
+    /// the last successfully persisted image. Every mutation sets it; [`StateStore::save`]
+    /// clears it ONLY on success, so a failed save keeps the store dirty and the
+    /// next save opportunity retries. While clean, `save()` returns Ok without
+    /// touching the disk at all (no clone, no serialize, no fsync) — that is what
+    /// makes the per-chunk + per-round save cadence cheap.
+    pub dirty: bool,
 }
 
 impl StateStore {
@@ -77,6 +127,7 @@ impl StateStore {
             file_path: file.to_string(),
             recs: Vec::<FileRec>::new(),
             idx: HashMap::<String, usize>::new(),
+            dirty: false,
         };
         match read_to_string(&file) {
             Err(_) => { st.reindex(); return Ok(st); }
@@ -121,6 +172,7 @@ impl StateStore {
     }
 
     pub fn upsert(self: &mut Self, rec: FileRec) {
+        self.dirty = true;
         let pos = self.idx.get(&rec.path);
         match pos {
             Some(pi) => {
@@ -159,6 +211,7 @@ impl StateStore {
         if n > 0 {
             self.recs = kept;
             self.reindex();
+            self.dirty = true;
         }
         return n;
     }
@@ -192,19 +245,41 @@ impl StateStore {
         if n > 0 {
             self.recs = kept;
             self.reindex();
+            self.dirty = true;
         }
         return n;
     }
 
-    /// Persist atomically after each scan round.
-    pub fn save(self: &Self) -> Result<(), String> {
+    /// Persist atomically. V1.3 phase E3a: a cheap NO-OP while the store is
+    /// clean (no clone, no serialize, no fsync), so the pipeline can offer a
+    /// save at every opportunity (per chunk, per round, before prune) and pay
+    /// only when something actually changed. On SUCCESS the dirty flag clears;
+    /// on FAILURE it STAYS SET, so the next opportunity retries the same
+    /// records. Returns Err verbatim for the caller to log + count.
+    pub fn save(self: &mut Self) -> Result<(), String> {
+        if !self.dirty {
+            return Ok(());
+        }
         let mut copied: Vec<FileRec> = Vec::<FileRec>::new();
         for r in &self.recs {
             copied.push(r.clone());
         }
         let doc = StateDoc { version: 1, recs: copied };
         let text = serialize_text(&doc);
-        return write_bytes_atomic(&self.file_path, &text);
+        let res = write_bytes_atomic(&self.file_path, &text);
+        match res {
+            Err(e) => { return Err(e); }
+            Ok(_) => {}
+        }
+        // V1.3 phase E3a instrumentation: state traffic was deliberately OUT of
+        // the wx-core storage counters (see write_bytes_atomic docs), which made
+        // the 1.0000x write-amplification headline blind to it. These dedicated
+        // relaxed counters report it separately (wxpoint_state_writes_total /
+        // wxpoint_state_bytes_written on /metrics).
+        let _sw = STATE_WRITES_TOTAL.fetch_add(1, Ordering::Relaxed);
+        let _sb = STATE_BYTES_WRITTEN.fetch_add(text.len() as u64, Ordering::Relaxed);
+        self.dirty = false;
+        return Ok(());
     }
 }
 
@@ -230,22 +305,22 @@ fn under_prefix(path: &str, dir: &str) -> bool {
     return path[0 .. needle.len()] == *needle.as_str();
 }
 
-/// FNV-1a 64 over the head/tail windows of a whole-file buffer.
-pub fn content_hash_bytes(bytes: &[u8]) -> String {
-    let n = bytes.len();
-    let mut h: u64 = 0xcbf29ce484222325;
-    if n <= HASH_WINDOW * 2 {
-        for k in 0 .. n {
-            h = (h ^ (bytes[k] as u64)).wrapping_mul(0x100000001b3);
-        }
-    } else {
-        for k in 0 .. HASH_WINDOW {
-            h = (h ^ (bytes[k] as u64)).wrapping_mul(0x100000001b3);
-        }
-        for k in n - HASH_WINDOW .. n {
-            h = (h ^ (bytes[k] as u64)).wrapping_mul(0x100000001b3);
-        }
+/// FNV-1a 64 parameters (split into feed/finish so the pread window reader in
+/// `content_hash_file` can chain the SAME arithmetic without materializing a
+/// whole-file buffer — identical digest, identical output format).
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
+
+#[allow(clippy::needless_return)]
+fn fnv_feed(mut h: u64, bytes: &[u8]) -> u64 {
+    for k in 0 .. bytes.len() {
+        h = (h ^ (bytes[k] as u64)).wrapping_mul(FNV_PRIME);
     }
+    return h;
+}
+
+#[allow(clippy::needless_return)]
+fn fnv_finish(h: u64) -> String {
     let mut v = h;
     v = v ^ (v  >> 33);
     v = v.wrapping_mul(0xff51afd7ed558ccd);
@@ -253,17 +328,70 @@ pub fn content_hash_bytes(bytes: &[u8]) -> String {
     return format!("{:016x}", v);
 }
 
-/// Hash a file by mmapping it (page cache shared with the decode step).
+/// FNV-1a 64 over the head/tail windows of a whole-file buffer.
+pub fn content_hash_bytes(bytes: &[u8]) -> String {
+    let n = bytes.len();
+    let mut h = FNV_OFFSET;
+    if n <= HASH_WINDOW * 2 {
+        h = fnv_feed(h, bytes);
+    } else {
+        h = fnv_feed(h, &bytes[0 .. HASH_WINDOW]);
+        h = fnv_feed(h, &bytes[n - HASH_WINDOW .. n]);
+    }
+    return fnv_finish(h);
+}
+
+/// Hash a file WITHOUT mmap (V1.3 phase E3a): plain `File` + `seek` +
+/// `read_exact` over the first/last 64 KiB windows (whole file read once when
+/// it is at most 128 KiB). This runs on EVERY CANDIDATE, including files still
+/// being written whose size may change under us before the stability verdict
+/// exists — an mmap of such a file can SIGBUS the reading thread when the
+/// producer truncates in place (a signal no error handling catches), while a
+/// plain read just returns fewer bytes or UnexpectedEof. The produced string
+/// is BYTE-IDENTICAL to the old mmap version for unchanged content (pinned by
+/// `tests/hash_compat.rs`), so records written by older builds keep matching.
+/// A shrink race yields Err (retry next round) or a digest of what was really
+/// read — never a panic, never a torn page mix.
 pub fn content_hash_file(path: &str) -> Result<String, String> {
     let f = File::open(&path);
     match f {
         Err(_) => { return Err("open failed".to_string()); }
-        Ok(h) => {
-            let m = unsafe { Mmap::map(&h) };
-            match m {
-                Err(_) => { return Err("mmap failed".to_string()); }
-                Ok(region) => {
-                    return Ok(content_hash_bytes(&region[0 .. region.len()]));
+        Ok(mut h) => {
+            let md = h.metadata();
+            match md {
+                Err(_) => { return Err("metadata failed".to_string()); }
+                Ok(info) => {
+                    let n = info.len();
+                    if n <= (HASH_WINDOW as u64) * 2 {
+                        // Whole file fits the small path: read it and reuse the
+                        // buffer digest EXACTLY as before.
+                        let mut buf: Vec<u8> = Vec::<u8>::new();
+                        let r = h.read_to_end(&mut buf);
+                        match r {
+                            Err(_) => { return Err("read failed".to_string()); }
+                            Ok(_c) => {}
+                        }
+                        return Ok(content_hash_bytes(&buf));
+                    }
+                    let mut head = vec![0u8; HASH_WINDOW];
+                    let rh = h.read_exact(&mut head);
+                    if rh.is_err() {
+                        return Err("read head window failed".to_string());
+                    }
+                    let seek_r = h.seek(SeekFrom::Start(n - (HASH_WINDOW as u64)));
+                    match seek_r {
+                        Err(_) => { return Err("seek failed".to_string()); }
+                        Ok(_) => {}
+                    }
+                    let mut tail = vec![0u8; HASH_WINDOW];
+                    let rt = h.read_exact(&mut tail);
+                    if rt.is_err() {
+                        return Err("read tail window failed".to_string());
+                    }
+                    let mut hh = FNV_OFFSET;
+                    hh = fnv_feed(hh, &head);
+                    hh = fnv_feed(hh, &tail);
+                    return Ok(fnv_finish(hh));
                 }
             }
         }
@@ -271,28 +399,34 @@ pub fn content_hash_file(path: &str) -> Result<String, String> {
 }
 
 /// Magic-byte precheck (V1.2 phase B): true when the file starts with ASCII
-/// `GRIB`. Cheap because it mmaps the file and inspects FOUR BYTES, and it runs
-/// BEFORE any decode so a non-GRIB candidate that matches a model's glob (a
-/// `.idx`/`.xml` sidecar delivered next to the product is the common case) can
-/// NEVER reach the decoder. Returns None when the file cannot be opened or is
-/// shorter than 4 bytes (both are "not decodable" answers, distinct from a
-/// GRIB-headed file that fails later inside section 7).
+/// `GRIB`. Cheap because it inspects FOUR BYTES, and it runs BEFORE any decode
+/// so a non-GRIB candidate that matches a model's glob (a `.idx`/`.xml`
+/// sidecar delivered next to the product is the common case) can NEVER reach
+/// the decoder. V1.3 phase E3a reads those four bytes with a plain `read`
+/// instead of an mmap (same SIGBUS rationale as `content_hash_file`). Returns
+/// Err ONLY when the file cannot be opened or the read itself fails (both are
+/// retryable I/O conditions the pipeline handles as such); a file shorter than
+/// 4 bytes is a definitive Ok(false) — not GRIB, record it.
 pub fn head_is_grib(path: &str) -> Result<bool, String> {
     let f = File::open(&path);
     match f {
         Err(_) => { return Err("open failed".to_string()); }
-        Ok(h) => {
-            let m = unsafe { Mmap::map(&h) };
-            match m {
-                Err(_) => { return Err("mmap failed".to_string()); }
-                Ok(region) => {
-                    if region.len() < 4 {
-                        return Ok(false);
-                    }
-                    return Ok(region[0] == 0x47 && region[1] == 0x52 &&
-                               region[2] == 0x49 && region[3] == 0x42);
+        Ok(mut h) => {
+            let mut b = [0u8; 4];
+            let mut got = 0usize;
+            while got < 4 {
+                let r = h.read(&mut b[got .. 4]);
+                match r {
+                    Err(_) => { return Err("read failed".to_string()); }
+                    Ok(0) => { break; }
+                    Ok(k) => { got += k; }
                 }
             }
+            if got < 4 {
+                return Ok(false);
+            }
+            return Ok(b[0] == 0x47 && b[1] == 0x52 &&
+                       b[2] == 0x49 && b[3] == 0x42);
         }
     }
 }

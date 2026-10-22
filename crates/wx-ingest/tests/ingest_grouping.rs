@@ -204,11 +204,16 @@ fn one_file_writes_groups_once_not_messages() {
 
     println!("MEASURE renames={0} bytes={1} fsyncs={2} field_files={3} aux={4} bin_dirs={5}", renames, bytes, fsyncs, acc.field_files, acc.aux_writes, acc.bin_dirs);
     // ---- FSYNCS: 1 per field inode + 2 per aux writer + 1 per DISTINCT dir
-    // (TouchedDirs.flush) + 2 per state save (one per FILE + one at round end).
-    // 3 saves happened inside the measured window: ONE per ingested FILE plus
-    // ONE at the end of EACH of the two scan rounds (the observation round saves
-    // too, which keeps an all-skip round's IGNORED/FAILED records durable).
-    let state_saves: u64 = 3;
+    // (TouchedDirs.flush) + 2 per STATE SAVE (files.json + parent dir). V1.3
+    // phase E3a changed the save CADENCE from per-file to per-chunk plus a
+    // dirty-gated round end: in this measured window (one file, two rounds)
+    // exactly ONE save now happens — the chunk-end persist of the ingest
+    // round. The observation round writes nothing (store never dirty) and the
+    // round-end offer is a no-op once the chunk already flushed. Pre-E3a this
+    // was 3 full rewrites (per-file + per-round). Durability contract after
+    // E3a: a crash loses at most one unfinished chunk's records, which
+    // re-ingest idempotently (see restart_midchunk.rs + docs/DECISIONS.md).
+    let state_saves: u64 = 1;
     assert!(fsyncs == 18 as u64 + 2 as u64 + 2 as u64 + 6 as u64 + 2 as u64 * state_saves);
 
     // ---- counters + live mirror agree --------------------------------------

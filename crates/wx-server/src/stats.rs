@@ -10,6 +10,11 @@
 //! exposes the wx-core storage counters as `wxpoint_storage_renames_total`,
 //! `wxpoint_storage_bytes_written_total` and `wxpoint_storage_fsyncs_total` —
 //! the write-amplification evidence an ingest benchmark needs (README §7.3).
+//! Since V1.3 phase E3a it additionally exposes the STATE writer, which those
+//! storage counters deliberately exclude: `wxpoint_state_writes_total` and
+//! `wxpoint_state_bytes_written` (batched per-chunk persistence makes these
+//! small; the 1.0000x field-path amplification headline stays scoped to the
+//! field/grid/manifest writers).
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicI64;
@@ -19,6 +24,7 @@ use libc::clock_gettime;
 use libc::CLOCK_MONOTONIC;
 use libc::CLOCK_REALTIME;
 use wx_core::storage::{counters_snapshot};
+use wx_ingest::state::{state_counters_snapshot};
 use std::sync::Arc;
 use std::sync::Mutex;
 use wx_ingest::pipeline::{LiveCounters};
@@ -236,6 +242,15 @@ impl QueryStats {
         out = format!("{0}{1}", out, sc.bytes_written);
         out = format!("{0}{1}", out, "\nwxpoint_storage_fsyncs_total ");
         out = format!("{0}{1}", out, sc.fsyncs);
+        // V1.3 phase E3a: the STATE writer is NOT part of the storage counters
+        // above (documented exclusion), so report it separately: successful
+        // files.json saves + bytes serialized. Batched cadence (per decode
+        // chunk + round end) is what keeps these tiny.
+        let stc = state_counters_snapshot();
+        out = format!("{0}{1}", out, "\nwxpoint_state_writes_total ");
+        out = format!("{0}{1}", out, stc.0);
+        out = format!("{0}{1}", out, "\nwxpoint_state_bytes_written ");
+        out = format!("{0}{1}", out, stc.1);
         // ingest lag: file mtime -> now, seconds (mtime is epoch ns).
         let mtime = self.last_mtime_ns.load(Ordering::Relaxed);
         let mt2 = lv.last_mtime_ns.load(Ordering::Relaxed);

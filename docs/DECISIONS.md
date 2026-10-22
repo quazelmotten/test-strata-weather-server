@@ -2408,3 +2408,123 @@ cells (named+units, in-table-triple+units, out-of-table+units, out-of-table
 bare, named bare + `raw` flag). Pre-E2 these fail semantically (units were
 always `""`, no note mechanism existed; the matrix additionally references the
 new `raw` field, so it would not compile).
+
+## 13. V1.3 phase E3a — retryable-I/O split + batched state persistence + pread hashing + state-write counters (2026-10-22)
+
+**The defects (AUDIT-confirmed, verified by the orchestrator).**
+(1) `decode_file` returns `GribErr::Io` for `File::open`/`Mmap::map` failures,
+and the scan_round Err branch recorded `REC_FAILED` keyed by content hash for
+ANY error INCLUDING Io — one transient EMFILE/ENOMEM/EIO/NFS-ESTALE/permission
+hiccup quarantined a perfectly good file until its CONTENT changed, although
+nothing about the content had ever been observed. Inconsistent with
+`head_is_grib`, which treats I/O failure as retryable. Worse, the branch
+comment claimed "NO record is written" while the code fell through from the
+magic-precheck Err arm into the IGNORED branch anyway.
+(2) `state.save()` cloned + serialized EVERY record and fsynced after EVERY
+ingested/ignored/failed file — O(N²) bytes written and fsynced per round at
+thousands of files for data that changes linearly.
+(3) `content_hash_file` and `head_is_grib` MMAPped every candidate —
+`content_hash_file` runs BEFORE the stability verdict exists, so a producer
+truncating in place could SIGBUS the ingest thread (a signal no Rust error
+handling catches); `read_bytes_maybe` copied mmap bytes one at a time.
+(4) The 1.0000x write-amplification headline comes from wx-core storage
+counters that deliberately exclude the state writer, so state traffic was
+invisible to every benchmark gauge.
+
+**Io-vs-content classification rule.** Every OS-level open/mmap failure maps to
+`GribErr::Io` (already true at HEAD: all `File::open`/`Mmap::map` error arms
+return Io — PermissionDenied included, pinned directly by
+`permission_denied_decodes_as_io_not_content`). The scan_round Err branch now
+matches `Err(GribErr::Io)` FIRST: Io feeds the streak policy below and writes
+NO record; every other variant keeps the pre-E3a content quarantine exactly as
+before (record with real hash, one error per new/changed hash). The same
+streak policy guards the two earlier read stages, because under a chmod/EACCES
+outage the candidate dies at the content-hash open LONG before decode ever
+runs: a fix scoped only to the decode branch would leave the audit's own
+deterministic injection (chmod 000) un-reached. Stage names ("content hash",
+"magic precheck", "decode") appear in the notes.
+
+**Escalation policy final form.** Bounded IN-MEMORY table
+(`io_streaks`, cap 512, evict-oldest) keyed by (path,size,mtime_ns,hash):
+attempt 1 → exactly ONE note; attempts 2..4 → silent progress lines only;
+attempt == `IO_FAIL_ESCALATION_ROUNDS` (5) → LOUD note + `errors` += 1 +
+`quarantined_files` += 1 + live-mirror add + ONE kind=FAILED record, flagged
+escalated so later rounds stay silent. Success, definitive IGNORED, or a
+content verdict clears the path's entries; an identity change simply starts a
+fresh key. Restart clears the whole table (in-memory by design: a fresh process
+deserves fresh retries). The record's hash is whatever was known at failure:
+EMPTY at the pre-hash stages, where nothing about the bytes was ever observed —
+an empty stored hash can never equal a real digest, so the unchanged-skip check
+lets the file back into the normal path automatically once reading works
+again (SELF-CLEAR; the audit's "chmod restore => ingests" holds WITHOUT any
+content touch). A decode-stage failure stores the REAL hash and keeps the
+pre-E3a "until content changes" hammering stop — the right trade once the
+bytes were readable and the I/O outage is proven persistent.
+
+**Batched-save exact rule.** Mutations (`upsert`, `drop_under`, `prune_missing`)
+set `StateStore.dirty`; `save()` is a cheap no-op while clean (no clone, no
+serialize, no fsync) and clears dirty ONLY on success. The pipeline persists
+via `save_state()` at: (a) the END OF EACH DECODE CHUNK (covers OK/IGNORED/
+FAILED records of every file consumed in the chunk), (b) end of scan round —
+which also serves as the required pre-retention-prune persist (round-end
+immediately precedes `retention_prune`, and prune itself touches no records),
+and (c) the two boot storage-format-recovery points. Per-file saves are gone.
+A FAILED save logs loudly, counts ONE error per failed attempt, and leaves the
+store dirty: the next opportunity retries the same records; ingestion is never
+blocked. Documented trade-off: worst case a crash between two opportunities
+loses at most one unfinished chunk's records (≤ K files), which re-ingest
+idempotently via merge dedup + atomic renames. No new config keys — chunk size
+already comes from `decode_batch_files`.
+Tests adjusted for the honest granularity: `restart_midchunk.rs` keeps its
+exact assertions (its manual prefix-truncation simulates a crash inside chunk
+2; observable outcome identical) but its header/comments now describe CHUNK
+granularity; `ingest_grouping.rs`'s fsync equation counted 2 fsyncs per state
+SAVE and assumed 3 saves in the measured window (per-file + 2 round ends) —
+with batching exactly ONE save occurs (observation round never dirties; the
+round-end offer is a clean no-op after the chunk flushed), so `state_saves`
+drops 3 → 1 with the reasoning inline. Nothing else reads files.json mid-round
+(`disk_full_retry` checks the in-memory store; every other files.json probe
+happens after a completed round, which the round-end save covers).
+
+**Hash-format preservation proof.** The digest core was split into
+`fnv_feed`/`fnv_finish` with the arithmetic untouched, and the new window
+reader chains feed(head)+feed(tail)+finish exactly like the old whole-buffer
+walk. `tests/hash_compat.rs` pins THREE ways: (1) `content_hash_file` ==
+`content_hash_bytes(whole file)` at sizes 0,1,1000,65535,65536,65537,131071,
+131072,131073,300000 (every window boundary); (2) literal digests computed by
+an INDEPENDENT Python port of the pre-E3a algorithm (LCG + ramp corpora) —
+old `files.json` hashes keep matching byte-for-byte after upgrade; (3) shrink
+races: truncate-in-place between stat and read yields Ok(new digest) or Err,
+never a panic, and the previously-Erroneous EMPTY file now hashes to the
+pinned empty-buffer digest (benign documented improvement — the old mmap of a
+zero-length mapping failed). `head_is_grib` short/empty/missing edges pinned
+graceful. decode_file's post-stability mmap STAYS (page-cache sharing with
+queries; residual SIGBUS risk accepted under the stability window, §9).
+
+**Counters.** New dedicated relaxed statics in `state.rs` exposed as
+`state_counters_snapshot() -> (writes, bytes)` and rendered on /metrics as
+`wxpoint_state_writes_total` /
+`wxpoint_state_bytes_written` (incremented only on SUCCESSFUL atomic saves,
+bytes = serialized JSON length). The wx-core field-path counters are untouched,
+so the 1.0000x headline stays valid WITH an explicit scope note (README §7.4);
+`scripts/ingestbench.sh` prints the state line alongside it. Measured gate
+numbers: 4 files at K=2 → exactly 2 state writes per ingest round, 0 for
+observation/idle rounds (pre-E3a: 5 full rewrites).
+
+**Gates added:** `hash_compat.rs` (3 tests: python-golden equivalence at all
+boundaries; shrinking/empty tolerance; head_is_grib edges), `io_retry.rs` (2
+tests: PermissionDenied ⇒ GribErr::Io directly; chmod-000 end-to-end — NO
+record for the first four failed rounds with exactly one retry note and zero
+counters, escalation at the fifth with kind=FAILED + empty hash persisted by
+the batched round-end save, restore WITHOUT content change re-ingests and
+clears the streak), `state_batching.rs` (1 test: exact save counts per chunk
+via the new counters, zero writes on clean rounds, unwritable state dir →
+dirty stays true + one note/error per failed ATTEMPT + ingestion proceeds +
+next round flushes all five records). Discrimination: E3a's new APIs
+(`dirty`, `state_counters_snapshot`, `io_streaks`) do not exist pre-E3a, so
+`io_retry` and `state_batching` cannot even compile against the old tree —
+semantically, pre-E3a the chmod file would have been silently skipped forever
+(silent hash-stage `continue`) or quarantined on first Io at decode, and saves
+were 5 where the gate asserts 2. `hash_compat`'s golden/equivalence cases pass
+before AND after BY DESIGN (that IS the compatibility proof); its shrink/empty
+case fails pre-E3a (mmap of an empty file Errs).
