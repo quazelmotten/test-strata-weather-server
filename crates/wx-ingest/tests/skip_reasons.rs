@@ -317,12 +317,13 @@ fn pipeline_note_and_counters_break_down_skips_by_kind() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn decode_file_on_real_gfs_sflux_skips_everything_as_grid_40() {
+fn decode_file_on_real_gfs_sflux_decodes_everything() {
     // The preserved live-fire artifacts (orchestrator, Oct 22 2026) sit under
-    // /tmp/opencode/realtest; when present this test pins the E4a diagnosis:
-    // ALL SIX messages across the three "GFS" files ride grid template 3.40,
-    // so the ONLY skip kind is Grid(40) and NOTHING decodes. When absent
-    // (any other machine / CI) it prints why and passes vacuously.
+    // /tmp/opencode/realtest; when present this test used to pin the E4a
+    // diagnosis (all six messages skipped as Grid(40)). V1.3 phase E4b
+    // landed template 3.40, so the honest expectation FLIPS: every message
+    // DECODES, no skip buckets remain. When absent (any other machine / CI)
+    // it prints why and passes vacuously.
     let dir = "/tmp/opencode/realtest/in_gfs";
     let names = ["gfs.t211200z.pgrb2.0p25.f000",
                  "gfs.t211200z.pgrb2.0p25.f006",
@@ -344,22 +345,20 @@ fn decode_file_on_real_gfs_sflux_skips_everything_as_grid_40() {
                 return;
             }
             Ok((msgs, st)) => {
-                if !(st.messages_total >= 1 && msgs.is_empty()
-                     && st.messages_decoded == 0
+                if !(st.messages_total >= 1 && msgs.len() == st.messages_total as usize
+                     && st.messages_decoded == st.messages_total
+                     && st.messages_unsupported == 0
                      && st.skip_coordlists == 0
                      && st.skip_pdt.is_empty()
-                     && st.skip_grid.len() == 1
-                     && st.skip_grid[0].0 == 40
-                     && st.skip_grid[0].1 == st.messages_total
-                     && st.messages_unsupported == st.messages_total) {
+                     && st.skip_grid.is_empty()) {
                     println!("unexpected stats for {0}: total={1} decoded={2} kinds={3:?} pdt={4:?}",
                              nm, st.messages_total, st.messages_decoded, st.skip_grid, st.skip_pdt);
                     assert!(false);
                     return;
                 }
                 let t = skip_tally_text(&st);
-                if !(t.find("grid template 3.40").is_some()) {
-                    println!("tally text missing 3.40: {0}", t);
+                if t.find("grid template 3.40").is_some() {
+                    println!("tally still carries 3.40 skips: {0}", t);
                     assert!(false);
                     return;
                 }
@@ -369,6 +368,6 @@ fn decode_file_on_real_gfs_sflux_skips_everything_as_grid_40() {
     if seen == 0 {
         println!("SKIP decode_file_on_real_gfs: {0} absent on this machine", dir);
     } else {
-        println!("real-GFS grid-40-only skips pinned for {0} file(s)", seen);
+        println!("real-GFS full-decode flips pinned for {0} file(s)", seen);
     }
 }

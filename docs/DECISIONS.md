@@ -2865,3 +2865,252 @@ All values from `tools/wgrib2-full -lon` on Oct 22 2026:
 
 Three new flat Prometheus counters (no labels): `wxpoint_skip_coordlists_total`,
 `wxpoint_skip_grid_total`, `wxpoint_skip_pdt_total`. No exit-code changes.
+
+## 16. V1.3 phase E4b — GRIB grid definition template 3.40 (gaussian lat-lon) end to end (2026-10-22)
+
+### 16.1 Scope
+
+Template 3.40 is the grid under which TODAY's operational GFS delivers every
+surface-flux field (`gfs.tHHZ.sfluxgrbfFFF.grib2`, 3072 x 1536). E4a proved by
+live fire that every message of that product line skipped as `Grid(40)`. E4b
+implements the grid end to end: wx-core variant + row table, decoder parse,
+grid.bin round-trip, query path, `/v1/models` rendering, real-data validation.
+Hybrid-level storage (level type 105, the FV3GFS upper-air line) is explicitly
+E4c scope; no level-model code changed here.
+
+### 16.2 Row-latitude algorithm (`gaussian_latitudes(ny)`, wx-core)
+
+The ny Gaussian rows are the roots of the Legendre polynomial **P_ny** mapped
+through asin, ordered north→south, antisymmetric across the equator (ny even).
+Implementation: f64 three-term recurrence evaluating P_n and its derivative
+via `P'_n = n·(x·P_n − P_{n−1})/(x²−1)`; Newton iteration from the asymptotic
+cos((k−0.25)π/(n+0.5)) starting points, bisection fallback whenever Newton
+leaves the bracket or stalls, final residual check |P_ny(x)| ≤ tol before the
+root is accepted (loud panic otherwise — a silently wrong row poisons every
+query on that row). Table built ONCE per `GridGaussian` (precomputed alongside
+dlon/projection constants), stored descending-positive + mirrored. Query-time
+lat→j is a binary search over the descending table plus LINEAR interpolation
+between the two bracketing rows — spec §6.1 works in grid-index space, the
+same rule as regular/LCC; horizontal blending then happens between rows j and
+j+1 exactly as columns i and i+1 blend.
+
+Tolerances and verification: goldens for ny ∈ {2,4,6,8} pinned as decimal
+literals computed by numpy `leggauss` (e.g. ny=2 → ±35.26438968°); live
+ny=1536 cross-checked against four wgrib2 `-lon` node probes (§16.10) with
+worst delta 1.47e-6 deg against the 1e-4 deg requirement (~68× margin).
+
+### 16.3 Task-text correction: P_ny, not P_ny/2
+
+The E4b brief said "nj = ny/2 positive gaussian latitudes = roots of P_{nj}".
+Degree nj=P₁ would put the only row pair at the equator, contradicting the
+brief's OWN golden (ny=2 → ±35.26438968°, which are the roots of P₂ mapped
+through asin). The mathematically and operationally correct table is roots of
+**P_ny**; this also matches wgrib2's `gauss2lats(nlat = 2·nlat_grib)` call in
+`geo.c::gauss2ll` (read directly from the vendored source). Implemented as P_ny.
+
+A mid-phase scare — near-equator rows appearing to differ from wgrib2
+(0.175724 vs a probed 0.058575, suggesting a Thompson-edited grid) — turned
+out to be an indexing bug in MY verification script (printed p[765]/p[766]
+instead of the LAST entry p[767] of the descending positive list). Re-run:
+pure P_1536 reproduces every probed row within 3.2e-7 deg. The live FV3GFS
+sflux grid is plain full-gaussian, NOT thompson-edited, at least at all four
+probed rows.
+
+### 16.4 Field offset map and the sign-magnitude discovery
+
+Decoder reads the section-3 payload with `p[k]` = octet k+6 (wgrib2's
+`gds+N` ↔ our `p[N−5]`). Map used by `parse_grid_gaussian`: quasi-regular
+CT3.11 @p6, nx @p25, ny @p29, basic angle @p33, angle multiplier @p37, La1
+@p41, Lo1 @p45, resolution/scan flag byte @p49 (live 0x30), La2 @p50
+(**unaligned**), Lo2 @p54, Di @p58, nlat @p62. Signed template fields are
+SIGN-MAGNITUDE encoded, NOT two's complement: the live La2 bytes `85 5b ec
+34` mean −89.910324 because bit31 is the sign and bits30..0 the magnitude —
+wgrib2's `int4()` decodes them the same way. Reading them as two's-complement
+i32 yields garbage (≈ −2.04e9). Unit derivation copies wgrib2's rules
+verbatim including its two quirks (basic angle 0 → units 1e-6; multiplier
+FFFFFFFF → 1e6).
+
+### 16.5 Acceptance rule deviation: CT3.11 == 0 is ACCEPTED
+
+The brief said "quasi-regular != 1 ⇒ decoder skip". The LIVE files carry
+CT3.11 = **0** there, so that rule would have skipped 100% of the product line
+E4b exists to enable. wgrib2 (`get_nxny_`) consults CT3.11 ONLY when nx/ny are
+missing from the section; with dimensions present it ignores it. Deviation
+recorded deliberately: we accept CT3.11 ∈ {0,1} when the FULL-GLOBAL shape
+check passes (nx > 0, ny > 0, nlat > 0, ny == 2·nlat, and both row ends agree
+with the computed table within 1e-3 deg). Thinned, reduced-order, and regional
+gaussian windows fail that check and skip as `UnsupportedGrid(40)` into the
+single flat grid-skip counter — documented limitation, README §9.
+
+### 16.6 dlon reconstruction from rounded Di
+
+The stored Di is 117188 (micro-degrees) — the producer ROUNDED the true
+0.1171875. Using 0.117188 verbatim drifts column 3071 by ~3e-4 grid cells and
+breaks exact-node hits plus seam behavior at the far edge. Rule: when
+lo2 − lo1 + di spans 360 ± 0.01 degrees, use exact dlon = 360/nx instead
+(wgrib2 similarly recomputes longitudes from the endpoints for global grids).
+Column indices then stay dyadic-exact: lon −95.039062 = column 2261 exactly.
+
+### 16.7 Exactness and out-of-domain semantics
+
+Node exactness mirrors the other grids: snap if |lat − row_j| ≤ PROJ_NODE_EPS
+(1e-9 GRID units — scaled by local row spacing) AND lon is within eps of a
+column. Requests carrying 6-decimal lats (the practical API form) sit up to
+~3e-7 deg off-row, OUTSIDE the snap window, so they blend between adjacent
+rows with weights like 0.9975/0.0025 — mathematically correct and numerically
+harmless (< 1e-3 K), but it means real probes land on blended values; the
+acceptance probe tolerance is therefore pinned at 0.01 K, the same precedent
+as the HRRR node gates (§15). Out-of-domain: gaussian grids have NO pole
+nodes — the node rectangle ends at ±89.91° for GFS 3072×1536. Beyond either
+outermost row (including lat ±90 EXACTLY) `project` returns None → 422
+`out_of_domain`; never extrapolate toward the poles. Longitudes wrap across
+the seam exactly as regular lat-lon.
+
+### 16.8 GRID_VERSION 2 → 3 decision
+
+grid.bin grew an additive kind=2 block (nx, ny, lon1, la1, la2, dlon, scan,
+earth_shape, winds flags). The P_ny row-latitude table is NOT serialized: it
+is derived data, recomputed bit-exactly from ny by `gaussian_latitudes` at
+load time (pinned by `grid_bin_v3_gaussian_roundtrip_bitexact`), which keeps
+grid.bin tiny and makes the table's single source of truth the algorithm.
+Because the set of valid kinds grew, version bumps to 3 and OLD readers reject
+kind-2 files loudly — the B0 STORAGE-FORMAT RECOVERY trap then re-ingests each
+affected model exactly once (one full re-ingest after upgrade, documented in
+README §4/§9). `grid_upgrade.rs` pins its v1 seed as a literal constant and
+remains compatible. Rejected alternative: keep version 2 and hope — a stale
+reader would silently mis-project or crash on unknown kind bytes.
+
+### 16.9 Wind orientation
+
+Template 40 products scan north→south and NCEP's gaussian lat-lon grids carry
+EARTH-relative u/v (wgrib2 hardcodes `winds(N/S):` for gdt 40; flag-bit 5 has
+no rotating-meridian meaning without LCC). Our rotate arm for Gaussian is the
+identity branch shared with Regular; `source_winds_grid` renders false for
+live GFS, and the decoder rejects nothing wind-related here.
+
+### 16.10 Ground-truth evidence (verbatim, tools/wgrib2-full)
+
+```
+1:0:grid_template=40:winds(N/S):
+        Gaussian grid: (3072 x 1536) units 1e-06 input WE:NS output WE:SN
+        number of latitudes between pole-equator=768 #points=4718592
+        lat 89.910324 to -89.910324
+        lon 0.000000 to 359.882813 by 0.117188
+```
+
+Node probes (`-lon 264.960938 <lat>`, both messages of gfs_sflux_f000):
+
+```
+1:0:lon=264.960938,lat=89.910326,val=0.0142      2:2980993:lon=264.960938,lat=89.910326,val=254.81
+1:0:lon=264.960938,lat=40.006506,val=0.0125      2:2980993:lon=264.960938,lat=40.006506,val=286.74
+1:0:lon=264.960938,lat=0.058575,val=0.0096       2:2980993:lon=264.960938,lat=0.058575,val=299.66
+1:0:lon=264.960938,lat=-89.910326,val=0.0196     2:2980993:lon=264.960938,lat=-89.910326,val=242.86
+```
+
+Comparison against OUR table (numpy leggauss(1536) cross-check, same roots
+our Newton produces to f64):
+
+| probed row | our table row | index | delta deg |
+|---|---|---|---|
+| 89.910326 | 89.910325 | 0 (top) | 1.47e-06 |
+| 40.006506 | 40.006506 | 426 | 2.48e-07 |
+| 0.058575 | 0.058575 | 767 (last positive) | 3.20e-07 |
+| −89.910326 | −89.910325 | 1535 (bottom) | 1.47e-06 |
+
+Also pinned inside `decode_3_40.rs`: the authentic 67-byte live section-3
+payload decoded field-by-field to these wgrib2 values, including dlon ==
+360/3072 and probe node (column 2261, row 426) exact.
+
+### 16.11 Real-data acceptance before/after
+
+Before (E4a state, same fetched files):
+
+| file | messages | decoded | stored | skipped |
+|---|---|---|---|---|
+| gfs_sflux_f000 | 2 | 0 | 0 | 2 × Grid(40) |
+| gfs_sflux_f006 | 2 | 0 | 0 | 2 × Grid(40) |
+| gfs_sflux_f012 | 3 | 0 | 0 | 3 × Grid(40) |
+
+After (E4b, `realdata_gate::gfs_real_data_ingests_and_matches_wgrib2_probes`):
+decoded = total on every file (2 / 2 / 3), ZERO unexpected skips
+(`skip_coordlists == skip_grid == skip_pdt == 0`, `errors == 0`,
+`ingested_files == 3`); TMP 2 m, UGRD/VGRD 10 m and HGT surface store and
+serve through the full ingest+index path; the two HYBRID-level messages in
+f012 (TMP/HGT, level type 105) decode but match no configured level and stay
+unSTORED pending E4c — pinned honestly (`hybrid TMP correctly absent from
+hag:2 planes at fh 12`). Probe replay at the recorded node (row 426 =
+40.006506°, column 2261 = −95.0390625° exact):
+
+| probe | server answer | wgrib2 truth | delta |
+|---|---|---|---|
+| TMP hag2 fh0 node-exact | 286.739990234375 K | 286.74 | 0.0 (exact f32 bits of 286.74) |
+| TMP midpoint rows 426/427 | 286.5800018310547 | 0.5·(286.739990234375 + 286.4200134277344) | < 1e-15 |
+| seam 264.9609375 vs −95.0390625 | bit-equal | — | 0.0 |
+| lat 90.0 / 89.95 | 422 out_of_domain | (no pole nodes exist) | defined behavior |
+| UGRD hag10 fh6 node-exact | 1 m/s | 1 | 0.0 (exact) |
+| VGRD hag10 fh6 node-exact | 3.200000047683716 m/s | 3.2 | 0.0 (exact f32 bits of 3.2) |
+| HGT surface fh12 node-exact | 295.7371520996094 gpm | 295.737 | 0.0 (exact f32 bits of 295.737) |
+
+Raw cross-check lines (`-lon 264.960938 40.006506` on the f006/f012 files):
+
+```
+1:0:lon=264.960938,lat=40.006506,val=1                 2:2092102:lon=264.960938,lat=40.006506,val=3.2
+1:0:lon=264.960938,lat=40.006506,val=306               2:1396223:lon=264.960938,lat=40.006506,val=292.87
+3:4799013:lon=264.960938,lat=40.006506,val=295.737
+```
+
+(f012 messages 1 and 2 are the HYBRID-level HGT/TMP — 306 gpm / 292.87 K —
+decoded but correctly absent from our store pending E4c; message 3, surface
+HGT, matches exactly.)
+
+Runtime note (measured, debug profile): with 4.7 M-point planes the two GFS
+gates cost ~15 min wall (acceptance, rayon ingest) and ~54 min wall
+(decode-gate walk, `decode_file` is per-file sequential) — combined suite
+line `finished in 3256.69s`. Real-data gate invocations must therefore be run
+in the background with generous timeouts, not foreground.
+
+### 16.12 Projection bench medians
+
+`cargo bench -p wx-core` (criterion, bench profile, this machine, no
+target-cpu=native), projection group medians:
+
+| case | median |
+|---|---|
+| projection/regular_ll project | 28.7 ns |
+| projection/lamcc project (precomputed consts) | 105.9 ns |
+| projection/gaussian project (table + binary search) (**new**) | 88.6 ns |
+
+The gaussian arm costs one binary search over the 768-entry positive table +
+two f64 blends — between regular (pure affine) and LCC (trig-heavy) as
+expected, ~90 ns against a query budget dominated by mmap page faults; the
+hot path remains allocation-free (row table built once at grid construction).
+
+### 16.13 New tests
+
+* `wx-core/tests/gaussian_grid.rs`: `gaussian_table_goldens_small_nj`
+  (ny 2/4/6/8 numpy literals), `gaussian_table_odd_ny_and_bounds`,
+  `gaussian_table_1536_matches_live_gfs`, `gaussian_rows_monotonic_symmetric_full_circle`,
+  `gaussian_project_node_exact_and_roundtrip`,
+  `gaussian_out_of_domain_poles_and_beyond_rows`,
+  `gaussian_seam_wrap_semantics_match_regular`.
+* `wx-ingest/tests/decode_3_40.rs`: `sec3_live_gaussian_payload_parses_to_wgrib2_values`,
+  `sec3_gaussian_rejections_skip_as_grid_40`,
+  `sec3_gaussian_south_north_orientation_accepted`.
+* `wx-ingest/tests/grid_bin_roundtrip.rs`: `grid_bin_v3_gaussian_roundtrip_bitexact`,
+  `grid_bin_v3_regular_and_lambert_still_roundtrip`,
+  `grid_bin_stale_version_is_rejected_for_the_recovery_trap`.
+* `wx-server/tests/gaussian_models_render.rs`: `models_grid_block_renders_gaussian_kind`
+  (dlon renders "0.1171875"), `models_grid_block_other_kinds_unchanged`.
+* `realdata_gate.rs` pins FLIPPED honestly: `gfs_sflux_skips_are_grid_40_only`
+  → `gfs_sflux_decodes_on_template_3_40` (decoded == total, per-file counts);
+  `skip_reasons::...skips_everything_as_grid_40` →
+  `decode_file_on_real_gfs_sflux_decodes_everything`. Both keep vacuous-safe
+  behavior when the fetched directory is absent.
+
+### 16.14 API shape changes
+
+Additive only: `/v1/models` grid blocks gain kind `"gaussian_latlon"` with
+fields nx, ny, lon1, la1, la2, dlon, scan_mode, earth_shape, source_winds_grid
+(`render_grid_json`). No renames, no removals, `/v1/point` semantics unchanged
+(422 `out_of_domain` at poles is new ONLY in the sense that gaussian grids did
+not exist before).

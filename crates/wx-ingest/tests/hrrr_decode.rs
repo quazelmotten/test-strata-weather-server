@@ -215,6 +215,7 @@ fn hrrr_rotation_invariants() {
                     }
                 }
                 GridDef::Regular(_rg) => { assert!(false); }
+                GridDef::Gaussian(_gg) => { assert!(false); }
             }
             // involution: rotating twice returns the grid components exactly
             // (the change-of-basis matrix is symmetric orthogonal).

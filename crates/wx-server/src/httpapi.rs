@@ -202,6 +202,8 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
 }
 
 /// Grid definition JSON (spec §7 /v1/models: "grid info incl LCC params").
+/// V1.3 phase E4b: `pub` so the gaussian-latlon block shape is pinned by an
+/// integration test without needing a synthesized template-3.40 fixture.
 /// V1.3 phase E2: the component-convention flag is reported as
 /// `source_winds_grid` — it describes how the SOURCE messages arriving in
 /// `ingest_dir` were encoded (GRIB flag table 3.3 bit 3, taken from the first
@@ -209,7 +211,7 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
 /// and queried U/V are ALWAYS earth-relative (spec §4.4 rotates grid-relative
 /// components at ingest; field headers carry false), so the value here is
 /// informational and may legitimately differ between runs of one model.
-fn render_grid_json(gd: &GridDef) -> String {
+pub fn render_grid_json(gd: &GridDef) -> String {
     match gd {
         GridDef::Regular(g) => {
             let nx = fmt_num(g.nx as f64);
@@ -224,6 +226,17 @@ fn render_grid_json(gd: &GridDef) -> String {
             let scan = fmt_num(g.scan_mode as f64);
             let es = fmt_num(g.earth_shape as f64);
             return format!("{{\"kind\":\"lcc\",\"nx\":{0},\"ny\":{1},\"la1\":{2},\"lo1\":{3},\"lov\":{4},\"lad\":{5},\"latin1\":{6},\"latin2\":{7},\"dx_m\":{8},\"dy_m\":{9},\"proj_flag\":{10},\"scan_mode\":{11},\"earth_shape\":{12},\"source_winds_grid\":{13}}}", nx, ny, g.la1, g.lo1, g.lov, g.lad, g.latin1, g.latin2, g.dx_m, g.dy_m, pf, scan, es, g.winds_grid);
+        }
+        GridDef::Gaussian(g) => {
+            // V1.3 phase E4b (GRIB template 3.40). la1/la2 are the row ends
+            // AS RECORDED IN SECTION 3; the authoritative row table is the
+            // P_ny-root table wx-core rebuilds from ny (see grid.rs docs),
+            // and lat +-90 is always out of domain on such grids.
+            let nx = fmt_num(g.nx as f64);
+            let ny = fmt_num(g.ny as f64);
+            let scan = fmt_num(g.scan_mode as f64);
+            let es = fmt_num(g.earth_shape as f64);
+            return format!("{{\"kind\":\"gaussian_latlon\",\"nx\":{0},\"ny\":{1},\"lon1\":{2},\"la1\":{3},\"la2\":{4},\"dlon\":{5},\"scan_mode\":{6},\"earth_shape\":{7},\"source_winds_grid\":{8}}}", nx, ny, g.lon1, g.la1, g.la2, g.dlon, scan, es, g.winds_grid);
         }
     }
 }

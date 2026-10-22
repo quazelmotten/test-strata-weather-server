@@ -493,6 +493,7 @@ pub fn grid_nxi(g: &GridDef) -> usize {
     match g {
         GridDef::Regular(r) => { return r.nx as usize; }
         GridDef::Lambert(r) => { return r.nx as usize; }
+        GridDef::Gaussian(r) => { return r.nx as usize; }
     }
 }
 
@@ -500,6 +501,7 @@ pub fn grid_nyi(g: &GridDef) -> usize {
     match g {
         GridDef::Regular(r) => { return r.ny as usize; }
         GridDef::Lambert(r) => { return r.ny as usize; }
+        GridDef::Gaussian(r) => { return r.ny as usize; }
     }
 }
 
@@ -509,6 +511,7 @@ pub fn rows_flipped(g: &GridDef) -> bool {
     match g {
         GridDef::Regular(r) => { return (r.scan_mode & 0x40) == 0; }
         GridDef::Lambert(r) => { return (r.scan_mode & 0x40) == 0; }
+        GridDef::Gaussian(r) => { return (r.scan_mode & 0x40) == 0; }
     }
 }
 
@@ -518,6 +521,7 @@ pub fn cols_flipped(g: &GridDef) -> bool {
     match g {
         GridDef::Regular(r) => { return (r.scan_mode & 0x80) != 0; }
         GridDef::Lambert(r) => { return (r.scan_mode & 0x80) != 0; }
+        GridDef::Gaussian(r) => { return (r.scan_mode & 0x80) != 0; }
     }
 }
 

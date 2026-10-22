@@ -52,7 +52,7 @@
 //! many section-7 payloads were skipped vs. actually unpacked so tests can
 //! prove the filter works.
 
-use wx_core::grid::{GridDef, GridRegular, GridLambert};
+use wx_core::grid::{gaussian_latitudes, GridDef, GridGaussian, GridRegular, GridLambert};
 use wx_core::tables::param_name_for;
 use wx_core::grid::D2R;
 
@@ -419,14 +419,21 @@ pub fn flag33_byte(p: &[u8]) -> (u16, u8) {
             if p.len() >= 42 { return (30, p[41]); }
             return (30, 0);
         }
+        40 => {
+            // NCEP gaussian usage: the flag byte sits between Lo1 and La2
+            // (offsets per wgrib2 grb2.h GDS_Gaussian_* macros, cross-checked
+            // against live GFS sflux bytes in V1.3 phase E4b)
+            if p.len() >= 50 { return (40, p[49]); }
+            return (40, 0);
+        }
         _ => { return (tmpl, 0); }
     }
 }
 
-/// Section 3 -> wx-core GridDef. Templates 3.0 and 3.30 only. Offsets follow
-/// the NCEP spec layout as written by the bootstrap writer (which wgrib2
-/// reads correctly); wgrib2's own Sec3 accessors are one byte off on the
-/// number-of-points field but agree because the source-of-grid byte is 0.
+/// Section 3 -> wx-core GridDef. Templates 3.0, 3.30 and 3.40 only. Offsets
+/// follow the NCEP spec layout as written by the bootstrap writer (which
+/// wgrib2 reads correctly); wgrib2's own Sec3 accessors are one byte off on
+/// the number-of-points field but agree because the source-of-grid byte is 0.
 pub fn parse_sec3(p: &[u8]) -> Result<GridDef, GribErr> {
     if p.len() < 10 {
         return Err(GribErr::Truncated);
@@ -435,6 +442,7 @@ pub fn parse_sec3(p: &[u8]) -> Result<GridDef, GribErr> {
     match tmpl {
         0 => { return parse_grid_regular(p); }
         30 => { return parse_grid_lambert(p); }
+        40 => { return parse_grid_gaussian(p); }
         _ => { return Err(GribErr::UnsupportedGrid(tmpl)); }
     }
 }
@@ -525,6 +533,104 @@ fn parse_grid_lambert(p: &[u8]) -> Result<GridDef, GribErr> {
         _ => {}
     }
     Ok(GridDef::Lambert(g))
+}
+
+/// GRIB2 grid definition template 3.40 as NCEP uses it for the operational
+/// FV3GFS line: global gaussian lat-lon, quasi-regular NON-thinned (V1.3
+/// phase E4b; docs/DECISIONS.md §16 has the live-fire byte map). Field
+/// offsets are wgrib2's own (`grb2.h::GDS_Gaussian_*`, gds+N == payload
+/// N-5) and were cross-checked value-by-value against
+/// `tools/wgrib2-full <file> -grid` on production bytes:
+///   nx@25 ny@29 basic@33 subangle@37 la1@41 lo1@45 [flags@49] la2@50
+///   lo2@54 di@58 nlat@62
+/// Acceptance rules (documented limitations):
+/// * FULL GLOBAL ONLY: require ny == 2*nlat. Thinned/reduced shapes (CT
+///   3.11 = 1/2, where wgrib2 itself consults the flag because dims are
+///   missing) and regional gaussian grids skip as UnsupportedGrid(40). Note
+///   the live files carry CT 3.11 == 0 ("global full") — the task text's
+///   "quasi-regular != 1 => skip" would have skipped every current-GFS
+///   message; wgrib2 reads CT 3.11 only when nx/ny are absent, so we do.
+/// * Row latitudes must match the P_ny-root table at both ends within
+///   1e-3 deg (live bytes agree to 5.4e-7); anything else is an unknown row
+///   convention and skips loudly instead of interpolating wrong rows.
+/// * Units: honor basic/sub angle exactly like wgrib2 (basic == 0 => 1e-6,
+///   the live case; sub-angle follows wgrib2's int8.c::sub_angle quirks).
+/// * Global wrap: when lo2-lo1+di spans the globe, use dlon = 360/nx
+///   EXACTLY (the stored Di is rounded to 1e-6 deg: 117188 vs the true
+///   117187.5; accumulating that error across 3072 columns breaks node
+///   exactness at the far edge — wgrib2 likewise recomputes from endpoints).
+fn parse_grid_gaussian(p: &[u8]) -> Result<GridDef, GribErr> {
+    if p.len() < 66 {
+        return Err(GribErr::Truncated);
+    }
+    let tmpl_skip = |why: &str| -> GribErr {
+        // Every template-3.40 shape we decline reports under the SAME bucket
+        // (skip kind "grid template 3.40") so counters stay tidy (§15 flat
+        // skip buckets); `why` rides in the per-file note text upstream.
+        let _ = why;
+        return GribErr::UnsupportedGrid(40);
+    };
+    let nx = be_u32(p, 25);
+    let ny = be_u32(p, 29);
+    let nlat = be_u32(p, 62);
+    if nx == 0 || ny == 0 || nlat == 0 || ny != 2 * nlat {
+        return Err(tmpl_skip("thinned/regional or missing dimensions"));
+    }
+    // basic angle / direction-derivative ratio -> units (wgrib2 semantics)
+    let basic = sm_i4(p, 33);
+    let mut subv = sm_i4(p, 37);
+    if p[37] == 0 && p[38] == 0 && p[39] == 0 && p[40] == 0 {
+        subv = 1;
+    } else if p[37] == 0xFF && p[38] == 0xFF && p[39] == 0xFF && p[40] == 0xFF {
+        subv = 1_000_000;
+    }
+    let units = if basic == 0 {
+        1.0e-6
+    } else if subv > 0 {
+        (basic as f64) / (subv as f64)
+    } else {
+        return Err(GribErr::BadField("gaussian basic/sub angle ratio nonpositive"));
+    };
+    let la1 = sm_i4(p, 41) as f64 * units;
+    let lon1 = norm_lon_f(be_u32(p, 45) as f64 * units);
+    let la2 = sm_i4(p, 50) as f64 * units; // UNALIGNED slot (octet 56), like wgrib2
+    let lon2 = norm_lon_f(be_u32(p, 54) as f64 * units);
+    let di_raw = sm_i4(p, 58) as f64 * units;
+    if di_raw <= 0.0 {
+        return Err(GribErr::BadField("zero or negative gaussian di"));
+    }
+    // orientation: row 0 sits at La1. NS storage (GFS) has La1 north.
+    let ns = la1 > la2;
+    if !ns && la1 == la2 {
+        return Err(tmpl_skip("degenerate row span"));
+    }
+    // validate the producer's end latitudes against the authoritative table
+    let top = match gaussian_latitudes(ny) {
+        Some(v) => v[0],
+        None => { return Err(tmpl_skip("unsupported row count")); }
+    };
+    let want_hi = if ns { la1 } else { la2 };
+    let want_lo = if ns { la2 } else { la1 };
+    let dhi = if want_hi - top >= 0.0 { want_hi - top } else { top - want_hi };
+    let dlo = if want_lo + top >= 0.0 { want_lo + top } else { -(want_lo + top) };
+    if dhi > 1e-3 || dlo > 1e-3 {
+        return Err(tmpl_skip("row ends disagree with P_ny table"));
+    }
+    // longitude spacing: reconstruct the exact global increment when the
+    // grid spans the full circle (stored value carries 1e-6-deg rounding)
+    let mut span = lon2 - lon1;
+    if span < 0.0 {
+        span += 360.0;
+    }
+    let dlon = if (span + di_raw - 360.0).abs() <= 0.01 {
+        360.0 / (nx as f64)
+    } else {
+        di_raw
+    };
+    let scan_mode: u8 = if ns { 0x00 } else { 0x40 };
+    let flag33 = p[49];
+    Ok(GridDef::Gaussian(GridGaussian::new(
+        nx, ny, lon1, la1, la2, dlon, scan_mode, p[9], (flag33 & 0x08) != 0)))
 }
 
 /// Section 4 product definition info (internal).
@@ -719,6 +825,7 @@ pub fn wx_nx(g: &GridDef) -> u32 {
     match g {
         GridDef::Regular(r) => { return r.nx; }
         GridDef::Lambert(r) => { return r.nx; }
+        GridDef::Gaussian(r) => { return r.nx; }
     }
 }
 
@@ -726,6 +833,7 @@ pub fn wx_ny(g: &GridDef) -> u32 {
     match g {
         GridDef::Regular(r) => { return r.ny; }
         GridDef::Lambert(r) => { return r.ny; }
+        GridDef::Gaussian(r) => { return r.ny; }
     }
 }
 
@@ -1407,6 +1515,7 @@ pub fn grid_winds(g: &GridDef) -> bool {
     match g {
         GridDef::Regular(r) => { return r.winds_grid; }
         GridDef::Lambert(r) => { return r.winds_grid; }
+        GridDef::Gaussian(r) => { return r.winds_grid; }
     }
 }
 
@@ -1756,6 +1865,15 @@ pub fn rotate_winds_to_earth(g: &GridDef, u_in: &[f32], v_in: &[f32]) -> (Vec<f3
     let mut vn = Vec::<f32>::new();
     match g {
         GridDef::Regular(_) => {
+            for x in u_in { ue.push(*x); }
+            for x in v_in { vn.push(*x); }
+            return (ue, vn);
+        }
+        GridDef::Gaussian(_) => {
+            // lat/lon geometry: U/V arrive earth-relative on NCEP template
+            // 3.40 (wgrib2 hardcodes winds N/S for this grid: mk_kgds.c
+            // kgds[5]=128; the live flag byte agrees, bit 0x08 clear), so no
+            // rotation applies — same treatment as regular lat/lon grids.
             for x in u_in { ue.push(*x); }
             for x in v_in { vn.push(*x); }
             return (ue, vn);

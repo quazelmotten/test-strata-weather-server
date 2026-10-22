@@ -248,6 +248,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
                     assert!(g.ny == 41);
                 }
                 GridDef::Regular(_) => { assert!(false); }
+                GridDef::Gaussian(_) => { assert!(false); }
             }
             match lookup_level_type("height_above_ground") {
                 None => { assert!(false); return; }

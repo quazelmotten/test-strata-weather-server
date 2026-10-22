@@ -110,6 +110,7 @@ fn wind_grid_of(fixture: &str) -> GridLambert {
                     match m.grid {
                         GridDef::Lambert(ref gl) => { return gl.clone(); }
                         GridDef::Regular(ref _rg) => { assert!(false); }
+                        GridDef::Gaussian(ref _gg) => { assert!(false); }
                     }
                 }
             }

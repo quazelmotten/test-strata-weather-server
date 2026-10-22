@@ -2658,6 +2658,7 @@ fn grid_scan_ns(g: &GridDef) -> bool {
     match g {
         GridDef::Regular(r) => { return (r.scan_mode & 0x40) == 0; }
         GridDef::Lambert(l) => { return l.j_south; }
+        GridDef::Gaussian(r) => { return (r.scan_mode & 0x40) == 0; }
     }
 }
 

@@ -7,7 +7,8 @@
 //! ## grid.bin format (versioned, custom — "define your own serialization")
 //!
 //! ```text
-//! magic 8B "WXPTGRID1" | version u32 LE = 2 | kind u8 (0 regular, 1 lambert)
+//! magic 8B "WXPTGRID1" | version u32 LE = 3 | kind u8 (0 regular, 1 lambert,
+//!                                                    2 gaussian)
 //! regular:  nx u32 ny u32 | lon1 lat1 dlon dlat f64 | scan u8 | winds u8
 //! lambert:  nx u32 ny u32 | la1 lo1 lov lad latin1 latin2 dx_m dy_m f64 x8
 //!           | proj_flag u8 | scan u8 | earth_shape u8 | winds u8
@@ -16,12 +17,17 @@
 //!           section 3; without these bytes a warm-boot rebuild would silently
 //!           fall back to the CT table value and project/rotate on the wrong
 //!           spheroid)
+//! gaussian: nx u32 ny u32 | lon1 la1 la2 dlon f64 | scan u8 | earth_shape u8
+//!           | winds u8                              (v3 addition, V1.3 E4b:
+//!           GRIB template 3.40. The row-latitude table is DERIVED data —
+//!           recomputed bit-identically from ny at read time — hence not
+//!           stored; la1/la2 ride along for reporting/validation only.)
 //! ```
 //! Precomputed projection constants are NOT stored: the reader rebuilds them
 //! via GridLambert::new (+ set_user_axes when inline_axes is set), keeping one
 //! source of truth for both the projection and the wind-rotation angle.
 
-use wx_core::grid::{GridDef, GridRegular, GridLambert};
+use wx_core::grid::{GridDef, GridRegular, GridLambert, GridGaussian};
 use wx_core::tables::valid_civil_date;
 use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, StatMeta, fsync_path,
                        PlaneSource, count_rename, count_bytes_written, le_u32, bits_to_f32,
@@ -29,7 +35,11 @@ use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, StatMeta,
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
-pub const GRID_VERSION: u32 = 2;
+/// grid.bin layout version. v3 (V1.3 phase E4b) adds the kind-2 gaussian
+/// variant; readers reject any other version loudly and the pipeline's B0
+/// STORAGE-FORMAT RECOVERY trap self-heals old stores with exactly one
+/// re-ingest per model (docs/DECISIONS.md).
+pub const GRID_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // LE primitives (local copies; wx-core only exposes f32/u32 helpers)
@@ -103,6 +113,22 @@ pub fn encode_grid(grid: &GridDef) -> Vec<u8> {
             push_le_f64(&mut out, g.ua_major_m);
             push_le_f64(&mut out, g.ua_minor_m);
             out.push(if g.inline_axes { 1 } else { 0 });
+        }
+        GridDef::Gaussian(g) => {
+            // V1.3 phase E4b. The row-latitude table is NOT serialized: it
+            // is recomputed deterministically from ny by GridGaussian::new
+            // (pure math, bit-identical across builds of this code), so the
+            // stored blob stays tiny and self-consistent.
+            out.push(2);
+            push_le_u32(&mut out, g.nx);
+            push_le_u32(&mut out, g.ny);
+            push_le_f64(&mut out, g.lon1);
+            push_le_f64(&mut out, g.la1);
+            push_le_f64(&mut out, g.la2);
+            push_le_f64(&mut out, g.dlon);
+            out.push(g.scan_mode);
+            out.push(g.earth_shape);
+            out.push(if g.winds_grid { 1 } else { 0 });
         }
     }
     return out;
@@ -179,6 +205,27 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
                 gg.set_user_axes(ua_major, ua_minor);
             }
             return Ok(GridDef::Lambert(gg));
+        }
+        2 => {
+            // gaussian (V1.3 E4b): magic(8)+ver(4)+kind(1)+nx/ny(8)+4 f64+3 flags
+            if b.len() < 12 + 1 + 8 + 32 + 3 {
+                return Err("truncated gaussian grid".to_string());
+            }
+            let nx = le_u32_at(b, 13);
+            let ny = le_u32_at(b, 17);
+            let lon1 = le_f64_at(b, 21);
+            let la1 = le_f64_at(b, 29);
+            let la2 = le_f64_at(b, 37);
+            let dlon = le_f64_at(b, 45);
+            let scan = b[53];
+            let earth_shape = b[54];
+            let winds = b[55];
+            let g = GridGaussian::new(nx, ny, lon1, la1, la2, dlon, scan,
+                                      earth_shape, winds != 0);
+            if g.row_lats().len() as u32 != ny {
+                return Err("gaussian row table rebuild failed".to_string());
+            }
+            return Ok(GridDef::Gaussian(g));
         }
         _ => { return Err("unknown grid kind".to_string()); }
     }

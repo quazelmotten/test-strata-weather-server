@@ -129,12 +129,42 @@ pub struct GridLambert {
     pub inline_axes: bool,
 }
 
-/// A grid is either regular lat/lon or LCC; downstream code passes this
-/// around.
+/// Gaussian-latitude lat/lon grid (GRIB2 grid definition template 3.40 as
+/// NCEP uses it for the operational FV3GFS line: quasi-regular, non-thinned,
+/// global; today 3072 x 1536). Equal-spaced longitudes, rows sit on Gaussian
+/// latitudes (see [`gaussian_latitudes`]); storage layout is the plain
+/// `[row][col]` rectangle like the regular grid, so the bilinear kernels are
+/// shared. There are NO pole nodes: the topmost/bottommost rows are at
+/// +/- asin(largest root of P_ny) (~ +/-89.91 deg for GFS), and lat +-90 is
+/// therefore always OUT of domain — defined behavior (spec §6.1: never
+/// extrapolate). Angles in degrees.
+#[derive(Clone, Debug)]
+pub struct GridGaussian {
+    pub nx: u32,
+    pub ny: u32, // total rows; must be even (symmetric about the equator)
+    pub lon1: f64, // longitude of stored point (0,0), normalized [0,360)
+    pub dlon: f64, // cell size, degrees (magnitude; direction in scan_mode)
+    pub la1: f64, // northernmost row latitude from section 3 (informational)
+    pub la2: f64, // southernmost row latitude from section 3 (informational)
+    pub scan_mode: u8, // CT 3.5 bits: 0x80 = i decreases eastward, 0x40 = rows go north
+    pub earth_shape: u8, // Code Table 3.2 byte (reported through /v1/models)
+    pub winds_grid: bool, // flag table 3.3 bit 0x08 (NCEP gaussian: false)
+
+    // precomputed once per grid (spec §4.3): row latitudes in STORAGE order,
+    // strictly monotonic; plus the coarsest row spacing in degrees, which
+    // anchors the node-exactness epsilon so it means the same fraction of a
+    // cell as PROJ_NODE_EPS does on the regular grid.
+    lats: Vec<f64>,
+    max_row_deg: f64,
+}
+
+/// A grid is regular lat/lon, LCC, or gaussian-lat-lon; downstream code
+/// passes this around.
 #[derive(Clone, Debug)]
 pub enum GridDef {
     Regular(GridRegular),
     Lambert(GridLambert),
+    Gaussian(GridGaussian),
 }
 
 // ---------------------------------------------------------------------------
@@ -199,6 +229,303 @@ impl GridRegular {
             di_out,
             dj.clamp(0.0, (self.ny as f64) - 1.0),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gaussian latitudes (GRIB template 3.40, V1.3 phase E4b)
+// ---------------------------------------------------------------------------
+
+/// Positive (north) Gaussian latitudes in degrees, DESCENDING, for a full
+/// global gaussian grid with `ny` rows: asin of the positive roots of the
+/// Legendre polynomial **P_ny** (ny even: exactly ny/2 positive roots, the
+/// southern rows are their mirror). NOTE the degree: the classic "full
+/// gaussian" grid places ALL ny rows on the ny roots of P_ny — NOT the ny/2
+/// roots of P_{ny/2}. Verified three ways (docs/DECISIONS.md V1.3-E4b):
+/// against `numpy.polynomial.legendre.leggauss`, against wgrib2's reference
+/// generator (`tools/wgrib2-full-src/grib2/wgrib2/geo.c::gauss2lats`, Newton
+/// on an exact cosine-series Legendre evaluator), and against LIVE GFS sflux
+/// bytes: the file's La1 = 89.910324 deg matches asin(top root of P_1536) to
+/// 5.4e-7 deg, and the recorded probe row 40.006506 IS a table entry (delta
+/// -2.5e-7 deg — six-decimal print rounding).
+///
+/// Algorithm: for k = 1..=ny/2 start from the asymptotic Chebyshev-Gauss
+/// seed x0 = cos(pi (k - 1/4) / (n + 1/2)) and polish with Newton iterations
+/// on P_n evaluated by the three-term recurrence ((1-x^2) P'_n = n(P_{n-1} -
+/// x P_n)), stopping at |dx| <= 1e-15. Safeguards: iterates that leave (0,1),
+/// stall, or finish with a non-tiny residual |P_n(x)| fall back to bisection
+/// on a sign change of P_n bracketed by walking down from the previously
+/// found larger root. The builder additionally requires strict monotonicity
+/// and returns None on any anomaly, so a decoder meeting a weird grid skips
+/// it loudly instead of interpolating wrong rows.
+pub fn gaussian_latitudes(ny: u32) -> Option<Vec<f64>> {
+    let n = ny as usize;
+    if !(2..=65536).contains(&n) || !n.is_multiple_of(2) {
+        return None; // odd ny would need an equator row: not produced by NCEP
+    }
+    let npos = n / 2;
+    let mut xs: Vec<f64> = vec![0.0; npos];
+    for k in 0..npos {
+        let j = (k + 1) as f64;
+        let seed = ((PI * (j - 0.25)) / (n as f64 + 0.5)).cos();
+        let prev = if k == 0 { 1.0 } else { xs[k - 1] };
+        let x = match refine_legendre_root(n, seed, prev) {
+            Some(v) => v,
+            None => { return None; }
+        };
+        // named bool so the NOT applies to a plain boolean: NaN must FAIL
+        // (both comparisons false -> && false -> !true -> None), which the
+        // direct `x <= 0.0 || x >= prev` spelling would silently pass.
+        let strict_between = x > 0.0 && x < prev;
+        if !strict_between {
+            return None;
+        }
+        xs[k] = x;
+    }
+    let lats: Vec<f64> = xs.iter().map(|xk| xk.asin() * R2D).collect();
+    return Some(lats);
+}
+
+/// (P_n(x), P_{n-1}(x)) via the stable three-term recurrence.
+fn legendre_pair(n: usize, x: f64) -> (f64, f64) {
+    let mut p0 = 1.0f64; // P_0
+    let mut p1 = x; // P_1
+    let mut k = 2usize;
+    while k <= n {
+        let kf = k as f64;
+        let pk = ((2.0 * kf - 1.0) * x * p1 - (kf - 1.0) * p0) / kf;
+        p0 = p1;
+        p1 = pk;
+        k += 1;
+    }
+    return (p1, p0);
+}
+
+/// Polish one root of P_n started from its asymptotic seed. `hi_prev` is the
+/// previously found (larger) root or 1.0 for the first one and anchors the
+/// fallback bracket. Newton first (quadratic convergence from the seed); if
+/// any iterate leaves (0, hi_prev) or the result keeps a visible residual,
+/// bisect on the sign change of P_n inside (0, hi_prev) instead.
+fn refine_legendre_root(n: usize, seed: f64, hi_prev: f64) -> Option<f64> {
+    let mut x = seed;
+    let mut converged = false;
+    let mut it = 0usize;
+    let nf = n as f64;
+    while it < 60 && x > 0.0 && x < hi_prev {
+        let (pn, pm1) = legendre_pair(n, x);
+        let den = 1.0 - x * x;
+        if den.abs() < 1e-300 {
+            break;
+        }
+        // P'_n = n (P_{n-1} - x P_n) / (1 - x^2)
+        let dpn = nf * (pm1 - x * pn) / den;
+        if dpn.abs() < 1e-300 {
+            break;
+        }
+        let dx = pn / dpn;
+        let xn = x - dx;
+        let adx = if dx < 0.0 { -dx } else { dx };
+        x = xn;
+        if adx <= 1e-15 {
+            converged = true;
+            break;
+        }
+        it += 1;
+    }
+    let in_bracket = x > 0.0 && x < hi_prev;
+    if !converged || !in_bracket {
+        // bisection fallback: walk the interval (0, hi_prev) downward from
+        // hi_prev in seed-sized steps until P_n changes sign, then bisect.
+        let step = if seed < hi_prev { hi_prev - seed } else { 0.05 };
+        let mut a = hi_prev;
+        let mut fa = legendre_pair(n, a).0;
+        let mut found = false;
+        let mut b = hi_prev - (step + step);
+        let mut guard = 0usize;
+        while b > 0.0 && guard < 4 * n + 64 {
+            let fb = legendre_pair(n, b).0;
+            if fa == 0.0 {
+                x = a;
+                found = true;
+                break;
+            }
+            if (fa > 0.0) != (fb > 0.0) {
+                // bisect [b, a], keeping the sign-change invariant
+                let mut lo = b;
+                let mut flo = fb;
+                let mut hi = a;
+                let mut j = 0usize;
+                while j < 200 && hi - lo > 1e-15 {
+                    let m = 0.5 * (lo + hi);
+                    let fm = legendre_pair(n, m).0;
+                    if (fm > 0.0) == (flo > 0.0) {
+                        lo = m;
+                        flo = fm;
+                    } else {
+                        hi = m;
+                    }
+                    j += 1;
+                }
+                x = 0.5 * (lo + hi);
+                found = true;
+                break;
+            }
+            a = b;
+            fa = fb;
+            b -= step;
+            guard += 1;
+        }
+        if !found {
+            return None;
+        }
+    }
+    let (pn, _) = legendre_pair(n, x);
+    let apn = if pn < 0.0 { -pn } else { pn };
+    if apn > 1e-9 {
+        return None;
+    }
+    return Some(x);
+}
+
+impl GridGaussian {
+    /// Build the grid and precompute the row-latitude table ONCE (spec
+    /// §4.3). Storage-order convention matches the other grids: row 0 is
+    /// the La1 side; scan bit 0x40 clear => rows advance southward (the
+    /// operational GFS layout), set => northward. The row latitudes come
+    /// from [`gaussian_latitudes`] (mathematically authoritative); la1/la2
+    /// are stored verbatim for reporting and validated by the DECODER
+    /// against the table before construction (see wx-ingest grib2.rs).
+    pub fn new(nx: u32, ny: u32, lon1: f64, la1: f64, la2: f64, dlon: f64,
+               scan_mode: u8, earth_shape: u8, winds_grid: bool) -> Self {
+        let posv = gaussian_latitudes(ny).unwrap_or_default();
+        let mut lats: Vec<f64> = Vec::<f64>::with_capacity(ny as usize);
+        if (posv.len() * 2) as u32 == ny {
+            let mut k = 0usize;
+            while k < posv.len() {
+                lats.push(posv[k]); // north half: descending
+                k += 1;
+            }
+            k = posv.len();
+            while k > 0 {
+                k -= 1;
+                lats.push(-posv[k]); // south half: ascending negatives
+            }
+        }
+        if (scan_mode & 0x40) != 0 {
+            lats.reverse();
+        }
+        let mut max_row_deg = 0.0f64;
+        let mut i = 1usize;
+        while i < lats.len() {
+            let d = lats[i - 1] - lats[i];
+            if d > max_row_deg {
+                max_row_deg = d;
+            }
+            i += 1;
+        }
+        return Self {
+            nx: nx, ny: ny, lon1: lon1, la1: la1, la2: la2, dlon: dlon,
+            scan_mode: scan_mode, earth_shape: earth_shape,
+            winds_grid: winds_grid, lats: lats, max_row_deg: max_row_deg,
+        };
+    }
+
+    /// Row latitudes in storage order (row 0 first), strictly monotonic.
+    pub fn row_lats(self: &Self) -> &[f64] {
+        return &self.lats;
+    }
+
+    /// True when column nx-1 wraps to column 0 (global gaussian grids).
+    pub fn lon_wrap(self: &Self) -> bool {
+        return ((self.nx as f64) * self.dlon - 360.0).abs() <= 1e-9;
+    }
+
+    /// Fractional (i, j) in storage order, or None outside the node
+    /// rectangle. Longitude handling is IDENTICAL to the regular grid
+    /// (wrap across the seam, never extrapolate at non-wrapping edges).
+    /// Latitude: binary search the monotonic row table, then interpolate
+    /// LINEARLY IN j BETWEEN NODES (spec §6.1 works in grid-index space;
+    /// this is the same rule the regular/Lambert projections apply). A
+    /// latitude within PROJ_NODE_EPS of the coarsest row spacing of a node
+    /// returns that node's exact integer j. Beyond the topmost/bottommost
+    /// row — INCLUDING both poles — the point is out of domain.
+    pub fn project(self: &Self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        if lat < -90.0 || lat > 90.0 {
+            return None;
+        }
+        if self.lats.len() != self.ny as usize || self.dlon <= 0.0 {
+            return None;
+        }
+        let lon = norm_lon(lon);
+        let wraps = self.lon_wrap();
+
+        // signed shortest delta from lon1 in cells (positive = east of lon1)
+        let delta = ((lon - self.lon1 + 180.0) % 360.0) - 180.0;
+        let mut di = delta / self.dlon;
+        if (self.scan_mode & 0x80) != 0 {
+            di = -di; // i decreases eastward: columns run westward from lon1
+        }
+        if wraps {
+            if di < 0.0 {
+                di += self.nx as f64;
+            }
+            if di >= (self.nx as f64) {
+                di -= self.nx as f64;
+            }
+        } else if di < -PROJ_NODE_EPS || di > (self.nx as f64) - 1.0 + PROJ_NODE_EPS {
+            return None;
+        }
+
+        // Work in NORTH-INDEX space: nk = row counted from the northernmost
+        // row, whose latitudes strictly decrease. The stored dj follows the
+        // scan direction.
+        let ns = (self.scan_mode & 0x40) == 0;
+        let len = self.lats.len();
+        let get = |nk: usize| -> f64 {
+            if ns { self.lats[nk] } else { self.lats[len - 1 - nk] }
+        };
+        let epsd = PROJ_NODE_EPS * self.max_row_deg;
+        let top = get(0);
+        let bot = get(len - 1);
+        if lat > top + epsd || lat < bot - epsd {
+            return None; // no pole nodes exist on a gaussian grid
+        }
+        // binary search: largest k with get(k) >= lat (clamped at the ends)
+        let mut lo = 0usize;
+        let mut hi = len - 1;
+        if lat >= top {
+            hi = 0;
+        } else {
+            while hi - lo > 1 {
+                let m = (lo + hi) / 2;
+                if get(m) >= lat {
+                    lo = m;
+                } else {
+                    hi = m;
+                }
+            }
+        }
+        let v0 = get(lo);
+        let v1 = get(hi);
+        let d0 = if lat > v0 { lat - v0 } else { v0 - lat };
+        let nk_f: f64;
+        if d0 <= epsd || hi == lo {
+            nk_f = lo as f64; // exactly on a node (or degenerate clamp)
+        } else {
+            let d1 = if lat > v1 { lat - v1 } else { v1 - lat };
+            if d1 <= epsd {
+                nk_f = hi as f64;
+            } else {
+                let w = (v0 - lat) / (v0 - v1);
+                nk_f = (lo as f64) + w;
+            }
+        }
+        let dj = if ns { nk_f } else { (len - 1) as f64 - nk_f };
+        let di_out = if wraps { di } else { di.clamp(0.0, (self.nx as f64) - 1.0) };
+        return Some((
+            di_out,
+            dj.clamp(0.0, (self.ny as f64) - 1.0),
+        ));
     }
 }
 
@@ -403,6 +730,7 @@ impl GridDef {
         match self {
             GridDef::Regular(g) => g.project(lat, lon),
             GridDef::Lambert(g) => g.project(lat, lon),
+            GridDef::Gaussian(g) => g.project(lat, lon),
         }
     }
 
@@ -410,6 +738,7 @@ impl GridDef {
         match self {
             GridDef::Regular(g) => g.nx,
             GridDef::Lambert(g) => g.nx,
+            GridDef::Gaussian(g) => g.nx,
         }
     }
 
@@ -417,6 +746,7 @@ impl GridDef {
         match self {
             GridDef::Regular(g) => g.ny,
             GridDef::Lambert(g) => g.ny,
+            GridDef::Gaussian(g) => g.ny,
         }
     }
 
@@ -425,6 +755,7 @@ impl GridDef {
         match self {
             GridDef::Regular(g) => g.lon_wrap(),
             GridDef::Lambert(_) => false,
+            GridDef::Gaussian(g) => g.lon_wrap(),
         }
     }
 
@@ -434,6 +765,7 @@ impl GridDef {
         match self {
             GridDef::Regular(g) => (g.scan_mode & 0x40) == 0,
             GridDef::Lambert(g) => g.j_south,
+            GridDef::Gaussian(g) => (g.scan_mode & 0x40) == 0,
         }
     }
 }

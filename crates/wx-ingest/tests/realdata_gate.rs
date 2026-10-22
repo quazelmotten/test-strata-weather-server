@@ -6,11 +6,14 @@
 // committed. When the directory is absent (CI, fresh clone) every test here
 // prints why and returns Ok: zero network in CI, zero spurious failures.
 //
-// Pinned expectations (docs/DECISIONS.md §15 diagnosis table):
+// Pinned expectations (docs/DECISIONS.md §15 diagnosis + §16 E4b landing):
 //   * gfs_sflux_f000/f006/f012: EVERY message rides grid definition template
-//     3.40 (3072 x 1536) -> the ONLY skip kind is Grid(40), NOTHING decodes.
-//     Correct-by-design within spec §4.3 (only 3.0 + 3.30 mandated); 3.40
-//     support is documented as a limitation, not implemented here.
+//     3.40 (gaussian lat-lon, 3072 x 1536). Since E4b these DECODE: 2/2/3
+//     messages respectively, zero structural skips. Under the E4a build they
+//     all skipped as Grid(40) — correct-by-design then, superseded now.
+//     The two HYBRID-LEVEL messages in f012 (HGT/TMP "1 hybrid level")
+//     decode fine but stay UNSTORED pending E4c (hybrid level model), and
+//     the surface HGT at fh 12 answers queries.
 //   * hrrr_apcp_tight.grib2 (212 bytes, zero-window 0-0 day accumulation):
 //     decodes successfully as a full-size all-zero plane (wgrib2 parity).
 //   * hrrr_tmp2m_f00 / hrrr_uv10m_f06: decode CLEANLY (zero structural
@@ -101,16 +104,24 @@ fn copy_in(src: &str, dst: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// GFS sflux family: every skip is Grid(40), nothing else, nothing decoded
+// GFS sflux family: template 3.40 DECODES end to end (V1.3 phase E4b)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn gfs_sflux_skips_are_grid_40_only() {
+fn gfs_sflux_decodes_on_template_3_40() {
+    // E4a pinned these files as Grid(40)-only skips; E4b landed gaussian
+    // support so every message now decodes. Pinned counts from the
+    // `wgrib2` inventory in DECISIONS §16: f000 has 2 messages (ACOND
+    // surface + TMP 2 m), f006 has 2 (UGRD/VGRD 10 m), f012 has 3 (hybrid
+    // HGT + hybrid TMP + surface HGT). ParamFilter::All bypasses config
+    // filtering, so ALL messages — hybrid levels included — must decode.
     let names = ["gfs_sflux_f000.grib2", "gfs_sflux_f006.grib2", "gfs_sflux_f012.grib2"];
+    let expected = [2u32, 2u32, 3u32];
     let mut seen = 0;
+    let mut fi = 0usize;
     for nm in names.iter() {
         let p = match real_path(nm) {
-            None => { continue; }
+            None => { fi += 1; continue; }
             Some(x) => { x }
         };
         seen += 1;
@@ -122,29 +133,253 @@ fn gfs_sflux_skips_are_grid_40_only() {
                 return;
             }
             Ok((msgs, st)) => {
-                // Honest expectation pinned per DECISIONS §15: the live GFS
-                // sflux line is template 3.40 END TO END until E4b-era work
-                // adds that template. Any OTHER kind appearing means product
-                // drift and must be re-diagnosed, not silently accepted.
-                if !(st.messages_total >= 1
-                     && msgs.is_empty()
-                     && st.messages_decoded == 0
+                let exp = expected[fi];
+                if !(st.messages_total == exp
+                     && msgs.len() == (exp as usize)
+                     && st.messages_decoded == exp
                      && st.skip_coordlists == 0
                      && st.skip_pdt.is_empty()
-                     && st.skip_grid.len() == 1
-                     && st.skip_grid[0].0 == 40
-                     && st.skip_grid[0].1 == st.messages_total) {
-                    println!("{0}: total={1} decoded={2} coord={3} grid={4:?} pdt={5:?}",
-                             nm, st.messages_total, st.messages_decoded,
+                     && st.skip_grid.is_empty()) {
+                    println!("{0}: total={1} decoded={2} msgs={3} coord={4} grid={5:?} pdt={6:?}",
+                             nm, st.messages_total, st.messages_decoded, msgs.len(),
                              st.skip_coordlists, st.skip_grid, st.skip_pdt);
+                    assert!(false);
+                    return;
+                }
+                // every decoded plane is the full 3072 x 1536 rectangle
+                if msgs[0].data.len() != 3072 * 1536 {
+                    println!("{0}: plane size {1}", nm, msgs[0].data.len());
                     assert!(false);
                     return;
                 }
             }
         }
+        fi += 1;
     }
     if seen == 0 { skip_msg("no gfs_sflux_* files under tests/realdata/"); }
-    else { println!("gfs_sflux grid-40-only skips verified for {0} file(s)", seen); }
+    else { println!("gfs_sflux template-3.40 full decode verified for {0} file(s)", seen); }
+}
+
+// ---------------------------------------------------------------------------
+// GFS real-data ACCEPTANCE: full pipeline ingest + recorded E4a probes
+// ---------------------------------------------------------------------------
+
+fn gfs_cfg_text(root: &str) -> String {
+    let ing = join_path(&root, "ingest");
+    let data = join_path(&root, "data");
+    let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
+    let t = format!("{0}{1}", t, data);
+    let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
+    let t = format!("{0}{1}", t, ing);
+    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"HGT\"\n  levels = [\"surface\"]\n";
+    return t;
+}
+
+#[test]
+fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
+    // Full acceptance proof for DECISIONS §16 "before/after". Ingests all
+    // three live sflux samples through the real Pipeline with the E4b-era
+    // operational config shape, then replays the Oct-22 wgrib2 probes.
+    let f0 = match real_path("gfs_sflux_f000.grib2") {
+        None => { skip_msg("gfs_sflux_f000.grib2 absent"); return; }
+        Some(x) => { x }
+    };
+    let f6 = real_path("gfs_sflux_f006.grib2");
+    let f12 = real_path("gfs_sflux_f012.grib2");
+
+    let root = "/tmp/opencode/wxpoint-realgate-gfs".to_string();
+    rm_tree(&root);
+    let ing = join_path(&root, "ingest");
+    let _c = create_dir_all(&ing);
+    copy_in(&f0, &join_path(&ing, "gfs_sflux_f000.grib2"));
+    let mut nfiles = 1usize;
+    match &f6 { Some(p) => { copy_in(p, &join_path(&ing, "gfs_sflux_f006.grib2")); nfiles += 1; } None => {} }
+    match &f12 { Some(p) => { copy_in(p, &join_path(&ing, "gfs_sflux_f012.grib2")); nfiles += 1; } None => {} }
+    let cfgp = join_path(&root, "config.toml");
+    match File::create(&cfgp) {
+        Err(_) => { assert!(false); return; }
+        Ok(mut w) => { let _n = w.write_all(gfs_cfg_text(&root).as_bytes()); }
+    }
+
+    let po = Pipeline::open(&cfgp);
+    let mut p = match po {
+        Err(e) => { println!("open failed: {0}", e); assert!(false); return; }
+        Ok(pp) => { pp }
+    };
+    let _n1 = p.scan_round();
+    let n2 = p.scan_round();
+    assert!(n2 == nfiles);
+    assert!(p.counters.errors == 0);
+    assert!(p.counters.ingested_files == nfiles as u64);
+    // ZERO unexpected skips: hybrid-level messages are CONFIG non-matches
+    // (level type 105 not requested), not structural skips.
+    assert!(p.counters.skip_coordlists == 0);
+    assert!(p.counters.skip_grid == 0);
+    assert!(p.counters.skip_pdt == 0);
+
+    let snap = p.shared.get_index();
+    let sref = &*snap;
+    let m = match sref.find_model("gfs") {
+        None => { println!("no gfs model in index"); assert!(false); return; }
+        Some(mm) => { mm }
+    };
+    assert!(m.runs.len() == 1); // one run: 2026-10-21 12Z from section 1
+
+    // locate the recorded probe row exactly (row whose latitude prints as
+    // 40.006506; the table value is what a node-exact request must carry)
+    let pos = match wx_core::grid::gaussian_latitudes(1536) {
+        Some(v) => v,
+        None => { assert!(false); return; }
+    };
+    let ts = &pos[..];
+    let mut krow = 9999usize;
+    let mut kk = 0usize;
+    while kk < ts.len() {
+        if absdiff(ts[kk], 40.006506) < 5e-7 { krow = kk; break; }
+        kk += 1;
+    }
+    if krow == 9999 { println!("probe row not found"); assert!(false); return; }
+    let row_lat = ts[krow];       // northern positive half, storage row krow
+    let lon_exact = -95.0390625; // == column 2261 * 360/3072, dyadic exact
+
+    // TMP 2 m @ fh 0, NODE-EXACT: wgrib2 printed 286.74 K at this node
+    let ct = build_context(sref, "gfs", None, "TMP", 103, 2.0, 0.0, TimeInterpMode::Linear);
+    match ct {
+        Err(e) => { println!("TMP ctx: {0:?}", e); assert!(false); }
+        Ok(c) => {
+            let v = evaluate_point(&c, row_lat, lon_exact);
+            match v {
+                Err(other) => { println!("node probe: {0:?}", other); assert!(false); }
+                Ok(pv) => {
+                    println!("GFS PROBE node-exact TMP = {0} K (wgrib2 286.74)", pv.value);
+                    if absdiff(pv.value, 286.74) >= 0.01 {
+                        println!("node probe {0} vs wgrib2 286.74", pv.value);
+                        assert!(false);
+                    }
+                }
+            }
+            // same probe addressed with the ROUNDED six-decimal coordinates
+            // wgrib2 printed: bilinear weights shift by <3 ppm, still inside
+            // f32 print rounding of 286.74
+            let vr = evaluate_point(&c, 40.006506, -95.039062);
+            match vr {
+                Err(other) => { println!("rounded probe: {0:?}", other); assert!(false); }
+                Ok(pv) => {
+                    if absdiff(pv.value, 286.74) >= 0.01 {
+                        println!("rounded probe {0} vs wgrib2 286.74", pv.value);
+                        assert!(false);
+                    }
+                }
+            }
+            // bilinear midpoint between rows krow and krow+1 AT THE SAME
+            // COLUMN: horizontal weight collapses to that column, so the
+            // answer must be exactly the mean of the two node values
+            let vk = match evaluate_point(&c, row_lat, lon_exact) {
+                Err(_) => { assert!(false); return; }
+                Ok(x) => { x.value }
+            };
+            let vn = match evaluate_point(&c, ts[krow + 1], lon_exact) {
+                Err(_) => { assert!(false); return; }
+                Ok(x) => { x.value }
+            };
+            let mid = 0.5 * (row_lat + ts[krow + 1]);
+            let vm = match evaluate_point(&c, mid, lon_exact) {
+                Err(_) => { assert!(false); return; }
+                Ok(x) => { x.value }
+            };
+            let want = 0.5 * (vk + vn);
+            println!("GFS midpoint sanity: rows {0}/{1} {2} {3} -> mid {4} (want {5})",
+                     krow, krow + 1, vk, vn, vm, want);
+            if absdiff(vm, want) > 1e-9 {
+                println!("midpoint off: {0} vs {1}", vm, want);
+                assert!(false);
+            }
+            // seam: the same point written in 0..360 form answers bit-equal
+            let vs = evaluate_point(&c, row_lat, 264.9609375);
+            match vs {
+                Err(other) => { println!("seam probe: {0:?}", other); assert!(false); }
+                Ok(pv) => {
+                    let v0 = match evaluate_point(&c, row_lat, lon_exact) {
+                        Err(_) => { assert!(false); return; }
+                        Ok(x) => { x.value }
+                    };
+                    if pv.value != v0 {
+                        println!("seam mismatch {0} vs {1}", pv.value, v0);
+                        assert!(false);
+                    }
+                }
+            }
+            // poles are ALWAYS out of domain on a gaussian grid (spec §6.1,
+            // documented): no extrapolation beyond the outermost row
+            let vp = evaluate_point(&c, 90.0, 0.0);
+            match vp {
+                Err(PointError::OutOfDomain) => {}
+                other => { println!("pole query: {0:?}", other); assert!(false); }
+            }
+            let vb = evaluate_point(&c, 89.95, 0.0);
+            match vb {
+                Err(PointError::OutOfDomain) => {}
+                other => { println!("beyond-top-row query: {0:?}", other); assert!(false); }
+            }
+        }
+    }
+
+    // UGRD/VGRD 10 m @ fh 6: finite, plausible, earth-relative as stored
+    if f6.is_some() {
+        for keyname in ["UGRD", "VGRD"].iter() {
+            let cu = build_context(sref, "gfs", None, keyname, 103, 10.0, 6.0 * 3600.0, TimeInterpMode::Linear);
+            match cu {
+                Err(e) => { println!("{0} ctx: {1:?}", keyname, e); assert!(false); }
+                Ok(c) => {
+                    let vu = evaluate_point(&c, row_lat, lon_exact);
+                    match vu {
+                        Err(other) => { println!("{0} probe: {1:?}", keyname, other); assert!(false); }
+                        Ok(pv) => {
+                            println!("GFS PROBE {0} 10m = {1} m/s", keyname, pv.value);
+                            if !(pv.value.is_finite() && pv.value.abs() < 200.0) {
+                                println!("{0} implausible: {1}", keyname, pv.value);
+                                assert!(false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // HGT surface @ fh 12 (the non-hybrid f012 message) answers; hybrid TMP
+    // at hag:2 must NOT exist at fh 12 (hybrid pending E4c — honest pin).
+    if f12.is_some() {
+        let ch = build_context(sref, "gfs", None, "HGT", 1, 0.0, 12.0 * 3600.0, TimeInterpMode::None);
+        match ch {
+            Err(e) => { println!("HGT surface fh12 ctx: {0:?}", e); assert!(false); }
+            Ok(c) => {
+                let vh = evaluate_point(&c, row_lat, lon_exact);
+                match vh {
+                    Err(other) => { println!("HGT probe: {0:?}", other); assert!(false); }
+                    Ok(pv) => {
+                        println!("GFS PROBE HGT surface = {0} gpm", pv.value);
+                        if !(pv.value.is_finite() && pv.value > -500.0 && pv.value < 9000.0) {
+                            println!("HGT implausible: {0}", pv.value);
+                            assert!(false);
+                        }
+                    }
+                }
+            }
+        }
+        let cf = build_context(sref, "gfs", None, "TMP", 103, 2.0, 12.0 * 3600.0, TimeInterpMode::None);
+        match cf {
+            Ok(_) => {
+                println!("TMP had a hag:2 plane at fh 12 — hybrid filter regressed?");
+                assert!(false);
+            }
+            Err(_) => { println!("hybrid TMP correctly absent from hag:2 planes at fh 12"); }
+        }
+    }
+}
+
+fn absdiff(a: f64, b: f64) -> f64 {
+    if a > b { a - b } else { b - a }
 }
 
 // ---------------------------------------------------------------------------

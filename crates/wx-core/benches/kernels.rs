@@ -5,7 +5,7 @@
 // derived in the README as 1e6/median_us. True p50/p99 under load come from
 // the /metrics histogram (scripts/loadtest.sh).
 
-use wx_core::grid::{GridRegular, GridLambert};
+use wx_core::grid::{GridRegular, GridLambert, GridGaussian};
 use wx_core::interp::{bilinear_slab_f32, bilinear4, horiz_nodes};
 use wx_core::storage::{MmapField, open_field, write_bin_atomic, BinHeader, StatMeta};
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -47,6 +47,21 @@ fn gen_lamcc_inputs(n: usize) -> Vec<(f64, f64)> {
     return out;
 }
 
+/// (lat, lon) pairs for the gaussian grid: uniform-ish over the live GFS
+/// domain (V1.3 phase E4b addition to the projection bench).
+fn gen_gauss_inputs(n: usize) -> Vec<(f64, f64)> {
+    let mut seed = 0x2545F4914F6CDD1Du64;
+    let mut out: Vec<(f64, f64)> = Vec::new();
+    for _k in 0 .. n {
+        seed = rng_next(seed);
+        let r1 = (seed >> 11) as f64 / 9007199254740992.0;
+        seed = rng_next(seed);
+        let r2 = (seed >> 11) as f64 / 9007199254740992.0;
+        out.push((-89.5 + r1 * 179.0, r2 * 360.0));
+    }
+    return out;
+}
+
 /// Fractional (di, dj) pairs strictly inside the node rectangle.
 fn gen_cells(nx: usize, ny: usize, n: usize) -> Vec<(f64, f64)> {
     let mut seed = 0x9E3779B97F4A7C15u64;
@@ -77,6 +92,12 @@ pub fn bench_projection(c: &mut Criterion) {
                                 26.5, 35.0, 3000.0, 3000.0, 1u8, 0x40u8, 6u8, false);
     let rin = gen_regular_inputs(4096);
     let lin = gen_lamcc_inputs(4096);
+    // V1.3 phase E4b: live GFS gaussian grid geometry. The P_ny-root row
+    // table is built ONCE here (outside the timed region), exactly like the
+    // lambert constants; the hot path adds one O(log ny) binary search.
+    let ggauss = GridGaussian::new(3072u32, 1536u32, 0.0, 89.910324, -89.910324,
+                                   360.0 / 3072.0, 0u8, 6u8, false);
+    let gin = gen_gauss_inputs(4096);
     let mut group_r = c.benchmark_group("projection");
     let gm = &mut group_r;
     gm.bench_function("regular_ll project", |b| {
@@ -92,6 +113,14 @@ pub fn bench_projection(c: &mut Criterion) {
         b.iter(|| {
             let pr = glam.project(lin[k].0, lin[k].1);
             k = (k + 1) % lin.len();
+            return pr;
+        });
+    });
+    gm.bench_function("gaussian project (table + binary search)", |b| {
+        let mut k = 0usize;
+        b.iter(|| {
+            let pr = ggauss.project(gin[k].0, gin[k].1);
+            k = (k + 1) % gin.len();
             return pr;
         });
     });

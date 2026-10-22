@@ -32,10 +32,25 @@ retention_runs = 4
 [[models]]
 name = "gfs"
 ingest_dir = "/data/incoming/gfs"
-file_glob = "gfs.t*z.pgrb2.0p25.f*"
+# CURRENT OPERATIONAL PRODUCT (V1.3 phase E4b): FV3GFS delivers surface AND
+# upper-air fields in gfs.tHHZ.sfluxgrbfFFF.grib2 on a GAUSSIAN-LATITUDE
+# lat-lon grid (GRIB2 grid definition template 3.40, global quasi-regular
+# non-thinned, 3072 x 1536 today). Template 3.40 decodes end to end since
+# E4b; HYBRID-level upper-air messages (level type 105) remain stored-skip
+# candidates pending phase E4c (they simply do not match any configured
+# level spec and are filtered like any unrequested level).
+file_glob = "gfs.t*z.sfluxgrbf*.grib2"
+# LEGACY (pre-FV3GFS) product line, still template 3.0 regular lat-lon
+# 0p25: set file_glob to this instead if you ingest archived runs
+# (file_glob takes exactly one pattern per model):
+#file_glob = "gfs.t*z.pgrb2.0p25.f*"
 
   [[models.params]]
   name = "HGT"
+  # NOTE (E4b reality): on TODAY's sfluxgrbf line, upper-air HGT/TMP ride the
+  # HYBRID level type (GRIB 4.5 code 105), which these isobaric specs do not
+  # match; those messages decode but stay unSTORED until phase E4c adds the
+  # hybrid level model. Surface HGT would need levels = ["surface"].
   levels = ["isobaric:1000", "isobaric:925", "isobaric:850", "isobaric:700",
             "isobaric:500", "isobaric:300", "isobaric:250", "isobaric:200"]
 

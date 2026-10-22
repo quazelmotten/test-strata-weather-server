@@ -342,17 +342,23 @@ data_dir/
   the accumulation/average guard and its time window live INSIDE each field file,
   so spec §6.3 stays enforced even when `manifest.json` is missing, corrupt or
   never written — this header is exactly what a warm start reads back.
-* `grid.bin`: magic `WXPTGRID`, u32 version (**`GRID_VERSION` = 2**; a version-1
-  file from a pre-V1.1-phase-4 store is detected on read and TRIGGERS AUTOMATIC
+* `grid.bin`: magic `WXPTGRID`, u32 version (**`GRID_VERSION` = 3**; a stale
+  version from an older store is detected on read and TRIGGERS AUTOMATIC
   RECOVERY — see §9 — instead of being silently ignored), kind byte (0 regular lat/lon,
-  1 Lambert Conformal Conic) + template fields (regular: nx,ny,lon1,lat1,dlon,
+  1 Lambert Conformal Conic, 2 gaussian lat-lon) + template fields (regular: nx,ny,lon1,lat1,dlon,
   dlat,scan,winds; LCC: nx,ny,la1,lo1,lov,lad,latin1,latin2,dx_m,dy_m,proj_flag,
   scan,earth_shape,winds, then two f64 major/minor axes in metres + an inline-axes
-  flag so Code Table 3.2 user-defined spheroids survive a warm boot). Precomputed
-  projection constants are rebuilt at read time, not stored. The bump 1→2 exists
-  because the Lambert block gained those axes: a store written before V1.1 phase 4
-  cannot represent a file that declared its own spheroid, so refusing beats
-  silently re-projecting it on a guessed earth.
+  flag so Code Table 3.2 user-defined spheroids survive a warm boot; gaussian
+  (V1.3 phase E4b, GRIB template 3.40): nx,ny,lon1,la1,la2,dlon,scan,earth_shape,
+  winds — the P_ny-root row-latitude table is DERIVED data recomputed bit-exactly
+  from ny at read time (`gaussian_latitudes`) and deliberately NOT serialized).
+  Precomputed projection constants are rebuilt at read time, not stored. The
+  bump 1→2 exists because the Lambert block gained those axes: a store written
+  before V1.1 phase 4 cannot represent a file that declared its own spheroid, so
+  refusing beats silently re-projecting it on a guessed earth. The bump 2→3
+  (E4b) exists because the set of valid KINDS grew (gaussian variant); old
+  readers reject the unknown kind/version loudly and the same recovery trap
+  re-ingests each affected model exactly once (docs/DECISIONS.md §16).
 * Atomicity and durability chain: every write is temp-file → `flush` → **fsync of
   the file inode** → atomic rename → directory fsync, so a query never sees a partial
   file and a crash cannot resurrect a renamed-but-unlinked name. How fsync is obtained
@@ -429,10 +435,17 @@ return f64.
 1. **Horizontal — bilinear.** lat/lon → fractional (i,j) via the model's
    projection (regular lat/lon wraps across the 359.75→0 seam; GFS scans
    north-to-south; LCC forward transform from La1,Lo1,LoV,LaD,Latin1,Latin2,
-   Dx,Dy + Code Table 3.2 earth shape, constants precomputed per grid). Exactly
+   Dx,Dy + Code Table 3.2 earth shape, constants precomputed per grid;
+   GAUSSIAN template 3.40 since V1.3 E4b: i exactly like regular lat/lon
+   incl. seam wrap, j by binary search in the precomputed P_ny-root row table
+   with LINEAR interpolation in j between neighbouring rows — spec §6.1 works
+   in grid-index space, identical rule to the other grids). Exactly
    on a node (within 1e-9 grid units) returns that node's value exactly, no
    blending. Outside the node rectangle (incl. the last half-cell at
-   non-wrapping edges) → 422 `out_of_domain`; never extrapolated. Any NaN
+   non-wrapping edges) → 422 `out_of_domain`; never extrapolated. On gaussian
+   grids the node rectangle ends at the outermost Gaussian rows (~±89.91° for
+   GFS 3072×1536): there are NO pole nodes, so lat ±90 is ALWAYS 422 — defined
+   behavior, pinned by tests. Any NaN
    among the 4 neighbors → `null` + `missing_data` (weights never renormalized).
 2. **Vertical — linear in the level coordinate** (hPa for isobaric). Exact
    stored level used directly; otherwise bracketing stored levels interpolate
@@ -570,6 +583,18 @@ criterion 0.5 prints medians only): **p50 = p90 = p99 = 1 µs, mean 1.007 µs,
 single-thread throughput ≈ 993,000 ops/s** (re-measured in the V1.2 phase-D sweep;
 the sweep also corrected a mislabelled unit on that printed line: `ops/s`,
 previously rendered `Mops/s`).
+
+**V1.3 phase E4b adds `projection/gaussian project (table + binary search)`**:
+measured back-to-back with the other two projection arms in the same session
+(E4b acceptance sweep, criterion medians): regular_ll **28.7 ns**, LCC
+**105.9 ns**, gaussian **88.6 ns**. All three arms read higher than the
+phase-6 column above (the session ran behind hour-long debug-profile realdata
+decodes — thermal/governor state, plus the Grid enum gained a variant); what
+matters is the ORDER and the absolute cost: gaussian sits between pure-affine
+regular and trig-heavy LCC exactly as its math implies (~768-entry f64 binary
+search + blend), and ~90 ns per projection stays noise against the mmap
+page-fault-dominated query budget. The row table is built once at grid
+construction; the hot path allocates nothing (`hotpath_alloc.rs` still green).
 
 **Why the point-query bench moved 136.6 -> 147.6 ns (+8%).** V1.2 phase B0 made
 vertical interpolation carry PER-SLOT level indices (a silent wrong answer when one
@@ -804,10 +829,12 @@ To close that gap manually, run `scripts/fetch_real_sample.sh` (MANUAL / NETWORK
 it fetches the `.idx` message index of live NOMADS products and HTTP-Range-extracts
 only the messages under test — a few MB total — into the gitignored
 `tests/realdata/`). With that directory present, `cargo test -p wx-ingest
---test realdata_gate` activates live-byte gates (GFS sflux skip kinds, the
-212-byte degenerate APCP, HRRR node probes replayed through the full index path
-against recorded `wgrib2 -lon` values); without it they skip cleanly, so CI
-stays offline. Recorded probes and the full diagnosis: docs/DECISIONS.md §15.
+--test realdata_gate` activates live-byte gates (GFS sflux messages now DECODE
+on template 3.40 end to end since V1.3 E4b — the gate pins decoded == total per
+file and replays TMP/UV/HGT probes through the full ingest+index path against
+recorded `wgrib2 -lon` values, plus the 212-byte degenerate APCP and HRRR node
+probes); without it they skip cleanly, so CI stays offline. Recorded probes and
+the full diagnosis: docs/DECISIONS.md §15 (E4a) and §16 (E4b acceptance table).
 See §9 Limitations for what remains unverified until you do.
 
 Beyond §9 (V1.1 additions): packing parity — each small fixture exists in six
@@ -934,14 +961,23 @@ live in §10 and docs/DECISIONS.md.
     pins all four shapes).
   * Unimplemented grid/product-definition templates beyond 3.0/3.30 and 4.0/4.8
     — same skip-and-note path (a grid we cannot project cannot be interpolated).
-    One REAL-WORLD instance pinned by the V1.3 phase E4a live fire: today's
-    operational GFS surface-flux product line (`gfs.tHHZ.sfluxgrbfFFF.grib2`)
-    rides grid template **3.40** (geostationary family, 3072 x 1536) END TO
-    END, so EVERY message in it skips as `Grid(40)` until 3.40 support exists —
-    correct-by-design, spec §4.3 mandates only 3.0 and 3.30. Since E4a the
-    skip note names kinds AND template numbers ("N skipped: X coordinate-list,
-    Y grid template 3.<t>, Z PDT 4.<t>") and each kind advances its own flat
-    counter (`wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /
+    Today's operational GFS surface-flux line (`gfs.tHHZ.sfluxgrbfFFF.grib2`)
+    rides grid template **3.40** (gaussian lat-lon, 3072 x 1536); that gap was
+    CLOSED by V1.3 phase E4b and those files now ingest and serve end to end
+    (validation evidence: docs/DECISIONS.md §16). Remaining 3.40 sub-limits,
+    all tallied under the same flat `Grid(40)` skip counter so nothing hides:
+    only FULL-GLOBAL non-thinned shapes are accepted (`nx > 0`, `ny = 2·nlat`,
+    quasi-regular flag consistent with a regular row structure) — thinned,
+    reduced-order and regional gaussian windows are rejected as `Grid(40)`
+    because their row structure needs per-row counts we do not model yet.
+    Gaussian grids also have NO node at the poles (outermost rows ~±89.91°),
+    so lat ±90 is always 422 `out_of_domain` there (defined behavior, tested).
+    And HYBRID-level upper-air fields on the current GFS line (level type 105)
+    still stay unSTORED pending phase E4c — they decode, they just match no
+    configured level spec. Since E4a the skip note names kinds AND template
+    numbers ("N skipped: X coordinate-list, Y grid template 3.<t>, Z PDT 4.<t>")
+    and each kind advances its own flat counter
+    (`wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /
     `wxpoint_skip_pdt_total`), making product-line coverage gaps visible on
     `/metrics` without reading logs (docs/DECISIONS.md §15).
 * **§9.3 wind-rotation golden is environment-blocked here.** `wgrib2 -new_grid_winds

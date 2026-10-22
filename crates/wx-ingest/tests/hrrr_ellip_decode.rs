@@ -74,6 +74,7 @@ fn ellipsoid_axes_come_from_the_file() {
                         assert!(gl.winds_grid == wg);
                     }
                     GridDef::Regular(ref _rg) => { assert!(false); }
+                    GridDef::Gaussian(ref _gg) => { assert!(false); }
                 }
             }
             // analytic values: base 255 + param offset + j*100 + i
@@ -152,6 +153,7 @@ fn oblate_rotation_and_inverse_roundtrip_at_nodes() {
                     }
                 }
                 GridDef::Regular(ref _rg) => { assert!(false); }
+                GridDef::Gaussian(ref _gg) => { assert!(false); }
             }
         }
     }
