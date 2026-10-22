@@ -274,7 +274,12 @@ pub enum FailTok {
     UnknownParam, // 404: no indexed field (param_key, level type) in any run
     NoRunCovers, // 404: valid time outside every run's stored forecast hours
     LevelOutOfRange, // 422: requested level outside stored range
-    StatTimeGuard, // 422: template 4.8 field, exact fh required
+    /// 422: template 4.8 data forbids linear time interpolation. V1.3 phase
+    /// E1 payload (SECONDS past the run time): `(fh_a, fh_b, offender, kind
+    /// code)` — the refused bracket (−1 when nothing brackets at all), which
+    /// forecast hour triggered the guard, and its STAT_* kind code. The
+    /// message names them so the caller sees WHICH hour forbids blending.
+    StatTimeGuard(i64, i64, i64, u8),
     TimeExactOnly, // 422: time_interp=none and no exact fh
     OutOfDomain, // 422: lat/lon outside grid node rectangle
 }
@@ -285,7 +290,7 @@ pub fn fail_http_status(t: FailTok) -> u16 {
         FailTok::UnknownParam => { return 404; }
         FailTok::NoRunCovers => { return 404; }
         FailTok::LevelOutOfRange => { return 422; }
-        FailTok::StatTimeGuard => { return 422; }
+        FailTok::StatTimeGuard(..) => { return 422; }
         FailTok::TimeExactOnly => { return 422; }
         FailTok::OutOfDomain => { return 422; }
     }
@@ -297,7 +302,7 @@ pub fn fail_token(t: FailTok) -> String {
         FailTok::UnknownParam => { return "unknown_param".to_string(); }
         FailTok::NoRunCovers => { return "no_run_covers".to_string(); }
         FailTok::LevelOutOfRange => { return "level_out_of_range".to_string(); }
-        FailTok::StatTimeGuard => { return "stat_time_guard".to_string(); }
+        FailTok::StatTimeGuard(..) => { return "stat_time_guard".to_string(); }
         FailTok::TimeExactOnly => { return "time_exact_only".to_string(); }
         FailTok::OutOfDomain => { return "out_of_domain".to_string(); }
     }
@@ -340,6 +345,12 @@ pub fn answer_param<'r>(snap: &'r IndexSnapshot, model: &'r str, pin: Option<i64
             let mut acc_level = false;
             let mut acc_stat = false;
             let mut acc_exact = false;
+            // V1.3 E1: first guard occurrence carries the naming detail
+            // (bracket + offending forecast hour + its kind code).
+            let mut g_a = -1i64;
+            let mut g_b = -1i64;
+            let mut g_off = -1i64;
+            let mut g_kind = 255u8;
             let mut ri = m.runs.len();
             while ri > 0 {
                 ri -= 1;
@@ -401,7 +412,15 @@ pub fn answer_param<'r>(snap: &'r IndexSnapshot, model: &'r str, pin: Option<i64
                     Err(se) => {
                         match se {
                             SelectError::LevelOutOfRange => { acc_level = true; }
-                            SelectError::StatTimeGuard => { acc_stat = true; }
+                            SelectError::StatTimeGuard(a, b, o, kk) => {
+                                if !acc_stat {
+                                    g_a = a;
+                                    g_b = b;
+                                    g_off = o;
+                                    g_kind = kk;
+                                }
+                                acc_stat = true;
+                            }
                             SelectError::TimeExactOnly => { acc_exact = true; }
                             _ => {}
                         }
@@ -413,7 +432,7 @@ pub fn answer_param<'r>(snap: &'r IndexSnapshot, model: &'r str, pin: Option<i64
                 return Err(FailTok::LevelOutOfRange);
             }
             if acc_stat {
-                return Err(FailTok::StatTimeGuard);
+                return Err(FailTok::StatTimeGuard(g_a, g_b, g_off, g_kind));
             }
             if acc_exact {
                 return Err(FailTok::TimeExactOnly);

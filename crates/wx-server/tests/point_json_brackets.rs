@@ -192,6 +192,8 @@ pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
     return IdxFh {
         fh_secs: fh_secs,
         field: mf.clone(),
+        stat_processed: false,
+        stat_kind_code: 0,
         stat_has_range: false,
         stat_begin_secs: 0,
         stat_end_secs: 0,

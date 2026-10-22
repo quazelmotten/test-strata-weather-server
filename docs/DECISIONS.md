@@ -2228,3 +2228,89 @@ headers, accumulation queries keep returning 422 `stat_time_guard`).
 Every one FAILS against pre-fix behavior by construction (pre-fix: 200 + linear
 interp after manifest loss; no notes/errors; REC_OK stuck on manifest failure;
 no field-version pre-check at all; no stat bytes to round-trip).
+
+## 11. V1.3 phase E1 — per-forecast-hour stat guards + loud stat-collision rejection (2026-10-22)
+
+**The defects (AUDIT-confirmed, verified by the orchestrator).**
+(1) `find_group` keyed store groups on `(run epoch, param, level type, fh)` ONLY.
+Two PDT 4.8 messages for the SAME param/level/fh with DIFFERENT statistical
+kinds or windows (a plausible delivery: a 0–6 h AND a 0–3 h accumulation for one
+valid time) merged into ONE group: `merge_field` silently kept the FIRST plane
+and the survivor's window was applied to data that did not come from it. No
+note, no counter, nothing observable.
+(2) The §6.3 time guard was decided from ONE FIELD-LEVEL flag
+(`FieldDef.stat_processed`), which came from whichever forecast hour REGISTERED
+FIRST. A stack mixing an instantaneous fh with an accumulated one therefore
+answered differently depending on message order: instantaneous-first let mid-time
+queries SILENTLY LINEAR-BLEND across the accumulation (wrong number), while
+accumulation-first wrongly refused brackets between two CLEAN hours. E0 had made
+each `.bin` header carry its own stat state; the index/guard simply did not use
+it per-fh yet.
+
+**Guard semantics chosen (fail closed, exactness preserved).** The decision now
+uses ONLY the slots the answer would touch, read from `IdxFh.stat_processed` +
+`IdxFh.stat_kind_code` (per-fh, fed from each file's own header on warm start and
+from its group's messages on cold ingest — identical bytes, identical truth):
+* EXACT fh hit → answers from that slot's OWN state, guarded or not (§6.3 asks
+  for exactness, not absence of processing).
+* LINEAR interpolation → BOTH bracket endpoints must be instantaneous; if either
+  guards, 422 `stat_time_guard` naming the refused bracket, the offending hour
+  and its kind (`SelectError::StatTimeGuard(fh_a_secs, fh_b_secs, offender_secs,
+  kind_code)` → richer HTTP message; reason token unchanged).
+* NO bracket at all while ANY stored slot guards → fail closed with the same
+  guard naming the FIRST guarded hour, instead of silently falling through to
+  older runs. This preserves every uniform-stack behavior pinned before E1
+  (incl. the single-slot accumulation in `frac_small`) and extends it
+  conservatively to mixed stacks.
+* `time_interp=none` outranks the guard (422 `time_exact_only` as before).
+`resolve_field_times` became STRUCTURAL-only (exact → none → single → bracket);
+the guard layer lives in `select_run` + `stat_guard_details` (cold error path
+only — the hot success path pays two scalar flag reads, zero allocations).
+Field-level `RegField.stat_processed/stat_kind` (inventory display only) is now
+RECOMPUTED deterministically from the per-fh truth: true iff ANY fh guards,
+kind = the first guarding fh's kind (fhs sorted ascending ⇒ warm start and cold
+ingest converge regardless of registration order — killing the display half of
+defect (2)). The registry REPLACE path also updates ALL per-fh stat fields now
+(previously refreshed only the mmap handle, leaving stale metadata behind).
+
+**Collision policy (orchestrator decision, spec silent).** The group key gained
+the full statistical identity `(stat_processed, stat_kind, begin_secs, end_secs,
+step_secs)`, so stat-distinct messages are DISTINCT groups — but storage layout
+is one file per `(param, level_type, fh)` and the query API has no range
+selector, so both cannot be stored without a filename-scheme change, which is
+explicitly OUT for this release. Instead the write phase CLAIMS each target path
+in MESSAGE ORDER (claim recorded BEFORE the write so ownership never depends on
+I/O outcomes): the first group wins; every later distinct group targeting an
+already-claimed path within the SAME source file is skipped-and-noted ONCE per
+occurrence (naming both windows) and counted in `IngestCounters.stat_collisions`
++ `LiveCounters.stat_collisions` + Prometheus `wxpoint_stat_collisions_total` —
+never an error, never counted among `groups_written`, so the file still records
+ingested. Same-key-same-window duplicates keep merging as before. Cross-round
+re-delivery of a DIFFERENT window for an existing fh still follows E0 merge
+semantics (newest decode rewrites the header); only WITHIN-file collisions are
+detected this release. Range selection (API parameter or window-carrying
+filenames) is documented future work.
+
+**API-visible changes.** No new status codes or reason tokens. The
+`stat_time_guard` MESSAGE is now specific (bracket + offending hour + kind;
+sentinel payload falls back to the old static text). New gauge
+`wxpoint_stat_collisions_total`. `/v1/inventory` JSON shape unchanged (field-level
+flags stay, now deterministic; per-fh ranges were already correct).
+
+**Gates added:** `mixed_stack_instantaneous_first_guards_per_forecast_hour` and
+`mixed_stack_accumulation_first_answers_clean_brackets` (`mixed_stat_stack.rs`;
+fixtures `mixstat_small.grib2` / `mixstat_rev_small.grib2`, values analytic and
+linear in fc hour) — forward order pins the guard payload where pre-fix blended
+253.0 silently, reverse order pins the clean-bracket answer 265.0 where pre-fix
+over-blocked, and both pin identical per-fh flags + field-level display
+regardless of message order (order independence);
+`two_accumulation_windows_one_valid_time_first_wins_loudly` (`stat_collision.rs`;
+fixture `collide_small.grib2`) — winner's window + plane proven from RAW header
+bytes and a value probe (loser's plane would read 510 vs 10), note exactly once,
+counter == 1 (live mirror too), other params unaffected, rejected window absent
+from the manifest. `point_http.rs` additionally pins the rendered message naming
+the bracket/hour/kind and the presence of the new gauge. Discrimination was
+verified EMPIRICALLY: with the guard reverted to the field-level flag and the
+group key reverted to base-only (API surface kept, so the tests compile), all
+three new tests FAIL — forward order accepts the silent blend, reverse order
+refuses the clean bracket, and the collision counter/note do not exist.

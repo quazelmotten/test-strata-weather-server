@@ -286,7 +286,7 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
         Ok(_c) => { assert!(false); return; }
         Err(e) => {
             match e {
-                SelectError::StatTimeGuard => {}
+                SelectError::StatTimeGuard(..) => {}
                 _ => { assert!(false); return; }
             }
         }
@@ -401,7 +401,7 @@ fn corrupt_manifest_boot_is_loud_counted_and_still_answers_right() {
         Ok(_) => { assert!(false); return; }
         Err(e) => {
             match e {
-                SelectError::StatTimeGuard => {}
+                SelectError::StatTimeGuard(..) => {}
                 _ => { assert!(false); return; }
             }
         }

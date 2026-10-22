@@ -228,7 +228,11 @@ time made them PROVABLY obsolete — vetoed before decode, never counted as erro
 state record is written for them), `wxpoint_quarantined_files_total` (decode failures recorded WITH their content
 hash so a corrupt file is not retried every round), `wxpoint_ingest_groups_written_total`
 (the write-once grouping unit — compare it with a message count to see the
-amplification phase B removed), and `wxpoint_ingest_lag_seconds` (newest ingested
+amplification phase B removed), `wxpoint_stat_collisions_total` (V1.3 phase E1:
+statistically-distinct groups REJECTED because an earlier group of the same
+source file already claimed their field file — first-in-message-order wins;
+skipped and logged, never counted as errors), and `wxpoint_ingest_lag_seconds`
+(newest ingested
 file mtime → now). Every ingest-side gauge reads `max(legacy store, LIVE pipeline
 mirror)`, and the live mirror advances after EVERY consumed FILE, so `/metrics`
 reflects a scan round that is still running.
@@ -376,11 +380,25 @@ return f64.
    run that covers it answers), and `run=` pins one exactly. Both bracketing slots
    must exist when interpolating. Exact fh match uses it directly (no blending,
    no `time` object in the response). The reported `forecast_hours` bracket converts
-   back to HOURS per §7 (e.g. `[0.5,1]`). Statistically processed fields (PDT 4.8
-   accumulations/averages/max/min) NEVER interpolate in time: exact fh required,
-   else 422 `stat_time_guard` — interpolating an accumulation is wrong.
-   `time_interp=none` requires exactness for any field (422 `time_exact_only`).
-   A valid time outside every run's stored hours → 404 `no_run_covers`.
+   back to HOURS per §7 (e.g. `[0.5,1]`). Statistically processed data (PDT 4.8
+   accumulations/averages/max/min) NEVER blends in time, and since V1.3 phase E1
+   the guard is decided PER FORECAST HOUR, not per field: each `.bin` header
+   carries its own statistical state and the decision uses ONLY the slots the
+   answer would touch. An EXACT fh always answers from its own slot (exactness
+   is what §6.3 asks for, not absence of processing). LINEAR interpolation
+   requires BOTH bracket endpoints to be instantaneous; if either endpoint came
+   from template 4.8 the query is refused with 422 `stat_time_guard` and the
+   message NAMES the refused bracket, the offending forecast hour and its kind
+   (e.g. "linear time interpolation between forecast hours 0 h and 6 h would
+   blend statistically processed data: forecast hour 6 h is 'accumulation' …").
+   A stack that mixes instantaneous and processed hours therefore interpolates
+   FREELY across clean brackets and refuses exactly the dirty ones — regardless
+   of which message registered first. If NO bracket exists at all and ANY
+   stored slot of that field is statistically processed, the query fails closed
+   with the same guard (naming the first processed hour) instead of silently
+   trying older runs. `time_interp=none` outranks the guard (422
+   `time_exact_only`). A valid time outside every run's stored hours → 404
+   `no_run_covers`.
 
 ## 6. Ingest pipeline
 
@@ -753,6 +771,21 @@ live in §10 and docs/DECISIONS.md.
   the log (`found bin version 1, current 2`), so a pre-E0 store upgrades itself
   on first boot instead of mis-parsing headers
   (`v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source`).
+* **Multiple accumulation windows for ONE valid time (V1.3 phase E1).** Storage
+  layout is ONE field file per `(run, param, level type, forecast hour)` and the
+  query API has no range-selection parameter, so when one source file delivers
+  TWO statistically DISTINCT PDT 4.8 groups for the same param/level/fh (e.g. a
+  0–6 h AND a 0–3 h accumulation for one valid time) BOTH cannot be stored under
+  the current scheme. Policy: FIRST-IN-MESSAGE-ORDER WINS; every later distinct
+  group targeting the already-claimed path within the same file is REJECTED
+  LOUDLY — one ingest-log note per occurrence naming both windows, counted in
+  `wxpoint_stat_collisions_total` (and `IngestCounters.stat_collisions`) — never
+  silently merged (pre-E1 the second plane was dropped without a word) and never
+  counted as an error, so the file still records ingested. Same-key-same-window
+  duplicate messages keep merging as before. Exposing BOTH windows (a range
+  selector on `/v1/point`, or a filename scheme carrying the window) is future
+  work; until then the rejected window is simply not queryable. Pinned by
+  `tests/stat_collision.rs`.
 * **Stability timing is MONOTONIC (V1.2 phase B0).** The file-stability window is
   measured with `std::time::Instant`, never against wall-clock mtimes, so NTP step-
   backs, container restore or VM pause cannot freeze ingest. File IDENTITY is still

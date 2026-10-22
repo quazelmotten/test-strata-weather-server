@@ -23,7 +23,7 @@
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 use wx_core::grid::GridDef;
-use wx_core::storage::{MmapField};
+use wx_core::storage::{MmapField, STAT_INSTANTANEOUS};
 use wx_core::interp::{
     EXACT_NODE_EPS, TIME_MATCH_EPS, LevelInterpMethod, TimeInterpMode, HorizMethod,
     InterpInfo, PointError, PointValue, QueryResult, VertMeta, TimeMeta,
@@ -32,16 +32,33 @@ use wx_core::interp::{
 
 /// A forecast-hour slot inside one field entry. `fh_secs` is the offset from
 /// the run time IN SECONDS (an exact key for fractional forecast hours); the
-/// PDT 4.8 statistical range for THIS slot travels with it so a restart can
+/// PDT 4.8 statistical state for THIS slot travels with it so a restart can
 /// restore it and future endpoints can report it.
+///
+/// V1.3 phase E1: `stat_processed` + `stat_kind_code` are PER FORECAST HOUR,
+/// read from each field file's own header (warm) or its group's messages
+/// (cold). The §6.3 time guard is decided FROM THESE PER-SLOT FLAGS, never
+/// from the field-level flag: a stack mixing an instantaneous fh with an
+/// accumulated one must guard exactly the brackets that TOUCH the
+/// statistically processed slot (fail closed), and must still interpolate
+/// freely between two clean slots.
 #[derive(Clone)]
 pub struct IdxFh {
     pub fh_secs: i64,
     pub field: Arc<MmapField>, // opened at index build time
+    pub stat_processed: bool,   // this fh came from template 4.8
+    pub stat_kind_code: u8,     // wx_core::storage STAT_* code
     pub stat_has_range: bool,
     pub stat_begin_secs: i64, // offsets from the run time
     pub stat_end_secs: i64,
     pub stat_step_secs: i64,
+}
+
+/// Does THIS slot's own statistical state forbid linear time interpolation?
+/// Mirrors `wx_core::storage::StatMeta::guards_time` (fail closed: anything
+/// not explicitly instantaneous guards).
+pub fn slot_time_guarded(f: &IdxFh) -> bool {
+    return f.stat_processed || f.stat_kind_code != STAT_INSTANTANEOUS;
 }
 
 #[derive(Clone)]
@@ -114,15 +131,46 @@ impl IndexSnapshot {
                     match fe {
                         None => { continue; }
                         Some(f) => {
-                            let pair = resolve_field_times(&f.fd.fhs, want_fh_secs, mode, f.fd.stat_processed);
+                            let pair = resolve_field_times(&f.fd.fhs, want_fh_secs, mode);
                             match pair {
                                 Err(e) => {
                                     match e {
-                                        PointError::NoTimeBracket => { continue; }
+                                        PointError::NoTimeBracket => {
+                                            // V1.3 E1 fail-closed refinement: this
+                                            // run CANNOT bracket the wanted time,
+                                            // but if any of its stored slots is
+                                            // statistically processed, refuse with
+                                            // the NAMED guard instead of silently
+                                            // trying older runs (preserves the
+                                            // pre-E1 behavior for uniform-stat
+                                            // stacks incl. single-slot
+                                            // accumulations, see frac_small APCP).
+                                            let d = stat_guard_details(&f.fd.fhs, want_fh_secs, mode);
+                                            if d.2 >= 0 {
+                                                return Err(SelectError::StatTimeGuard(d.0, d.1, d.2, d.3));
+                                            }
+                                            continue;
+                                        }
                                         _ => { return Err(map_time_err(e)); }
                                     }
                                 }
                                 Ok(p) => {
+                                    // EXACT hits (p.0 == p.1) answer from that
+                                    // slot's OWN state, guarded or not (spec §6.3
+                                    // requires an exact match, not absence).
+                                    // INTERPOLATION needs BOTH slots clean.
+                                    if p.0 != p.1 {
+                                        let ga = slot_time_guarded(&f.fd.fhs[p.0]);
+                                        let gb = slot_time_guarded(&f.fd.fhs[p.1]);
+                                        if ga || gb {
+                                            let oi = if ga { p.0 } else { p.1 };
+                                            let oa = f.fd.fhs[p.0].fh_secs;
+                                            let ob = f.fd.fhs[p.1].fh_secs;
+                                            let os = f.fd.fhs[oi].fh_secs;
+                                            let kc = f.fd.fhs[oi].stat_kind_code;
+                                            return Err(SelectError::StatTimeGuard(oa, ob, os, kc));
+                                        }
+                                    }
                                     return Ok((p.0, p.1, run, f));
                                 }
                             }
@@ -150,25 +198,44 @@ pub enum SelectError {
     NoRunCovers, // server: 404
     LevelOutOfRange, // server: 422
     TimeExactOnly, // server: 422
-    StatTimeGuard, // server: 422
+    /// server: 422. V1.3 phase E1 payload, all SECONDS past the run time:
+    /// `(fh_a_secs, fh_b_secs, offender_fh_secs, offender_kind_code)` — the
+    /// interpolation bracket that was refused (−1/−1 when nothing brackets
+    /// the wanted time at all), which slot inside it triggered the §6.3
+    /// guard, and that slot's `wx_core::storage` STAT_* kind code. The
+    /// server renders these into the message so operators see WHICH
+    /// forecast hour forbids blending, not just that one did.
+    StatTimeGuard(i64, i64, i64, u8), // server: 422
 }
 
 fn map_time_err(e: PointError) -> SelectError {
     match e {
         PointError::TimeExactOnly => { return SelectError::TimeExactOnly; }
-        PointError::StatTimeGuard => { return SelectError::StatTimeGuard; }
+        // Defensive: `resolve_field_times` no longer emits this variant (the
+        // guard is decided PER SLOT by the caller, which supplies the real
+        // payload); the sentinel shape keeps any stray generic-path error
+        // rendering as the plain pre-E1 message.
+        PointError::StatTimeGuard => { return SelectError::StatTimeGuard(-1, -1, -1, 255); }
         _ => { return SelectError::NoRunCovers; }
     }
 }
 
-/// Slice-free twin of wx-core `resolve_times` (V1.1 phase 5): resolves the
-/// forecast-hour bracket straight out of the index slot list so selection
-/// allocates nothing. Bit-for-bit identical to materializing `Vec<f64>` of
-/// `fh_secs as f64` and calling `resolve_times`: same widening per element,
-/// same TIME_MATCH_EPS exact-match scan, same guard order (exact -> none ->
-/// stat -> single -> bracket). Equivalence proven in tests/alloc_free_select.rs.
-pub fn resolve_field_times(fhs: &[IdxFh], want_fh_secs: f64, mode: TimeInterpMode,
-                           stat_processed: bool) -> Result<(usize, usize), PointError> {
+/// Slice-free STRUCTURAL time resolution (V1.1 phase 5, per-fh guard split in
+/// V1.3 phase E1): resolves the forecast-hour bracket straight out of the
+/// index slot list so selection allocates nothing. Bit-for-bit identical to
+/// materializing `Vec<f64>` of `fh_secs as f64` and calling `resolve_times`
+/// with `stat_processed = false`: same widening per element, same
+/// TIME_MATCH_EPS exact-match scan, same order (exact -> none -> single ->
+/// bracket). Equivalence proven in tests/alloc_free_select.rs.
+///
+/// V1.3 E1: the §6.3 statistical guard is NO LONGER decided here from one
+/// field-level flag. The caller (`select_run`) vets the SPECIFIC slots the
+/// answer would blend — exact hits use their own state (always allowed),
+/// interpolation requires BOTH bracket endpoints instantaneous, and a run
+/// that cannot bracket at all while holding statistically processed slots
+/// fails closed with the guard (see [`stat_guard_details`]).
+pub fn resolve_field_times(fhs: &[IdxFh], want_fh_secs: f64, mode: TimeInterpMode)
+    -> Result<(usize, usize), PointError> {
     let n = fhs.len();
     if n == 0 {
         return Err(PointError::NoTimeBracket);
@@ -184,9 +251,6 @@ pub fn resolve_field_times(fhs: &[IdxFh], want_fh_secs: f64, mode: TimeInterpMod
     if mode == TimeInterpMode::None {
         return Err(PointError::TimeExactOnly);
     }
-    if stat_processed {
-        return Err(PointError::StatTimeGuard);
-    }
     if n == 1 {
         return Err(PointError::NoTimeBracket);
     }
@@ -200,6 +264,68 @@ pub fn resolve_field_times(fhs: &[IdxFh], want_fh_secs: f64, mode: TimeInterpMod
         k2 += 1;
     }
     return Err(PointError::NoTimeBracket);
+}
+
+/// Name the §6.3 guard for a candidate run whose structural resolution
+/// FAILED (cold error path only — the hot success path never calls this).
+/// Returns `(fh_a_secs, fh_b_secs, offender_fh_secs, offender_kind_code)`
+/// with SECONDS past the run time, or `(-1, -1, -1, 255)` when NO slot of
+/// this field is statistically processed (the caller then keeps the plain
+/// no-bracket fallthrough and tries older runs). When a bracket exists but
+/// an endpoint guards, the bracket is reported; otherwise the first guarded
+/// slot is reported with `fh_a = fh_b = -1` (nothing can blend it).
+pub fn stat_guard_details(fhs: &[IdxFh], want_fh_secs: f64, mode: TimeInterpMode)
+    -> (i64, i64, i64, u8) {
+    let n = fhs.len();
+    // first guarded slot (ascending fh order — deterministic naming).
+    let mut gi = usize::MAX;
+    let mut k = 0;
+    while k < n {
+        if slot_time_guarded(&fhs[k]) {
+            gi = k;
+            break;
+        }
+        k += 1;
+    }
+    if gi == usize::MAX {
+        return (-1, -1, -1, 255);
+    }
+    // exact hit: that slot answers for itself; guard only if IT guards.
+    let mut k0 = 0;
+    while k0 < n {
+        let h = fhs[k0].fh_secs as f64;
+        if (h - want_fh_secs).abs() <= TIME_MATCH_EPS {
+            if slot_time_guarded(&fhs[k0]) {
+                let s = fhs[k0].fh_secs;
+                return (s, s, s, fhs[k0].stat_kind_code);
+            }
+            return (-1, -1, -1, 255);
+        }
+        k0 += 1;
+    }
+    if mode == TimeInterpMode::None {
+        return (-1, -1, -1, 255); // TimeExactOnly outranks the guard
+    }
+    if n >= 2 {
+        let mut k2 = 1;
+        while k2 < n {
+            let a = fhs[k2 - 1].fh_secs as f64;
+            let b = fhs[k2].fh_secs as f64;
+            if a != b && (a - want_fh_secs) * (b - want_fh_secs) <= 0.0 {
+                let ga = slot_time_guarded(&fhs[k2 - 1]);
+                let gb = slot_time_guarded(&fhs[k2]);
+                if ga || gb {
+                    let oi = if ga { k2 - 1 } else { k2 };
+                    return (fhs[k2 - 1].fh_secs, fhs[k2].fh_secs,
+                            fhs[oi].fh_secs, fhs[oi].stat_kind_code);
+                }
+                return (-1, -1, -1, 255); // clean bracket: not a guard case
+            }
+            k2 += 1;
+        }
+    }
+    // no bracket at all: fail closed, name the first guarded slot.
+    return (-1, -1, fhs[gi].fh_secs, fhs[gi].stat_kind_code);
 }
 
 // ---------------------------------------------------------------------------

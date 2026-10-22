@@ -432,7 +432,7 @@ fn e2e_roundtrip_through_index() {
                 Ok(_) => { assert!(false); }
                 Err(g) => {
                     match g {
-                        SelectError::StatTimeGuard => {}
+                        SelectError::StatTimeGuard(..) => {}
                         SelectError::TimeExactOnly => {}
                         _ => { assert!(false); }
                     }

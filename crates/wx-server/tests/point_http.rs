@@ -328,6 +328,11 @@ fn error_status_table() {
             let r4 = rt.block_on(fetch(svc.clone(), e4.to_string()));
             assert!(r4.0 == 422);
             assert!(has(&r4.1, "\"error\":\"stat_time_guard\""));
+            // V1.3 phase E1: the message NAMES the refused bracket and WHICH
+            // forecast hour forbids blending (per-fh guard payload). Pre-E1
+            // the message was a static string naming no hour at all.
+            assert!(has(&r4.1, "between forecast hours 0 h and 6 h"));
+            assert!(has(&r4.1, "forecast hour 0 h is 'accumulation'"));
 
             // APCP exact fh 0 answers 10 (guard does not break exact matches)
             let e5 = "/v1/point?model=stat&param=APCP&level=surface&lat=20&lon=240&valid=2026-10-19T12:00:00Z";
@@ -462,6 +467,8 @@ fn meta_endpoints_and_metrics() {
             assert!(has(&rx.1, "wxpoint_query_latency_us_bucket{le=\"+inf\"}"));
             assert!(has(&rx.1, "wxpoint_ingest_lag_seconds"));
             assert!(has(&rx.1, "wxpoint_ingested_files_total"));
+            // V1.3 phase E1: stat-collision rejection is observable too.
+            assert!(has(&rx.1, "wxpoint_stat_collisions_total"));
         }
     }
     rm_tree(&root);

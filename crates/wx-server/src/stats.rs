@@ -58,6 +58,11 @@ pub struct QueryStats {
     /// is already full (see `Pipeline.retention_skip_reason`). Counted once per
     /// (file,content hash), never an error.
     pub retention_skipped: AtomicU64,
+    /// V1.3 phase E1: statistically-distinct groups rejected because another
+    /// group already claimed their field file within one source file
+    /// (wxpoint_stat_collisions_total; fed by the LIVE mirror only — the
+    /// legacy setters predate this counter).
+    pub stat_collisions: AtomicU64,
     /// Slot holding the ingest pipeline's LIVE counter mirror (V1.2 phase B).
     /// Detached (fresh zeros) until [`QueryStats.attach_live`] points it at the
     /// Pipeline's own `Arc<LiveCounters>`; from then on `/metrics` reflects
@@ -209,6 +214,15 @@ impl QueryStats {
         }
         out = format!("{0}{1}", out, "\nwxpoint_retention_skipped_files_total ");
         out = format!("{0}{1}", out, v_stale);
+        // V1.3 phase E1: statistically-distinct groups rejected inside one
+        // source file (first-in-message-order wins; loud, never an error).
+        let mut v_col = self.stat_collisions.load(Ordering::Relaxed);
+        let l_col = lv.stat_collisions.load(Ordering::Relaxed);
+        if l_col > v_col {
+            v_col = l_col;
+        }
+        out = format!("{0}{1}", out, "\nwxpoint_stat_collisions_total ");
+        out = format!("{0}{1}", out, v_col);
         // V1.2 phase D: write-amplification observability straight from the wx-core
         // storage counters (renames / bytes handed to writers / fsync syscalls).
         // These are PROCESS-WIDE totals since boot, which is exactly what an ingest
@@ -297,6 +311,7 @@ pub fn new_stats_with(live: Arc<LiveCounters>) -> Arc<QueryStats> {
         quarantined_files: AtomicU64::new(0),
         groups_written: AtomicU64::new(0),
         retention_skipped: AtomicU64::new(0),
+        stat_collisions: AtomicU64::new(0),
         live_slot: Mutex::<Arc<LiveCounters>>::new(live),
     };
     return Arc::new(qs);

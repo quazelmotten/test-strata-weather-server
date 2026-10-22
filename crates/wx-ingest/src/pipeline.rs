@@ -12,7 +12,8 @@ use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, sta
 use crate::store::{write_grid_bin, merge_write_field_batch, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, le_u32_at, GRID_VERSION};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
 use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot, StatMeta,
-                       BIN_VERSION, bin_version_of_path, stat_kind_code, stat_kind_name};
+                       BIN_VERSION, bin_version_of_path, stat_kind_code, stat_kind_name,
+                       STAT_INSTANTANEOUS};
 use memmap2::Mmap;
 use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
@@ -44,6 +45,11 @@ use serde::Deserialize;
 pub struct RegFh {
     pub fh_secs: i64,
     pub field: Arc<MmapField>,
+    /// V1.3 phase E1: the §6.3 guard travels PER FORECAST HOUR (each .bin
+    /// header carries its own state; the query path decides from THESE, never
+    /// from the field-level flag below, which is display/inventory only).
+    pub stat_processed: bool,
+    pub stat_kind_code: u8, // wx_core::storage STAT_* code
     pub stat_has_range: bool,
     pub stat_begin_secs: i64,
     pub stat_end_secs: i64,
@@ -138,6 +144,8 @@ impl RegModel {
             Some(_) => {}
         }
         let ri2 = ri.unwrap();
+        // derive the CODE before `stat_kind` may be MOVED into a fresh field
+        let kind_code = stat_kind_code(stat_kind.as_str());
         let mut fi = find_field_idx(&self.runs[ri2].fields, &fk);
         match fi {
             None => {
@@ -181,6 +189,8 @@ impl RegModel {
                 self.runs[ri2].fields[fi2].fhs.push(RegFh {
                     fh_secs: fh_secs,
                     field: field,
+                    stat_processed: stat_processed,
+                    stat_kind_code: kind_code,
                     stat_has_range: stat_has_range,
                     stat_begin_secs: stat_begin_secs,
                     stat_end_secs: stat_end_secs,
@@ -196,8 +206,45 @@ impl RegModel {
                     }
                 }
             }
-            Some(ki2) => { self.runs[ri2].fields[fi2].fhs[ki2].field = field; }
+            // REPLACE path (re-delivery / warm rebuild of an existing slot):
+            // EVERY statistical field follows the newest durable bytes —
+            // pre-E1 this refreshed only the handle and left stale per-fh
+            // state behind (V1.3 E0 established "newest decode wins" for the
+            // .bin header; E1 makes the registry agree).
+            Some(ki2) => {
+                self.runs[ri2].fields[fi2].fhs[ki2].field = field;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_processed = stat_processed;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_kind_code = kind_code;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_has_range = stat_has_range;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_begin_secs = stat_begin_secs;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_end_secs = stat_end_secs;
+                self.runs[ri2].fields[fi2].fhs[ki2].stat_step_secs = stat_step_secs;
+            }
         }
+        // FIELD-LEVEL flags (inventory display only since V1.3 E1): recompute
+        // deterministically from the per-fh truth — `stat_processed` is true
+        // iff ANY stored forecast hour guards time interpolation, `stat_kind`
+        // names the FIRST guarding forecast hour (fhs are sorted ascending,
+        // so warm start and cold ingest converge on the same answer no matter
+        // which message registered first: that registration-order coin flip
+        // was exactly defect AUDIT-confirmed (2)).
+        let mut any_guard = false;
+        let mut kind_name = "instantaneous".to_string();
+        {
+            let fref = &self.runs[ri2].fields[fi2];
+            for e in &fref.fhs {
+                if e.stat_processed || e.stat_kind_code != STAT_INSTANTANEOUS {
+                    any_guard = true;
+                    kind_name = stat_kind_name(e.stat_kind_code).to_string();
+                    break;
+                }
+            }
+            if !any_guard {
+                kind_name = "instantaneous".to_string();
+            }
+        }
+        self.runs[ri2].fields[fi2].stat_processed = any_guard;
+        self.runs[ri2].fields[fi2].stat_kind = kind_name;
     }
 }
 
@@ -235,6 +282,13 @@ pub struct IngestCounters {
     /// (path,content-hash) verdict — like the quarantine counters, never once
     /// per scan round — and NEVER added to `errors`.
     pub retention_skipped_files: u64,
+    /// V1.3 phase E1 STAT COLLISIONS: statistically-distinct GROUPS inside one
+    /// source file that target the SAME field file `(run, param, level type,
+    /// forecast hour)` — e.g. two accumulation windows delivered for one valid
+    /// time. FIRST-IN-MESSAGE-ORDER wins; every rejected group is noted once
+    /// and counted here (NEVER an error). Range selection in the query API is
+    /// future work (docs/DECISIONS.md V1.3 E1).
+    pub stat_collisions: u64,
 }
 
 /// Live mirror of the ingest counters (V1.2 phase B). The pipeline updates this
@@ -251,6 +305,10 @@ pub struct LiveCounters {
     pub quarantined_files: AtomicU64,
     pub groups_written: AtomicU64,
     pub retention_skipped: AtomicU64,
+    /// V1.3 phase E1: statistically-distinct groups rejected because another
+    /// group already claimed their field file within the same source file
+    /// (first-in-message-order wins). Never an error; see `IngestCounters`.
+    pub stat_collisions: AtomicU64,
     pub last_mtime_ns: AtomicI64,
     /// Bumped once per consumed file; the printer side compares it against the
     /// last value it saw to decide whether a fresh progress line exists.
@@ -282,6 +340,7 @@ impl LiveCounters {
             quarantined_files: AtomicU64::new(0),
             groups_written: AtomicU64::new(0),
             retention_skipped: AtomicU64::new(0),
+            stat_collisions: AtomicU64::new(0),
             last_mtime_ns: AtomicI64::new(0),
             progress_seq: AtomicU64::new(0),
             last_msg: Mutex::<String>::new("".to_string()),
@@ -331,6 +390,13 @@ impl LiveCounters {
         let _a = self.retention_skipped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One STAT COLLISION rejected (V1.3 phase E1): a statistically-distinct
+    /// group lost its field file to an earlier group of the same source file.
+    /// Counted once per rejected GROUP, never as an error.
+    pub fn bump_stat_collision(self: &Self) {
+        let _a = self.stat_collisions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Monotone merge of ABSOLUTE values (used by `QueryStats.set_ingest`, which
     /// stores whole-counter values rather than deltas). Compare-store keeps this
     /// safe even when the pipeline has already advanced past the caller's snapshot
@@ -375,6 +441,7 @@ impl LiveCounters {
             quarantined_files: self.quarantined_files.load(Ordering::Relaxed),
             groups_written: self.groups_written.load(Ordering::Relaxed),
             retention_skipped_files: self.retention_skipped.load(Ordering::Relaxed),
+            stat_collisions: self.stat_collisions.load(Ordering::Relaxed),
         };
     }
 }
@@ -917,7 +984,7 @@ impl Pipeline {
             clock: MonoClock::new_clock(),
             registry: Vec::<RegModel>::new(),
             shared: Arc::new(SharedIndex { store: ArcSwap::from_pointee(IndexSnapshot { models: Vec::<IdxModel>::new() }) }),
-            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0 },
+            counters: IngestCounters { ingested_files: 0, errors: 0, skipped_messages: 0, last_mtime_ns: 0, ignored_files: 0, quarantined_files: 0, groups_written: 0, retention_skipped_files: 0, stat_collisions: 0 },
             live: Arc::new(LiveCounters::new_live()),
             wind_violation: false,
             stale_verdicts: Vec::<(String, String)>::new(),
@@ -1700,11 +1767,20 @@ fn find_wind(pend: &Vec<WindPending>, key: (i64, i64, u8, f64)) -> Option<usize>
 
 /// One WRITE UNIT (V1.2 phase B): every message of ONE source file that lands in
 /// the SAME field file is merged and written ONCE. The group key is
-/// `(run epoch, param key, level type code, forecast-hour offset in seconds)` —
-/// the WindPending-style keying extended with the run EPOCH, because ONE file can
-/// carry TWO runs (`tests/fixtures/frac_small.grib2`) and `fh_secs` is relative
-/// to the run. Levels inside a group keep caller order, so the documented
-/// "first entry wins" rule of `merge_field` applies inside a group too.
+/// `(run epoch, param key, level type code, forecast-hour offset in seconds,
+/// statistical identity)` — the WindPending-style keying extended with the run
+/// EPOCH, because ONE file can carry TWO runs (`tests/fixtures/frac_small.grib2`)
+/// and `fh_secs` is relative to the run. V1.3 phase E1 added the STATISTICAL
+/// IDENTITY `(stat_processed, stat_kind, begin_secs, end_secs, step_secs)` to
+/// the key: two PDT 4.8 messages with the same param/level/fh but DIFFERENT
+/// windows or kinds are now DISTINCT groups instead of silently merging into
+/// one (which lost a plane and applied the survivor's window). Because storage
+/// layout is ONE file per (param, level_type, fh), statistically-distinct
+/// groups targeting the SAME path collide: the write phase keeps the FIRST
+/// (message order) and REJECTS the rest LOUDLY (note once per occurrence +
+/// `stat_collisions` counter; range selection in the API is future work).
+/// Levels inside a group keep caller order, so the documented "first entry
+/// wins" rule of `merge_field` applies inside a group too.
 #[derive(Clone, Debug)]
 pub struct StoreGroup {
     pub epoch: i64,
@@ -1724,10 +1800,16 @@ pub struct StoreGroup {
 }
 
 fn find_group(gs: &Vec<StoreGroup>, epoch: i64, param_key: &str, code: u8,
-              fh: i64) -> Option<usize> {
+              fh: i64, stat_processed: bool, stat_kind: &str,
+              begin_secs: i64, end_secs: i64, step_secs: i64) -> Option<usize> {
     for k in 0 .. gs.len() {
         if gs[k].epoch == epoch && gs[k].param_key == param_key &&
-           gs[k].level_code == code && gs[k].fh_secs == fh {
+           gs[k].level_code == code && gs[k].fh_secs == fh &&
+           gs[k].stat_processed == stat_processed &&
+           gs[k].stat_kind == stat_kind &&
+           gs[k].stat_begin_secs == begin_secs &&
+           gs[k].stat_end_secs == end_secs &&
+           gs[k].stat_step_secs == step_secs {
             return Some(k);
         }
     }
@@ -1742,7 +1824,9 @@ fn group_put(gs: &mut Vec<StoreGroup>, epoch: i64, dir_name: &str, grid: &GridDe
              stat_processed: bool, stat_kind: &str, stat_has_range: bool,
              stat_begin_secs: i64, stat_end_secs: i64, stat_step_secs: i64,
              level_val: f64, plane: Vec<f32>) {
-    let gi = find_group(gs, epoch, param_key, level_code, fh_secs);
+    let gi = find_group(gs, epoch, param_key, level_code, fh_secs,
+                        stat_processed, stat_kind,
+                        stat_begin_secs, stat_end_secs, stat_step_secs);
     match gi {
         None => {
             gs.push(StoreGroup {
@@ -1963,8 +2047,46 @@ impl Pipeline {
         let mut runs: Vec<(i64, String)> = Vec::<(i64, String)>::new();
         let mut written = 0usize;
         let mut failed = 0usize;
+        // V1.3 phase E1 STAT COLLISION GUARD (see `StoreGroup` docs): the
+        // extended group key lets statistically-DISTINCT messages of one
+        // source file coexist as separate groups, but storage layout has ONE
+        // path per (run, param, level type, fh). The FIRST group in message
+        // order claims its path; every later distinct group targeting an
+        // already-claimed path within THIS file is REJECTED LOUDLY — one note
+        // per occurrence naming both windows + the dedicated collisions
+        // counter — never silently merged (that was the pre-E1 defect: one
+        // plane lost, survivor's window applied) and never counted as an
+        // error. Claiming happens BEFORE the write so ownership is decided by
+        // MESSAGE ORDER alone, deterministic across retries.
+        let mut claimed: Vec<(i64, String, u8, i64, String, i64, i64)> =
+            Vec::<(i64, String, u8, i64, String, i64, i64)>::new();
         while !gs.is_empty() {
             let g = gs.remove(0);
+            let mut winner_k = "".to_string();
+            let mut winner_b = 0i64;
+            let mut winner_e = 0i64;
+            let mut taken = false;
+            for c in &claimed {
+                if c.0 == g.epoch && c.1 == g.param_key &&
+                   c.2 == g.level_code && c.3 == g.fh_secs {
+                    taken = true;
+                    winner_k = c.4.to_string();
+                    winner_b = c.5;
+                    winner_e = c.6;
+                    break;
+                }
+            }
+            if taken {
+                self.note(format!("stat-collision in {0}: {1}/{2} of run {3} is ALREADY claimed for THIS file by [{4} window {5}..{6}s]; the rejected group [{7} window {8}..{9}s] targets the SAME field file — first-in-message-order wins, skipped and counted (wxpoint_stat_collisions_total; selecting among multiple accumulation windows is future work)",
+                    path, g.param_key, level_dir_name(g.level_code), g.dir_name,
+                    winner_k, winner_b, winner_e,
+                    g.stat_kind, g.stat_begin_secs, g.stat_end_secs));
+                self.counters.stat_collisions += 1;
+                self.live.bump_stat_collision();
+                continue;
+            }
+            claimed.push((g.epoch, g.param_key.to_string(), g.level_code, g.fh_secs,
+                          g.stat_kind.to_string(), g.stat_begin_secs, g.stat_end_secs));
             let mdir = join_path(&self.data_dir, mdl.name.as_str());
             let run_dir = join_path(&mdir, g.dir_name.as_str());
             let mk = create_dir_all(&run_dir);
@@ -2265,6 +2387,8 @@ pub fn build_snapshot(reg: &Vec<RegModel>) -> IndexSnapshot {
                     ifs.push(IdxFh {
                         fh_secs: fhv.fh_secs,
                         field: fhv.field.clone(),
+                        stat_processed: fhv.stat_processed,
+                        stat_kind_code: fhv.stat_kind_code,
                         stat_has_range: fhv.stat_has_range,
                         stat_begin_secs: fhv.stat_begin_secs,
                         stat_end_secs: fhv.stat_end_secs,

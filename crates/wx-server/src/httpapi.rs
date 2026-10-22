@@ -16,6 +16,7 @@ use wx_ingest::index::{SharedIndex, IndexSnapshot};
 use wx_ingest::config::{ResolvedModel};
 use wx_ingest::pipeline::{level_dir_name};
 use wx_core::tables::{fmt_num};
+use wx_core::storage::{stat_kind_name};
 use wx_core::grid::{GridDef};
 use crate::stats::{mono_ns, QueryStats};
 use crate::queryapi::{parse_query, lookup_entries, new_entries, entries_at, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
@@ -111,13 +112,35 @@ pub fn answer_all(snap: Arc<IndexSnapshot>, pa: &ParsedArgs) -> (u16, String) {
     return (200, render_point_json(pa.model, run_ep, pa.valid_epoch, pa.lat, pa.lon, pa.level_code, pa.level_val, &eb));
 }
 
+/// Render a forecast-hour offset (SECONDS past the run time) the way the API
+/// reports forecast hours: whole hours as integers, fractional ones via the
+/// shared `fmt_num` formatter (same shape as `forecast_hours` in responses).
+fn fh_hrs(secs: i64) -> String {
+    if secs % 3600 == 0 {
+        return format!("{0}", secs / 3600);
+    }
+    return fmt_num((secs as f64) / 3600.0);
+}
+
 fn error_message(ft: FailTok, model: &str, key: &str) -> String {
     match ft {
         FailTok::UnknownModel => { return format!("model '{0}' is not configured/indexed", model); }
         FailTok::UnknownParam => { return format!("parameter '{0}' has no indexed data for model '{1}'", key, model); }
         FailTok::NoRunCovers => { return "no indexed run covers the requested valid time".to_string(); }
         FailTok::LevelOutOfRange => { return "requested level is outside the stored level range (never extrapolated)".to_string(); }
-        FailTok::StatTimeGuard => { return "statistically processed field (template 4.8) requires an exact forecast-hour match; linear time interpolation would be wrong".to_string(); }
+        // V1.3 phase E1: the message NAMES the offending forecast hour and its
+        // statistical kind (per-fh guard; spec §6.3). Sentinel payload (-1)
+        // falls back to the plain pre-E1 wording.
+        FailTok::StatTimeGuard(a, b, off, kind) => {
+            if off < 0 {
+                return "statistically processed field (template 4.8) requires an exact forecast-hour match; linear time interpolation would be wrong".to_string();
+            }
+            let kn = stat_kind_name(kind);
+            if a < 0 {
+                return format!("statistically processed data forbids linear time interpolation: this run stores no forecast-hour bracket for the requested valid time, and forecast hour {0} h is '{1}' (GRIB template 4.8); query that exact forecast hour", fh_hrs(off), kn);
+            }
+            return format!("linear time interpolation between forecast hours {0} h and {1} h would blend statistically processed data: forecast hour {2} h is '{3}' (GRIB template 4.8); query an exact forecast hour instead", fh_hrs(a), fh_hrs(b), fh_hrs(off), kn);
+        }
         FailTok::TimeExactOnly => { return "time_interp=none and no stored forecast hour equals the requested valid time".to_string(); }
         FailTok::OutOfDomain => { return "point is outside the grid node rectangle (horizontal extrapolation is never done)".to_string(); }
     }

@@ -500,7 +500,7 @@ fn fractional_hours_queries_and_run_selection() {
                         Ok(_) => { assert!(false); }
                         Err(g) => {
                             match g {
-                                SelectError::StatTimeGuard => {}
+                                SelectError::StatTimeGuard(..) => {}
                                 _ => {
                                     println!("unexpected select error {:?}", g);
                                     assert!(false);

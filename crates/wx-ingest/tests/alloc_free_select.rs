@@ -3,9 +3,17 @@
 // slot list) must produce EXACTLY the same Result as the old path — materialize
 // `Vec<f64>` of `fh_secs as f64` and call wx-core `resolve_times` — across
 // every case class: exact hits, eps near-misses, fractional wants in seconds
-// (post-phase-3 arithmetic), time_interp=none, the template-4.8 stat guard,
-// single-slot fields, gaps, out-of-range and empty lists. Selection never
-// dereferences the mmap handle, so ONE shared tiny field backs every slot.
+// (post-phase-3 arithmetic), time_interp=none, single-slot fields, gaps,
+// out-of-range and empty lists. Selection never dereferences the mmap handle,
+// so ONE shared tiny field backs every slot.
+//
+// V1.3 phase E1 note: the twin comparison runs with `stat_processed = false`
+// because the §6.3 statistical guard is NO LONGER decided inside this helper
+// — it moved PER FORECAST HOUR into `select_run`/`stat_guard_details` (each
+// slot carries its own flags now). The structural resolution being compared
+// here is exactly what the guard layer consumes; per-slot guard semantics are
+// pinned by tests/mixed_stat_stack.rs and the pre-existing uniform-stack
+// gates (restart.rs, point_http.rs, fractional_fh.rs).
 
 use wx_ingest::index::{IdxFh, resolve_field_times};
 use wx_core::interp::{resolve_times, TIME_MATCH_EPS, PointError, TimeInterpMode};
@@ -44,10 +52,14 @@ pub fn make_stub(dir: String) -> Result<Arc<MmapField>, String> {
     }
 }
 
-pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
+pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64, stat: bool) -> IdxFh {
     return IdxFh {
         fh_secs: fh_secs,
         field: mf.clone(),
+        // uniform per-slot flag per trial (structural resolution ignores it;
+        // the guard layer that DOES read it is tested in mixed_stat_stack)
+        stat_processed: stat,
+        stat_kind_code: 0,
         stat_has_range: false,
         stat_begin_secs: 0,
         stat_end_secs: 0,
@@ -76,7 +88,7 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
                 while k < n {
                     let step = if (trial % 5) == 0 { 1800i64 } else { 3600i64 };
                     let v = base + k as i64 * step;
-                    let _p = fhs.push(mk_fh(stub.clone(), v));
+                    let _p = fhs.push(mk_fh(stub.clone(), v, (trial % 3) == 0));
                     let _q = f64s.push(v as f64);
                     k += 1;
                 }
@@ -93,8 +105,12 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
                         } else if wi == f64s.len() { want = f64s[0] - TIME_MATCH_EPS * 0.4; }
                         else if wi == f64s.len() + 1usize { want = f64s[f64s.len() - 1usize] + TIME_MATCH_EPS * 0.4; }
                         else if wi == f64s.len() + 2usize { want = -1e9; }
-                        let old_r = resolve_times(&f64s, want, mode, stat);
-                        let new_r = resolve_field_times(&fhs, want, mode, stat);
+                        // structural twin: E1 moved the stat guard OUT of the
+                        // resolver (per-fh decision in select_run), so the
+                        // materialized twin runs with stat_processed = false.
+                        let _ = stat;
+                        let old_r = resolve_times(&f64s, want, mode, false);
+                        let new_r = resolve_field_times(&fhs, want, mode);
                         assert!(old_r == new_r);
                         match old_r {
                             Ok(p) => {
@@ -126,7 +142,7 @@ fn empty_field_never_brackets() {
         Err(_e) => { assert!(false); return; }
         Ok(stub) => {
             let empty: Vec<IdxFh> = Vec::<IdxFh>::new();
-            let r = resolve_field_times(&empty, 0.0, TimeInterpMode::Linear, false);
+            let r = resolve_field_times(&empty, 0.0, TimeInterpMode::Linear);
             match r {
                 Err(e) => {
                     match e {

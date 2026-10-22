@@ -654,6 +654,56 @@ def main():
         for r in srecs:
             f.write(r)
 
+    # ------------- V1.3 E1 MIXED-STAT STACK + STAT COLLISION ---------------
+    # mixstat_small.grib2: ONE field (TMP@2m AGL) whose forecast hours MIX
+    # instantaneous slots (PDT 4.0 fh 0/12/18) with a statistically processed
+    # one (PDT 4.8 ACCUMULATION fh 6, window [6,12] h). Values stay analytic
+    # and LINEAR IN THE FORECAST HOUR:   value = 250 + j*nx + i + fc_hour
+    # so every exact AND clean-bracket interpolated probe is exactly
+    # predictable (mid fh 15 between 12 and 18 -> 265 at node (20N, 240E)).
+    # mixstat_rev_small.grib2 carries the SAME four messages in REVERSE
+    # order: pre-E1 the FIELD-level guard flag came from whichever message
+    # registered FIRST, so the two orders answered mid-time queries
+    # DIFFERENTLY (AUDIT-confirmed defect (2)); post-E1 they must agree.
+    # collide_small.grib2: TWO PDT 4.8 APCP@surface messages for the SAME
+    # fh 0 with DIFFERENT windows ([0,6] then [0,3]) plus one UNAFFECTED
+    # TMP@2m message. Pre-E1 both merged into ONE group silently (second
+    # plane lost, first window applied); post-E1 they are distinct groups
+    # and the second is LOUDLY rejected (first-in-message-order wins).
+    mnx, mny = snx, sny
+    mgrid = sgrid
+    def mix_msg(fc_hour, acc):
+        incs = [j * mnx + i + fc_hour for j in range(mny) for i in range(mnx)]
+        s5b, s7b, s6b, _ = encode_field(incs, 250.0, 0, None)
+        if not acc:
+            s4b = sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_AGL, 2, fc_hour)
+        else:
+            s4b = sec4_pdt48(PARAMS["TMP"][0], PARAMS["TMP"][1], 1, 1, 1, 6, 1, 0,
+                             fc_hour, LEVEL_AGL, 0, 2, genproc=2)
+        return build_record(sth, mgrid, s4b, s5b, s7b, None)
+    mixrecs = [mix_msg(0, False), mix_msg(6, True), mix_msg(12, False), mix_msg(18, False)]
+    with open(os.path.join(a.out, "mixstat_small.grib2"), "wb") as f:
+        for r in mixrecs:
+            f.write(r)
+    with open(os.path.join(a.out, "mixstat_rev_small.grib2"), "wb") as f:
+        for r in reversed(mixrecs):
+            f.write(r)
+    crecs = []
+    for (plen, inc_off) in ((6, 0), (3, 500)):
+        incs = [j * mnx + i + inc_off for j in range(mny) for i in range(mnx)]
+        s5b, s7b, s6b, _ = encode_field(incs, 10.0, 0, None)
+        s4b = sec4_pdt48(PARAMS["APCP"][0], PARAMS["APCP"][1], 1, 1, 1, plen, 1, 0,
+                         0, LEVEL_SURFACE, 0, 0, genproc=2)
+        crecs.append(build_record(sth, mgrid, s4b, s5b, s7b, None))
+    cinc = [j * mnx + i for j in range(mny) for i in range(mnx)]
+    c5b, c7b, c6b, _ = encode_field(cinc, 250.0, 0, None)
+    crecs.append(build_record(sth, mgrid,
+                              sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_AGL, 2, 0),
+                              c5b, c7b, None))
+    with open(os.path.join(a.out, "collide_small.grib2"), "wb") as f:
+        for r in crecs:
+            f.write(r)
+
     # ------------- FRACTIONAL FORECAST HOURS (V1.1 phase 3) -----------------
     # CT 4.4 unit = MINUTE (code 0): forecast hours 0h, 0h30m, 1h for run
     # 2026-10-19T12Z, PLUS a SECOND RUN 12:30Z inside the SAME FILE (the

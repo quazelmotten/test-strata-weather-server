@@ -101,8 +101,8 @@ pub fn build_snapshot(dir: &str) -> Result<Arc<IndexSnapshot>, String> {
         units: "K".to_string(),
         stat_processed: false,
         stat_kind: "instantaneous".to_string(),
-        fhs: [IdxFh { fh_secs: 0i64, field: Arc::new(mf0), stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 },
-              IdxFh { fh_secs: 21600i64, field: Arc::new(mf6), stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 }].to_vec(),
+        fhs: [IdxFh { fh_secs: 0i64, field: Arc::new(mf0), stat_processed: false, stat_kind_code: 0, stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 },
+              IdxFh { fh_secs: 21600i64, field: Arc::new(mf6), stat_processed: false, stat_kind_code: 0, stat_has_range: false, stat_begin_secs: 0, stat_end_secs: 0, stat_step_secs: 0 }].to_vec(),
     };
     let run = IdxRun {
         epoch_secs: 1761105600i64,
