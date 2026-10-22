@@ -9,9 +9,10 @@ use crate::config::{ResolvedModel, ResolvedParam, validate_config, load_config, 
 use serde_json::from_str;
 use crate::state::{StateStore, FileRec, content_hash_file, stat_size_mtime, head_is_grib, REC_OK, REC_IGNORED, REC_FAILED, join_path};
 use crate::discovery::{glob_match, walk_files, StabilityTracker, WatchQueue, start_watchers, drain_queue, base_name, path_to_str, MonoClock};
-use crate::store::{write_grid_bin, merge_write_field_batch, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, parse_iso_utc, le_u32_at, GRID_VERSION};
+use crate::store::{write_grid_bin, merge_write_field_batch, decode_grid, manifest_field_json, write_bytes_atomic_pub, iso_utc, le_u32_at, GRID_VERSION};
 use crate::index::{SharedIndex, IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField, IdxFh};
-use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot};
+use wx_core::storage::{open_field, MmapField, TouchedDirs, counters_snapshot, StatMeta,
+                       BIN_VERSION, bin_version_of_path, stat_kind_code, stat_kind_name};
 use memmap2::Mmap;
 use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
@@ -1010,75 +1011,145 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
                     return;
                 }
                 Ok(grid) => {
-                    let mp = format!("{}/manifest.json", run_dir);
-                    let mt = read_text_maybe(&mp);
-                    let mut doc = ManifestDoc { model: mdl.name.clone(), fields: Vec::<ManifestField>::new() };
-                    match mt {
+                    // ---- V1.3 phase E0: FIELD-FILE FORMAT PRE-CHECK ---------
+                    // A .bin written by a DIFFERENT BIN_VERSION cannot carry the
+                    // statistical-process metadata this build needs to guard
+                    // accumulations (spec §6.3), so it must never answer a query.
+                    // Same recovery as the grid.bin upgrade trap above: LOUD note
+                    // + DELETE the run dir + FORGET this model's ingest records,
+                    // so the NEXT scan round re-decodes from source with the
+                    // current format. Done BEFORE anything is indexed, so a doomed
+                    // run dir never half-publishes.
+                    let files = collect_field_files(run_dir);
+                    let mut bad_ver: Option<(String, u32)> = None;
+                    for fe in &files {
+                        match bin_version_of_path(fe.0.as_str()) {
+                            Some(vv) => {
+                                if vv != BIN_VERSION && bad_ver.is_none() {
+                                    bad_ver = Some((fe.0.to_string(), vv));
+                                }
+                            }
+                            // unreadable / shorter than the version field: leave
+                            // it to open_field below, which reports WHY.
+                            None => {}
+                        }
+                    }
+                    match bad_ver {
+                        Some(bp) => {
+                            p.note(format!("STORAGE-FORMAT RECOVERY: field file {} in {} was written by a different storage format (found bin version {}, current {}); deleting the run dir and forgetting model '{}'s ingest records so its source files are re-decoded on the next scan round",
+                                bp.0, run_dir, bp.1, BIN_VERSION, mdl.name));
+                            p.counters.errors += 1;
+                            delete_tree(&run_dir);
+                            let dropped = p.state.drop_under(&mdl.ingest_dir);
+                            p.note(format!("STORAGE-FORMAT RECOVERY: forgot {} ingest record(s) under {}", dropped, mdl.ingest_dir));
+                            let _ = p.state.save();
+                            return;
+                        }
                         None => {}
+                    }
+                    // ---- manifest.json: HUMAN-FACING INVENTORY ONLY ----------
+                    // V1.3 E0: the accumulation guard comes from each .bin's own
+                    // header now, so a missing or unparsable manifest can no
+                    // longer change an ANSWER. It is still a reportable anomaly
+                    // (a failed manifest write means something IS wrong with the
+                    // store), hence LOUD note once per run + one error count.
+                    let mp = format!("{}/manifest.json", run_dir);
+                    match read_text_maybe(&mp) {
+                        None => {
+                            p.note(format!("manifest.json MISSING in {} (model '{}'): indexing proceeds from the .bin headers, which carry the statistical metadata; the manifest is rewritten whenever this run ingests again", run_dir, mdl.name));
+                            p.counters.errors += 1;
+                        }
                         Some(txt) => {
                             match from_str::<ManifestDoc>(&txt) {
-                                Err(_) => {}
-                                Ok(d) => { doc = d; }
+                                Err(e) => {
+                                    p.note(format!("manifest.json in {} (model '{}') is UNPARSABLE ({:?}): indexing proceeds from the .bin headers", run_dir, mdl.name, e));
+                                    p.counters.errors += 1;
+                                }
+                                Ok(_) => {}
                             }
                         }
                     }
-                    match read_dir(&run_dir) {
-                        Err(_) => {}
-                        Ok(it) => {
-                            for pe in it {
-                                match pe {
-                                    Err(_) => { continue; }
-                                    Ok(pde) => {
-                                        let pdir = path_to_str(&pde.path());
-                                        let param_key = base_name(pdir.to_string());
-                                        if param_key == "grid.bin" || param_key == "manifest.json" {
-                                            continue;
-                                        }
-                                        match read_dir(&pdir) {
-                                            Err(_) => { continue; }
-                                            Ok(lit) => {
-                                                for le in lit {
-                                                    match le {
+                    // ---- index every readable field file --------------------
+                    // Stat guard + range come from the FILE HEADER (V1.3 E0),
+                    // never from the manifest: warm path and cold path agree by
+                    // construction because both read the same durable bytes.
+                    for fe in &files {
+                        let mfr = open_field(fe.0.to_string());
+                        match mfr {
+                            Err(e) => {
+                                // Structural failure that is NOT a version
+                                // mismatch (truncated file, bad flags, corrupt
+                                // stat bytes): loud and counted, slot absent.
+                                p.note(format!("field file {} in run dir {} could not be opened ({}): skipped", fe.0, run_dir, e));
+                                p.counters.errors += 1;
+                                continue;
+                            }
+                            Ok(mfv) => {
+                                let un = units_for(p, mdl, fe.1.as_str(), fe.3);
+                                let sm = mfv.header.stat;
+                                let sp = sm.guards_time();
+                                let kind_name = stat_kind_name(sm.kind).to_string();
+                                p.registry_put(mdl, epoch, dir_name.clone(), grid.clone(),
+                                    FieldKey { param_key: fe.1.to_string(), level_code: fe.3 },
+                                    fe.2, Arc::new(mfv), un, sp, kind_name,
+                                    sp, sm.begin_secs, sm.end_secs, sm.step_secs);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One QUERYABLE field file found under a run directory: `(full path, param
+/// key, forecast-hour offset in SECONDS, CT 4.5 level code)`. Entries that are
+/// not a canonical `f<FFF>.bin` under a KNOWN level-type directory (grid.bin,
+/// manifest.json, writer temp litter, hand-dropped junk) are IGNORED — exactly
+/// the files the pre-V1.3-E0 inline walk skipped. Sorted by (param, level code,
+/// fh) so both the recovery log and the index-build order are deterministic
+/// across filesystems (V1.3 E0: the walk became a reusable collector because
+/// the version pre-check has to see every field file BEFORE any of them gets
+/// indexed).
+fn collect_field_files(run_dir: &str) -> Vec<(String, String, i64, u8)> {
+    let mut out: Vec<(String, String, i64, u8)> = Vec::<(String, String, i64, u8)>::new();
+    match read_dir(run_dir) {
+        Err(_) => { return out; }
+        Ok(it) => {
+            for pe in it {
+                match pe {
+                    Err(_) => { continue; }
+                    Ok(pde) => {
+                        let pdir = path_to_str(&pde.path());
+                        let param_key = base_name(pdir.to_string());
+                        if param_key == "grid.bin" || param_key == "manifest.json" {
+                            continue;
+                        }
+                        match read_dir(&pdir) {
+                            Err(_) => { continue; }
+                            Ok(lit) => {
+                                for le in lit {
+                                    match le {
+                                        Err(_) => { continue; }
+                                        Ok(lde) => {
+                                            let ldir = path_to_str(&lde.path());
+                                            let lvl_dir = base_name(ldir.to_string());
+                                            match level_code_of_dir(&lvl_dir) {
+                                                None => { continue; }
+                                                Some(code) => {
+                                                    match read_dir(&ldir) {
                                                         Err(_) => { continue; }
-                                                        Ok(lde) => {
-                                                            let ldir = path_to_str(&lde.path());
-                                                            let lvl_dir = base_name(ldir.to_string());
-                                                            let code = level_code_of_dir(&lvl_dir);
-                                                            match code {
-                                                                None => { continue; }
-                                                                Some(code2) => {
-                                                                    match read_dir(&ldir) {
-                                                                        Err(_) => { continue; }
-                                                                        Ok(fit) => {
-                                                                            for fe in fit {
-                                                                                match fe {
-                                                                                    Err(_) => { continue; }
-                                                                                    Ok(fde) => {
-                                                                                        let fp = path_to_str(&fde.path());
-                                                                                        let bfp = base_name(fp.to_string());
-                        let fh = parse_fh_name(&bfp);
-                                                                                        match fh {
-                                                                                            None => { continue; }
-                                                                                            Some(fhv) => {
-                                                                                                let mf = open_field(fp.to_string());
-                                                                                                match mf {
-                                                                                                    Err(_) => { continue; }
-                                                                                                    Ok(mfv) => {
-                                                                                                        let un = units_for(p, mdl, &param_key, code2);
-let spc = stat_for(&doc, &param_key, &lvl_dir);
-// restore this forecast hour's 4.8 time range from manifest.json
-// so a restart keeps BOTH the guard and the range metadata.
-let rng = stat_range_for(&doc, &param_key, &lvl_dir, fhv, epoch);
-p.registry_put(mdl, epoch, dir_name.clone(), grid.clone(),
-    FieldKey { param_key: param_key.clone(), level_code: code2 },
-    fhv, Arc::new(mfv), un, spc.0, spc.1,
-    rng.0, rng.1, rng.2, rng.3);
-                                                                                                    }
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
+                                                        Ok(fit) => {
+                                                            for fe in fit {
+                                                                match fe {
+                                                                    Err(_) => { continue; }
+                                                                    Ok(fde) => {
+                                                                        let fp = path_to_str(&fde.path());
+                                                                        let bn = base_name(fp.to_string());
+                                                                        match parse_fh_name(&bn) {
+                                                                            None => { continue; }
+                                                                            Some(fh) => {
+                                                                                out.push((fp.to_string(), param_key.to_string(), fh, code));
                                                                             }
                                                                         }
                                                                     }
@@ -1098,6 +1169,28 @@ p.registry_put(mdl, epoch, dir_name.clone(), grid.clone(),
             }
         }
     }
+    out.sort_by(|a, b| {
+        if a.1 < b.1 {
+            return CmpOrdering::Less;
+        }
+        if a.1 > b.1 {
+            return CmpOrdering::Greater;
+        }
+        if a.3 < b.3 {
+            return CmpOrdering::Less;
+        }
+        if a.3 > b.3 {
+            return CmpOrdering::Greater;
+        }
+        if a.2 < b.2 {
+            return CmpOrdering::Less;
+        }
+        if a.2 > b.2 {
+            return CmpOrdering::Greater;
+        }
+        return CmpOrdering::Equal;
+    });
+    return out;
 }
 
 impl Pipeline {
@@ -1152,39 +1245,6 @@ fn units_for(_p: &Pipeline, mdl: &ResolvedModel, param_key: &str, _code: u8) -> 
     }
 }
 
-/// Restore one forecast hour's PDT 4.8 statistical time range from
-/// manifest.json: returns (has_range, begin_secs, end_secs, step_secs) where
-/// begin/end are offsets from the run time (`run_epoch` supplied by the caller)
-/// so they match what the writer stored. Absent or unparsable -> (false,0,0,0)
-/// and the field still gets its `stat_processed` guard from `stat_for`.
-fn stat_range_for(doc: &ManifestDoc, param_key: &str, lvl_dir: &str,
-                  fh_secs: i64, run_epoch: i64) -> (bool, i64, i64, i64) {
-    for f in &doc.fields {
-        if f.param != param_key || f.level_type != lvl_dir {
-            continue;
-        }
-        for r in &f.stat_ranges {
-            if r.fh_secs != fh_secs {
-                continue;
-            }
-            let b = parse_iso_utc(&r.begin);
-            match b {
-                None => { return (true, 0, 0, r.step_secs); }
-                Some(bv) => {
-                    let en = parse_iso_utc(&r.end);
-                    match en {
-                        None => { return (true, bv - run_epoch, 0, r.step_secs); }
-                        Some(ev) => {
-                            return (true, bv - run_epoch, ev - run_epoch, r.step_secs);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return (false, 0, 0, 0);
-}
-
 /// Render the per-fh statistical ranges of one field entry as a JSON array
 /// (`[]` when nothing is statistically processed). begin/end are ABSOLUTE
 /// instants in ISO-8601 UTC; `fh_secs` is the exact join key.
@@ -1207,14 +1267,14 @@ pub fn stat_ranges_json(fhs: &Vec<RegFh>, run_epoch: i64) -> String {
     return out + "]";
 }
 
-fn stat_for(doc: &ManifestDoc, param_key: &str, lvl_dir: &str) -> (bool, String) {
-    for f in &doc.fields {
-        if f.param == param_key && f.level_type == lvl_dir {
-            return (f.stat_processed, f.stat_kind.clone());
-        }
-    }
-    return (false, "instantaneous".to_string());
-}
+// V1.3 phase E0 REMOVED: `stat_for()` and `stat_range_for()` used to restore
+// the PDT 4.8 guard and its time range from manifest.json on a warm start. That
+// made a human-facing inventory file correctness-critical: delete or corrupt
+// one manifest and an accumulation started answering with LINEAR TIME
+// INTERPOLATION (spec §6.3 violation, silent wrong answer). The guard and the
+// range now live in each field file's own header (`wx_core::storage::StatMeta`),
+// which `ingest_run_dir` reads directly, so both paths answer from the same
+// durable bytes.
 
 fn read_bytes_maybe(path: &str) -> Option<Vec<u8 > > {
             let f = std::fs::File::open(&path);
@@ -1467,13 +1527,17 @@ impl Pipeline {
                                 }
                                 let out = self.ingest_file(&mdl, dr.0, rd.0.to_string());
                                 if out.failed_groups > 0 {
-                                    // ANY group failed: the file is NOT marked ingested,
-                                    // so the NEXT round retries it (idempotent thanks to
-                                    // phase-A merge dedup + atomic renames). ONE error per
-                                    // file-with-failure, not one per failed group.
+                                    // ANY write step failed (a GROUP or the
+                                    // manifest refresh): the file is NOT marked
+                                    // ingested, so the NEXT round retries it
+                                    // (idempotent thanks to phase-A merge dedup +
+                                    // atomic renames, and V1.3 E0 makes the
+                                    // manifest rewrite part of that contract).
+                                    // ONE error per file-with-failure, not one
+                                    // per failed step.
                                     self.counters.errors += 1;
                                     self.live.add(1, 0, 0, 0, 0, out.groups as u64);
-                                    self.progress(format!("FAILED {0}: {1} of {2} group(s) unwritable, retrying next round",
+                                    self.progress(format!("FAILED {0}: {1} of {2} write step(s) failed (group writes + manifest refresh), retrying next round",
                                         rd.0, out.failed_groups, out.groups + out.failed_groups));
                                 } else {
                                     self.state.upsert(FileRec {
@@ -1706,7 +1770,10 @@ fn group_put(gs: &mut Vec<StoreGroup>, epoch: i64, dir_name: &str, grid: &GridDe
 #[derive(Clone, Debug)]
 pub struct FileOutcome {
     pub groups: usize,          // field files WRITTEN successfully
-    pub failed_groups: usize,   // groups whose write FAILED (file retried)
+    /// Groups whose write FAILED **plus** manifest-refresh failures (V1.3 E0):
+    /// ANY non-zero value means the source file is NOT recorded as ingested and
+    /// gets retried next round.
+    pub failed_groups: usize,
     pub bytes_written: u64,     // storage BYTES_WRITTEN_TOTAL delta
     pub renames: u64,           // RENAMES_TOTAL delta (groups + grid.bin + manifests)
     pub ms: i64,                // monotonic time spent on this file
@@ -1795,7 +1862,7 @@ impl Pipeline {
             let epoch = msg.run.epoch_secs;
             let dirn = run_dir_name(msg.run.clone());
             let stp = msg.stat.kind != StatKind::Instantaneous;
-            let kind_name = stat_kind_name(msg.stat.kind.clone());
+            let kind_name = stat_kind_label(msg.stat.kind.clone());
             // Configured parameter whose LEVEL is NOT requested: skip silently.
             // This used to happen inside `store_plane`; doing it here keeps an
             // unrequested level from ever creating a group (and therefore a write).
@@ -1931,9 +1998,23 @@ impl Pipeline {
             }
             let fpath = join_path(&fparent, &fh_file_name(g.fh_secs));
             let scan_ns = grid_scan_ns(&g.grid);
+            // V1.3 phase E0: the group's PDT 4.8 metadata goes into the FIELD
+            // FILE HEADER, not only into manifest.json. That header is what a
+            // warm start reads, so the accumulation guard survives a deleted,
+            // corrupt or never-written manifest. The kind NAME maps to its
+            // on-disk CODE through the one shared table
+            // (`wx_core::storage::stat_kind_code`), which is also the table the
+            // warm path uses in reverse, so the two paths cannot drift.
+            let smeta = StatMeta {
+                processed: g.stat_processed,
+                kind: stat_kind_code(g.stat_kind.as_str()),
+                begin_secs: g.stat_begin_secs,
+                end_secs: g.stat_end_secs,
+                step_secs: g.stat_step_secs,
+            };
             // winds_grid=false: components are stored EARTH-relative (spec §4.4).
             let mw = merge_write_field_batch(fpath.to_string(), g.level_code, g.grid.nx(),
-                                             g.grid.ny(), scan_ns, false, g.entries, Some(&mut dirs));
+                                             g.grid.ny(), scan_ns, false, smeta, g.entries, Some(&mut dirs));
             match mw {
                 Err(e) => {
                     self.note(format!("group write failed {}: {}", fpath, e));
@@ -1953,6 +2034,11 @@ impl Pipeline {
                     continue;
                 }
                 Ok(mfv) => {
+                    // Cold path publishes the GROUP's metadata; the durable
+                    // header just written carries exactly those bytes, so the
+                    // warm path (which reads the header back) indexes the same
+                    // guard and range. `mfv.header.stat` is available here too
+                    // and is what the NEXT process will see.
                     self.registry_put(mdl, g.epoch, g.dir_name.clone(), g.grid.clone(),
                         FieldKey { param_key: g.param_key, level_code: g.level_code },
                         g.fh_secs, Arc::new(mfv), g.units, g.stat_processed, g.stat_kind.clone(),
@@ -1961,11 +2047,22 @@ impl Pipeline {
             }
         }
         // ---- manifest.json ONCE per AFFECTED RUN -----------------------------
+        // V1.3 phase E0: a FAILED manifest write now BLOCKS the REC_OK state
+        // record (it increments the same `failed` counter a failed GROUP does),
+        // so the source file is retried next round instead of being recorded as
+        // fully ingested with no inventory. The retry is idempotent (groups are
+        // already durable and rewrite through merge dedup + atomic rename).
+        // Before this change the failure only logged + counted, and a crash
+        // between the durable .bin writes and the manifest left exactly that
+        // state permanently — the amplifier of the manifest-loss defect.
         for r in &runs {
             if !update_run_manifest(self, mdl.name.clone(), r.0) {
-                self.note(format!("manifest update failed for run {0}", r.1));
-                self.counters.errors += 1;
-                self.live.add(1, 0, 0, 0, 0, 0);
+                self.note(format!("manifest update failed for run {0}: source file NOT marked ingested, retrying next round", r.1));
+                // NO extra error count here: the caller's `failed_groups > 0`
+                // branch is the single point where a file-with-any-write-
+                // failure gets exactly ONE error (same rule as a failed GROUP,
+                // see the "ONE error per file-with-failure" comment there).
+                failed += 1;
             }
         }
         // ---- DIRECTORY FSYNCS ONCE per DISTINCT DIRECTORY TOUCHED ------------
@@ -2042,9 +2139,12 @@ fn resolve_param_by_key(mdl: &ResolvedModel, key: &str) -> Option<ResolvedParam>
 
 // ---------------------------------------------------------------------------
 // manifest.json maintenance (spec §4.5: what is present per run). Written
-// atomically after every field write; the index remains authoritative, so a
-// manifest failure is logged but does not block publication. Levels listed
-// are those of the newest forecast-hour file for the field (informational).
+// atomically after every field write; the index remains authoritative AND, since
+// V1.3 phase E0, so does the FIELD FILE HEADER for the statistical metadata that
+// guards an answer (spec §6.3). A manifest failure therefore can no longer change
+// an answer, but it DOES block the REC_OK state record so the file is retried and
+// the inventory gets rebuilt. Levels listed are those of the newest forecast-hour
+// file for the field (informational).
 // ---------------------------------------------------------------------------
 
 pub fn update_run_manifest(p: &Pipeline, model_name: String, epoch: i64) -> bool {
@@ -2128,7 +2228,12 @@ fn grid_scan_ns(g: &GridDef) -> bool {
     }
 }
 
-fn stat_kind_name(k: StatKind) -> String {
+/// Canonical lower-case name of a decoded stat kind. Same table as
+/// `wx_core::storage::stat_kind_name` (which maps the ON-DISK u8 code), so the
+/// cold path's string, the header's code and `/v1/inventory`'s label can never
+/// drift apart (V1.3 phase E0 renamed this from `stat_kind_name` to keep the
+/// two directions distinct and non-conflicting).
+fn stat_kind_label(k: StatKind) -> String {
     match k {
         StatKind::Instantaneous => { return "instantaneous".to_string(); }
         StatKind::Accumulation => { return "accumulation".to_string(); }

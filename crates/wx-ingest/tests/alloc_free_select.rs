@@ -9,7 +9,7 @@
 
 use wx_ingest::index::{IdxFh, resolve_field_times};
 use wx_core::interp::{resolve_times, TIME_MATCH_EPS, PointError, TimeInterpMode};
-use wx_core::storage::{BinHeader, MmapField, open_field, write_bin_atomic};
+use wx_core::storage::{BinHeader, StatMeta, MmapField, open_field, write_bin_atomic};
 use std::sync::Arc;
 use std::fs::create_dir_all;
 use std::fs::remove_file;
@@ -26,6 +26,7 @@ pub fn make_stub(dir: String) -> Result<Arc<MmapField>, String> {
         levels: [500.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let plane: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
     let mut planes: Vec<&[f32]> = Vec::<&[f32]>::new();

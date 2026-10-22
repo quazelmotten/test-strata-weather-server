@@ -7,7 +7,7 @@
 
 use wx_core::grid::{GridRegular, GridLambert};
 use wx_core::interp::{bilinear_slab_f32, bilinear4, horiz_nodes};
-use wx_core::storage::{MmapField, open_field, write_bin_atomic, BinHeader};
+use wx_core::storage::{MmapField, open_field, write_bin_atomic, BinHeader, StatMeta};
 use criterion::{criterion_group, criterion_main, Criterion};
 
 /// Deterministic xorshift64* PRNG (no rand dependency in wx-core).
@@ -166,6 +166,7 @@ fn mmap_warm_field(nx: usize, ny: usize) -> Result<MmapField, String> {
         levels: [250.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let plane = build_slab(nx, ny);
     let pl = &plane;

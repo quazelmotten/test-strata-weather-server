@@ -20,7 +20,7 @@ use wx_server::httpapi::{ServerState, build_router};
 use wx_server::stats::new_stats;
 use wx_ingest::index::{IdxField, IdxFh, IdxFieldEntry, IdxModel, IdxRun, IndexSnapshot, SharedIndex};
 use wx_core::grid::{GridDef, GridRegular};
-use wx_core::storage::{BinHeader, MmapField, open_field, write_bin_atomic};
+use wx_core::storage::{BinHeader, StatMeta, MmapField, open_field, write_bin_atomic};
 use wx_core::tables::{lookup_level_type};
 use axum::routing::RouterIntoService;
 use axum::body::Body;
@@ -101,6 +101,7 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64) {
         levels: lv32,
         scan_ns: false,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let wr = write_bin_atomic(format!("{0}/{1}", dir, name), &hdr, &refs);
     match wr {

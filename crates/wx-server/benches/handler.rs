@@ -6,7 +6,7 @@
 // Run: cargo bench -p wx-server
 
 use wx_core::grid::{GridDef, GridRegular};
-use wx_core::storage::{BinHeader, open_field, write_bin_atomic};
+use wx_core::storage::{BinHeader, StatMeta, open_field, write_bin_atomic};
 use wx_ingest::index::{IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField,
                        IdxFh};
 use wx_server::queryapi::{parse_query};
@@ -36,6 +36,7 @@ pub fn build_snapshot(dir: &str) -> Result<Arc<IndexSnapshot>, String> {
         levels: [1000.0, 925.0, 850.0, 700.0, 500.0, 300.0, 250.0, 200.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let mut planes: Vec<Vec<f32>> = Vec::new();
     for li in 0 .. 8 {

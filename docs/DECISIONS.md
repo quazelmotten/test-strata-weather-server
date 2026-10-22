@@ -2161,3 +2161,70 @@ volume down to exactly the final store size.
 
 Out of scope for V1.2 (unchanged): slant paths, bounding boxes, soundings, grid subsetting,
 unit conversion, derived quantities, authentication, downloading model data.
+
+## 10. V1.3 phase E0 — statistical-metadata durability (2026-10-22)
+
+**The defect (AUDIT_1.2.md P1).** `stat_processed`, `stat_kind` and the PDT 4.8
+begin/end window lived ONLY in `manifest.json`. Spec §6.3 says accumulations,
+averages and max/min fields must never be time-interpolated, but the warm-start
+rebuild read that guard back from the manifest, so the durable `.bin` files alone
+were not enough to enforce it.
+
+**Reproduction.** Ingest `stat_small.grib2`; APCP at a mid-forecast-hour valid
+time answers 422 `stat_time_guard` (correct). `rm <data>/stat/2026101912/manifest.json`,
+restart: the same query now answers **200 with linear interpolation between
+forecast_hours [0, 6]** — a plausible, WRONG number (the sum of two 6 h
+accumulations blended 50/50). Same state from an UNPARSABLE manifest, and the
+amplifier: a FAILED manifest write counted an error but still recorded the source
+file REC_OK, so a crash between the durable `.bin` writes and the manifest left
+exactly that state permanently.
+
+**The fix.** The metadata moved INTO each field file's own fixed header
+(`wx_core::storage::StatMeta`: kind byte, processed byte, begin/end/step i64s),
+`BIN_VERSION` 1→2 (fixed header 24→56 bytes, +32 B per field file; payload
+layout `[level][y][x]` f32 LE unchanged). The warm start reads the guard FROM
+THAT HEADER; `manifest.json` became human-facing inventory only. The reader is
+strict (kind > 5, processed > 1 or non-zero reserved bytes → `HeaderError::BadStat`),
+and negative window offsets round-trip.
+
+**Compat strategy — chosen (b), B0-style storage-format recovery.** Two options
+were on the table: (a) an UNKNOWN tri-state that fails closed with a new 422
+reason when a header lacks stat bytes, or (b) treat a foreign field-file version
+as the same "unusable store" condition phase B0 already handles for `grid.bin`.
+Chosen: **(b)**. Rationale: (a) needs a new API-visible error reason and a
+half-migrated index (some fields guarded, some unknown); (b) reuses machinery
+that is already loud, counted, tested end-to-end (`grid_upgrade.rs`) and
+self-healing — one generalized pre-index pass (`collect_field_files` +
+`bin_version_of_path`, a 12-byte read per candidate) plus ONE distinct
+`open_field` error string ("bad bin version") so the log can name found vs
+current version. Cost is one re-decode per affected model, exactly as in B0;
+no new states leak into `/v1/point`. Version 1 stores therefore UPGRADE
+themselves on first boot instead of answering from mis-parsed headers.
+
+**Behavior deltas (deliberate).**
+* Warm start with missing/unparsable manifest: LOUD once-per-run note + exactly
+  one counted ingest error each; indexing and answers proceed from the headers;
+  the manifest is rewritten whenever that run ingests again.
+* A failed manifest WRITE now increments the same `failed` counter a failed
+  GROUP write does, so the source file is NOT marked ingested and retries next
+  round (idempotent via merge dedup + atomic rename). Error accounting stays
+  "exactly ONE error per file-with-failure": the inner manifest branch no longer
+  double-counts alongside the outer `failed_groups > 0` branch.
+* Golden fixtures: `writer_golden_v2.bin` (488 B, real 0–6 h accumulation window)
+  is the byte contract; `writer_golden_v1.bin` (456 B) is kept and asserted to be
+  REJECTED as an old format, not mis-parsed.
+
+**API-visible changes: none new.** Same status codes and reasons; the change
+makes existing ones truthful after manifest loss (inventory/`/ready` reflect the
+headers, accumulation queries keep returning 422 `stat_time_guard`).
+
+**Gates added:** `warm_boot_without_manifest_keeps_the_accumulation_guard`,
+`corrupt_manifest_boot_is_loud_counted_and_still_answers_right`
+(`stat_durability.rs`); `manifest_write_failure_blocks_state_record_and_retries_next_round`
+(`manifest_fail_retry.rs`); `v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source`
+(`field_upgrade.rs`); `header_stat_metadata_round_trips_and_guards`,
+`corrupt_stat_bytes_and_foreign_versions_are_refused` (`storage_roundtrip.rs`);
+`v1_golden_is_rejected_as_an_old_format_not_misparsed` (`writer_golden.rs`).
+Every one FAILS against pre-fix behavior by construction (pre-fix: 200 + linear
+interp after manifest loss; no notes/errors; REC_OK stuck on manifest failure;
+no field-version pre-check at all; no stat bytes to round-trip).

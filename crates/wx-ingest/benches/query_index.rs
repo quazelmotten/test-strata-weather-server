@@ -5,7 +5,7 @@
 // function". Run: cargo bench -p wx-ingest.
 
 use wx_core::grid::{GridDef, GridRegular};
-use wx_core::storage::{BinHeader, MmapField, open_field, write_bin_atomic};
+use wx_core::storage::{BinHeader, StatMeta, MmapField, open_field, write_bin_atomic};
 use wx_core::interp::{TimeInterpMode, PointError};
 use wx_ingest::index::{IndexSnapshot, IdxModel, IdxRun, IdxFieldEntry, IdxField,
                        IdxFh, build_context, evaluate_point};
@@ -27,6 +27,7 @@ fn write_fh_file(path: &str, nx: u32, ny: u32) -> bool {
         levels: gfs_levels(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let mut planes: Vec<Vec<f32>> = Vec::new();
     for li in 0 .. 8 {

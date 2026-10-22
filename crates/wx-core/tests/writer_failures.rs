@@ -10,7 +10,7 @@
 //
 // Single test again: process-wide counters are asserted here too.
 
-use wx_core::storage::{BinHeader, write_bin_atomic, open_field, unique_tmp_path,
+use wx_core::storage::{BinHeader, StatMeta, write_bin_atomic, open_field, unique_tmp_path,
                        counters_snapshot, counters_reset};
 use std::fs::create_dir_all;
 use std::fs::read_dir;
@@ -98,6 +98,7 @@ fn failed_writes_leave_no_temp_litter_and_keep_the_original() {
         levels: [850.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let target = format!("{0}/field.bin", rw);
     let good: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
@@ -131,6 +132,7 @@ fn failed_writes_leave_no_temp_litter_and_keep_the_original() {
         levels: [850.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let rb = write_bin_atomic(target.to_string(), &hdr_bad, &refs);
     assert!(rb.is_err());

@@ -23,7 +23,7 @@ use wx_ingest::index::{IdxField, IdxFh, IdxFieldEntry, IdxModel, IdxRun, IndexSn
                        build_context, evaluate_point};
 use wx_core::grid::{GridDef, GridRegular};
 use wx_core::interp::{HorizMethod, LevelInterpMethod, PointError, TimeInterpMode};
-use wx_core::storage::{BinHeader, bits_to_f32, MmapField, open_field, write_bin_atomic};
+use wx_core::storage::{BinHeader, StatMeta, bits_to_f32, MmapField, open_field, write_bin_atomic};
 use wx_core::tables::{lookup_level_type};
 use wx_ingest::discovery::{path_to_str};
 use std::sync::Arc;
@@ -96,6 +96,7 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64,
         levels: lv32,
         scan_ns: false, // scan_mode 0x40: rows advance northward
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let path = format!("{0}/{1}", dir, name);
     let wr = write_bin_atomic(path, &hdr, &refs);

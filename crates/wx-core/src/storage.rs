@@ -37,12 +37,12 @@
 //! ([`counters_snapshot`]: renames, bytes written, fsyncs). Relaxed atomics:
 //! cheap, and OUTSIDE the query hot path.
 //!
-//! ## Header layout (fixed 24 bytes + 4 bytes per level, all little-endian)
+//! ## Header layout V1.3 E0 (fixed 56 bytes + 4 bytes per level, all little-endian)
 //!
 //! ```text
 //! offset  size  field
 //! 0       8     magic ASCII "WXPTBIN1"
-//! 8       4     version u32 (= BIN_VERSION = 1)
+//! 8       4     version u32 (= BIN_VERSION = 2)
 //! 12      4     nx u32
 //! 16      4     ny u32
 //! 20      2     nlevels u16
@@ -51,14 +51,41 @@
 //!                 `scan_ns`), bit1 = winds_grid (grid-relative component flag
 //!                 as stored at ingest; queries are uniform but the flag is
 //!                 kept for round-tripping)
-//! 23      1     reserved (0)
-//! 24      4*n   level coords, f32 LE, in CANONICAL ORDER:
+//! 23      1     stat_kind: STAT_INSTANTANEOUS(0) / STAT_ACCUMULATION(1) /
+//!                 STAT_AVERAGE(2) / STAT_MAXIMUM(3) / STAT_MINIMUM(4) /
+//!                 STAT_OTHER(5) — mirrors grib2::StatKind (V1.3 E0 addition)
+//! 24      1     stat_processed u8 (0/1): PDT 4.8 statistical processing seen
+//!                 at decode. THE ACCUMULATION GUARD READS THIS BYTE, not
+//!                 manifest.json (V1.3 E0: metadata that guards an answer must
+//!                 live in the file that carries the answer)
+//! 25      3     reserved (must be 0)
+//! 28      8     stat_begin_secs i64 LE, statistical window BEGIN relative to
+//!                 the run time (0 for instantaneous fields)
+//! 36      8     stat_end_secs i64 LE, window END relative to the run time
+//! 44      8     stat_step_secs i64 LE, CT 4.11 step length in seconds
+//! 52      4     reserved (must be 0)
+//! 56      4*n   level coords, f32 LE, in CANONICAL ORDER:
 //!                 - isobaric levels descending by pressure (1000, 925, ... hPa)
 //!                 - every other level type ascending (height_above_ground,
 //!                   msl, sigma, ...)
-//! data    4*nx*ny per level, f32 LE, slab li at byte 24+4n + li*nx*ny*4,
+//! data    4*nx*ny per level, f32 LE, slab li at byte 56+4n + li*nx*ny*4,
 //!         row-major [j][i] in STORED scan order (j follows the scan flag)
 //! ```
+//!
+//! ### Version history
+//!
+//! * **v1** (through V1.2): fixed header was 24 bytes — magic, version, nx, ny,
+//!   nlevels, flags, ONE reserved byte — then the level coords. Statistical
+//!   process metadata lived ONLY in `manifest.json`, so a missing or corrupt
+//!   manifest made a warm start treat accumulations as instantaneous and
+//!   TIME-INTERPOLATE them (spec §6.3 violation, silent wrong answer). Fixed by
+//!   bumping to v2 and moving the metadata here.
+//! * **v2** (V1.3 phase E0): 56-byte fixed header as above. A v1 field file is
+//!   REJECTED structurally (`HeaderError::BadVersion` → `open_field` reports
+//!   `"bad bin version"`), and the warm-start rebuild turns that into the same
+//!   loud STORAGE-FORMAT RECOVERY the grid.bin upgrade trap uses (delete the run
+//!   dir, forget the model's ingest records, re-decode from source), so an old
+//!   store can NEVER answer from lost metadata. See docs/DECISIONS.md V1.3-E0.
 //!
 //! ## mmap lifetime (spec §5)
 //!
@@ -78,14 +105,99 @@ use std::sync::atomic::Ordering;
 /// Magic bytes of every .bin file ("WXPTBIN1").
 pub const BIN_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x42, 0x49, 0x4E, 0x31];
 
-/// Current format version.
-pub const BIN_VERSION: u32 = 1;
+/// Current format version. Bumped 1 -> 2 in V1.3 phase E0 because the header
+/// gained the PDT 4.8 statistical-process metadata (see module docs); a v1
+/// field file cannot represent it, so refusing beats silently losing the
+/// accumulation guard.
+pub const BIN_VERSION: u32 = 2;
 
 /// Fixed part of the header before the level coordinates (bytes).
-pub const BIN_FIXED_HEADER: usize = 24;
+pub const BIN_FIXED_HEADER: usize = 56;
 
 /// One stored level coordinate (f32 LE bytes).
 pub const BIN_LEVEL_BYTES: usize = 4;
+
+// ---------------------------------------------------------------------------
+// statistical-process metadata (V1.3 phase E0)
+// ---------------------------------------------------------------------------
+
+// `stat_kind` codes stored in the header. They MIRROR `grib2::StatKind` (which
+// wx-core cannot depend on: grib2 lives in wx-ingest), and the name table below
+// is the same one `pipeline::stat_kind_name` renders into manifest.json and
+// `/v1/inventory`, so code <-> name round-trips exactly across all three.
+pub const STAT_INSTANTANEOUS: u8 = 0;
+pub const STAT_ACCUMULATION: u8 = 1;
+pub const STAT_AVERAGE: u8 = 2;
+pub const STAT_MAXIMUM: u8 = 3;
+pub const STAT_MINIMUM: u8 = 4;
+pub const STAT_OTHER: u8 = 5;
+
+/// Canonical lower-case name of a stat-kind code ("instantaneous", ...).
+pub fn stat_kind_name(code: u8) -> &'static str {
+    match code {
+        STAT_INSTANTANEOUS => { return "instantaneous"; }
+        STAT_ACCUMULATION => { return "accumulation"; }
+        STAT_AVERAGE => { return "average"; }
+        STAT_MAXIMUM => { return "maximum"; }
+        STAT_MINIMUM => { return "minimum"; }
+        _ => { return "other"; }
+    }
+}
+
+/// Code of a canonical stat-kind name; anything unrecognized maps to
+/// `STAT_OTHER`, which still GUARDS time interpolation (fail closed).
+pub fn stat_kind_code(name: &str) -> u8 {
+    if name == "instantaneous" {
+        return STAT_INSTANTANEOUS;
+    }
+    if name == "accumulation" {
+        return STAT_ACCUMULATION;
+    }
+    if name == "average" {
+        return STAT_AVERAGE;
+    }
+    if name == "maximum" {
+        return STAT_MAXIMUM;
+    }
+    if name == "minimum" {
+        return STAT_MINIMUM;
+    }
+    return STAT_OTHER;
+}
+
+/// Per-field-file statistical-process metadata (spec §4.2 "store the process
+/// type AND the time range"). One .bin file IS one (param, level type, forecast
+/// hour) group, so ONE record per file is exactly right. Begin/end/step are
+/// SECONDS RELATIVE TO THE RUN TIME, matching what the index and manifest use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatMeta {
+    pub processed: bool,
+    pub kind: u8, // one of the STAT_* codes above
+    pub begin_secs: i64,
+    pub end_secs: i64,
+    pub step_secs: i64,
+}
+
+impl StatMeta {
+    /// The metadata of a plain PDT 4.0 field (no guard, no range).
+    pub fn instantaneous() -> StatMeta {
+        return StatMeta {
+            processed: false,
+            kind: STAT_INSTANTANEOUS,
+            begin_secs: 0,
+            end_secs: 0,
+            step_secs: 0,
+        };
+    }
+
+    /// TRUE when a query must NOT interpolate this field in time (spec §6.3).
+    /// Fail CLOSED: either signal alone is enough — a file that claims a stat
+    /// KIND but forgot the flag (or vice versa) still gets guarded, because a
+    /// rejected query beats a wrong number.
+    pub fn guards_time(self: &Self) -> bool {
+        return self.processed || self.kind != STAT_INSTANTANEOUS;
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BinHeader {
@@ -94,6 +206,9 @@ pub struct BinHeader {
     pub levels: Vec<f32>, // canonical order (see module docs)
     pub scan_ns: bool, // row 0 = north/La1 side, rows go south
     pub winds_grid: bool,
+    /// PDT 4.8 statistical-process metadata (V1.3 E0): the accumulation guard
+    /// reads THIS, from the durable file, never manifest.json.
+    pub stat: StatMeta,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +217,9 @@ pub enum HeaderError {
     BadMagic,
     BadVersion,
     BadFlags,
+    /// stat_kind / stat_processed byte out of range, or a reserved byte that
+    /// is not zero (V1.3 E0).
+    BadStat,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,13 +254,30 @@ pub fn push_le_f32(out: &mut Vec<u8>, v: f32) {
     push_le_u32(out, v.to_bits());
 }
 
+/// Append a little-endian i64 (two's complement; stored as its u64 bits).
+pub fn push_le_i64(out: &mut Vec<u8>, v: i64) {
+    let b = v as u64;
+    for k in 0 .. 8 {
+        out.push(((b >> (k * 8)) & 0xFF) as u8);
+    }
+}
+
+/// Read a little-endian i64 at `off` (caller guarantees 8 readable bytes).
+pub fn le_i64(b: &[u8], off: usize) -> i64 {
+    let mut v: u64 = 0;
+    for k in 0 .. 8 {
+        v |= (b[off + k] as u64) << (k * 8);
+    }
+    return v as i64;
+}
+
 // ---------------------------------------------------------------------------
 // header encode / validate
 // ---------------------------------------------------------------------------
 
 /// Serialize a header (not the data planes).
 pub fn encode_header(hdr: &BinHeader) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
+    let mut out: Vec<u8> = Vec::<u8>::new();
     for b in BIN_MAGIC {
         out.push(b);
     }
@@ -152,11 +287,24 @@ pub fn encode_header(hdr: &BinHeader) -> Vec<u8> {
     push_le_u16(&mut out, hdr.levels.len() as u16);
     let flags = (if hdr.scan_ns { 1 } else { 0 }) | (if hdr.winds_grid { 2 } else { 0 });
     out.push(flags as u8);
+    // --- V1.3 E0 statistical-process metadata ------------------------------
+    out.push(hdr.stat.kind);
+    let sp: u8 = if hdr.stat.processed { 1 } else { 0 };
+    out.push(sp);
+    out.push(0); // reserved x3 (validated ZERO on read)
     out.push(0);
-    for k in 0..hdr.levels.len() {
+    out.push(0);
+    push_le_i64(&mut out, hdr.stat.begin_secs);
+    push_le_i64(&mut out, hdr.stat.end_secs);
+    push_le_i64(&mut out, hdr.stat.step_secs);
+    out.push(0); // reserved u32 (validated ZERO on read)
+    out.push(0);
+    out.push(0);
+    out.push(0);
+    for k in 0 .. hdr.levels.len() {
         push_le_f32(&mut out, hdr.levels[k]);
     }
-    out
+    return out;
 }
 
 /// Parse + validate a header from the first bytes of a .bin file.
@@ -164,7 +312,7 @@ pub fn decode_header(b: &[u8]) -> Result<BinHeader, HeaderError> {
     if b.len() < BIN_FIXED_HEADER {
         return Err(HeaderError::Truncated);
     }
-    for k in 0..8 {
+    for k in 0 .. 8 {
         if b[k] != BIN_MAGIC[k] {
             return Err(HeaderError::BadMagic);
         }
@@ -177,11 +325,29 @@ pub fn decode_header(b: &[u8]) -> Result<BinHeader, HeaderError> {
     if (flags & 0xFC) != 0 {
         return Err(HeaderError::BadFlags);
     }
+    // V1.3 E0: the stat bytes are part of the VALIDATED surface. A kind code
+    // outside the table, a processed byte that is not 0/1, or a non-zero
+    // reserved byte means the file was not written by this writer, so we refuse
+    // it rather than guess at what the guard should have been.
+    let kind = b[23];
+    if kind > STAT_OTHER {
+        return Err(HeaderError::BadStat);
+    }
+    let spb = b[24];
+    if spb > 1 {
+        return Err(HeaderError::BadStat);
+    }
+    if b[25] != 0 || b[26] != 0 || b[27] != 0 {
+        return Err(HeaderError::BadStat);
+    }
+    if b[52] != 0 || b[53] != 0 || b[54] != 0 || b[55] != 0 {
+        return Err(HeaderError::BadStat);
+    }
     if b.len() < BIN_FIXED_HEADER + nlevels * BIN_LEVEL_BYTES {
         return Err(HeaderError::Truncated);
     }
-    let mut levels: Vec<f32> = Vec::new();
-    for k in 0..nlevels {
+    let mut levels: Vec<f32> = Vec::<f32>::new();
+    for k in 0 .. nlevels {
         let off = BIN_FIXED_HEADER + k * BIN_LEVEL_BYTES;
         levels.push(bits_to_f32(le_u32(b, off)));
     }
@@ -191,6 +357,13 @@ pub fn decode_header(b: &[u8]) -> Result<BinHeader, HeaderError> {
         levels: levels,
         scan_ns: (flags & 1) != 0,
         winds_grid: (flags & 2) != 0,
+        stat: StatMeta {
+            processed: spb != 0,
+            kind: kind,
+            begin_secs: le_i64(b, 28),
+            end_secs: le_i64(b, 36),
+            step_secs: le_i64(b, 44),
+        },
     })
 }
 
@@ -565,7 +738,11 @@ pub struct MmapField {
 }
 
 /// Open, map and validate one .bin file. All mmaps are opened at index-build
-/// time (spec §5), never per request.
+/// time (spec §5), never per request. The error strings are PART OF THE WARM-
+/// START CONTRACT, not just diagnostics: `"bad bin version"` is what tells
+/// `pipeline::ingest_run_dir` to run the storage-format recovery (delete the
+/// run dir, forget the model's records, re-decode from source) instead of
+/// indexing a store whose statistical metadata this build cannot read.
 pub fn open_field(path: String) -> Result<MmapField, &'static str> {
     let f = std::fs::File::open(path);
     match f {
@@ -577,6 +754,7 @@ pub fn open_field(path: String) -> Result<MmapField, &'static str> {
                 Ok(region) => {
                     let hdr_res = decode_header(&region);
                     match hdr_res {
+                        Err(HeaderError::BadVersion) => { return Err("bad bin version"); }
                         Err(_) => { return Err("bad header"); }
                         Ok(hdr) => {
                             let want = expected_size(&hdr);
@@ -593,6 +771,33 @@ pub fn open_field(path: String) -> Result<MmapField, &'static str> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Read ONLY the format-version field of a .bin file (magic + version = the
+/// first 12 bytes) without mapping it. Used by the warm-start upgrade check so
+/// the recovery log can name the offending file AND the version it found; a
+/// multi-megabyte plane never gets faulted in just to ask that question.
+/// None = unreadable / too short / wrong magic (the caller then falls through
+/// to `open_field`, which reports the structural failure).
+pub fn bin_version_of_path(path: &str) -> Option<u32> {
+    use std::io::Read;
+    let f = std::fs::File::open(path);
+    match f {
+        Err(_) => { return None; }
+        Ok(mut h) => {
+            let mut b: [u8; 12] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+            let r = h.read_exact(&mut b);
+            if r.is_err() {
+                return None;
+            }
+            for k in 0 .. 8 {
+                if b[k] != BIN_MAGIC[k] {
+                    return None;
+                }
+            }
+            return Some(le_u32(&b, 8));
         }
     }
 }

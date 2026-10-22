@@ -10,7 +10,8 @@
 // inside one binary concurrently.
 
 use wx_ingest::store::{merge_write_field, merge_field};
-use wx_core::storage::{open_field, expected_size, counters_snapshot, counters_reset};
+use wx_core::storage::{open_field, expected_size, counters_snapshot, counters_reset,
+                       StatMeta, STAT_ACCUMULATION};
 use std::fs::read_dir;
 use std::fs::remove_file;
 use std::fs::remove_dir;
@@ -76,7 +77,7 @@ fn batch_merge_of_k_levels_onto_l_existing_costs_one_write() {
         (925.0, plane(200.0)),
         (850.0, plane(300.0)),
     ].to_vec();
-    let r1 = merge_write_field(path.to_string(), 100, NX, NY, true, false, first);
+    let r1 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(), first);
     assert!(r1.is_ok());
     match r1 {
         Err(_) => {}
@@ -98,7 +99,7 @@ fn batch_merge_of_k_levels_onto_l_existing_costs_one_write() {
         (850.0, plane(900.0)),
     ].to_vec();
     let before = counters_snapshot();
-    let r2 = merge_write_field(path.to_string(), 100, NX, NY, true, false, second);
+    let r2 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(), second);
     assert!(r2.is_ok());
     let after = counters_snapshot();
 

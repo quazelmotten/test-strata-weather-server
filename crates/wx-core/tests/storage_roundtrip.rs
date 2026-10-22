@@ -7,7 +7,7 @@ use wx_core::storage::open_field;
 use wx_core::storage::encode_header;
 use wx_core::storage::decode_header;
 use wx_core::storage::expected_size;
-use wx_core::storage::BinHeader;
+use wx_core::storage::{BinHeader, StatMeta, STAT_ACCUMULATION, HeaderError, BIN_VERSION};
 use wx_core::storage::BIN_FIXED_HEADER;
 use std::io::Write;
 
@@ -37,6 +37,7 @@ fn roundtrip_write_read() {
     let hdr = BinHeader {
         nx: 4, ny: 3, levels: v2(1000.0, 925.0),
         scan_ns: true, winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let mut p0: Vec<f32> = Vec::<f32>::new();
     let mut p1: Vec<f32> = Vec::<f32>::new();
@@ -77,6 +78,7 @@ fn header_roundtrip_codec() {
     let hdr = BinHeader {
         nx: 1440, ny: 721, levels: v3(1000.0, 925.0, 850.0),
         scan_ns: true, winds_grid: true,
+        stat: StatMeta::instantaneous(),
     };
     let bytes = encode_header(&hdr);
     assert!(bytes.len() == BIN_FIXED_HEADER + 3 * 4);
@@ -97,6 +99,7 @@ fn reject_bad_magic() {
     let hdr = BinHeader {
         nx: 2, ny: 2, levels: v1(1000.0),
         scan_ns: true, winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let bytes = encode_header(&hdr);
     let path = "/tmp/opencode/wxpt_badmagic.bin".to_string();
@@ -127,6 +130,7 @@ fn reject_truncated_data() {
     let hdr = BinHeader {
         nx: 4, ny: 4, levels: v2(1000.0, 500.0),
         scan_ns: true, winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let head = encode_header(&hdr);
     let path = "/tmp/opencode/wxpt_trunc.bin".to_string();
@@ -161,6 +165,7 @@ fn scan_flag_accessor() {
     let hdr = BinHeader {
         nx: 2, ny: 5, levels: v1(1000.0),
         scan_ns: false, winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     assert!(!hdr.scan_ns);
     let mut p0: Vec<f32> = Vec::<f32>::new();
@@ -186,5 +191,166 @@ fn scan_flag_accessor() {
             assert!(mfield.stored_row(0) == 4);
             assert!(mfield.value(0, mfield.stored_row(0), 0) == 4.0);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// V1.3 phase E0: statistical-process metadata lives IN THE HEADER
+// ---------------------------------------------------------------------------
+
+#[test]
+fn header_stat_metadata_round_trips_and_guards() {
+    // A real accumulation window (offsets relative to the run time) plus a
+    // NEGATIVE begin to pin two's-complement little-endian i64 encoding.
+    let hdr = BinHeader {
+        nx: 2, ny: 2, levels: v1(1000.0),
+        scan_ns: true, winds_grid: false,
+        stat: StatMeta {
+            processed: true,
+            kind: STAT_ACCUMULATION,
+            begin_secs: -3600,
+            end_secs: 43200,
+            step_secs: 3600,
+        },
+    };
+    let mut p0: Vec<f32> = Vec::<f32>::new();
+    for k in 0 .. 4 {
+        p0.push(k as f32);
+    }
+    let path = "/tmp/opencode/wxpt_stat.bin".to_string();
+    let w = write_bin_atomic(path.to_string(), &hdr, &[&p0[0 .. 4]]);
+    match w {
+        Err(_) => { assert!(false); return; }
+        Ok(_) => {}
+    }
+    let mf = open_field(path.to_string());
+    match mf {
+        Err(_) => { assert!(false); return; }
+        Ok(mfield) => {
+            assert!(mfield.header.stat.processed);
+            assert!(mfield.header.stat.kind == STAT_ACCUMULATION);
+            assert!(mfield.header.stat.begin_secs == -3600);
+            assert!(mfield.header.stat.end_secs == 43200);
+            assert!(mfield.header.stat.step_secs == 3600);
+            // the guard decision the query path consumes (spec §6.3)
+            assert!(mfield.header.stat.guards_time());
+            // data planes still address exactly as before the header growth
+            // (plane = [0,1,2,3] row-major over nx=2: row 1 = [2,3])
+            assert!(mfield.value(0, 0, 1) == 1.0);
+            assert!(mfield.value(0, 1, 1) == 3.0);
+        }
+    }
+
+    // An instantaneous field must NOT guard time interpolation.
+    let hdr2 = BinHeader {
+        nx: 2, ny: 2, levels: v1(1000.0),
+        scan_ns: true, winds_grid: false,
+        stat: StatMeta::instantaneous(),
+    };
+    let head2 = encode_header(&hdr2);
+    match decode_header(&head2) {
+        Err(_) => { assert!(false); return; }
+        Ok(h) => {
+            assert!(!h.stat.processed);
+            assert!(h.stat.kind == 0);
+            assert!(h.stat.begin_secs == 0 && h.stat.end_secs == 0 && h.stat.step_secs == 0);
+            assert!(!h.stat.guards_time());
+        }
+    }
+
+    // Fail-CLOSED consistency: a header that claims a stat KIND but forgot the
+    // processed flag (or the reverse) still guards, because a rejected query
+    // beats a wrong number.
+    let half = StatMeta { processed: false, kind: STAT_ACCUMULATION,
+                          begin_secs: 0, end_secs: 21600, step_secs: 0 };
+    assert!(half.guards_time());
+    let half2 = StatMeta { processed: true, kind: 0,
+                           begin_secs: 0, end_secs: 0, step_secs: 0 };
+    assert!(half2.guards_time());
+}
+
+#[test]
+fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
+    let hdr = BinHeader {
+        nx: 2, ny: 2, levels: v1(1000.0),
+        scan_ns: true, winds_grid: false,
+        stat: StatMeta {
+            processed: true,
+            kind: STAT_ACCUMULATION,
+            begin_secs: 0,
+            end_secs: 21600,
+            step_secs: 0,
+        },
+    };
+    let good = encode_header(&hdr);
+    assert!(good.len() == BIN_FIXED_HEADER + 4);
+    // baseline parses
+    match decode_header(&good) {
+        Err(_) => { assert!(false); return; }
+        Ok(_) => {}
+    }
+
+    // (a) version bumped by hand -> BadVersion (the warm-start recovery trigger)
+    let mut b = good.to_vec();
+    b[8] = ((BIN_VERSION as u32) + 1) as u8;
+    match decode_header(&b) {
+        Err(e) => {
+            match e {
+                HeaderError::BadVersion => {}
+                _ => { assert!(false); }
+            }
+        }
+        Ok(_) => { assert!(false); }
+    }
+
+    // (b) stat_kind outside the table -> BadStat (never guess what it meant)
+    let mut b2 = good.to_vec();
+    b2[23] = 9;
+    match decode_header(&b2) {
+        Err(e) => {
+            match e {
+                HeaderError::BadStat => {}
+                _ => { assert!(false); }
+            }
+        }
+        Ok(_) => { assert!(false); }
+    }
+
+    // (c) stat_processed byte not 0/1 -> BadStat
+    let mut b3 = good.to_vec();
+    b3[24] = 2;
+    match decode_header(&b3) {
+        Err(e) => {
+            match e {
+                HeaderError::BadStat => {}
+                _ => { assert!(false); }
+            }
+        }
+        Ok(_) => { assert!(false); }
+    }
+
+    // (d) reserved bytes must be zero: mid-block byte 26 ...
+    let mut b4 = good.to_vec();
+    b4[26] = 1;
+    match decode_header(&b4) {
+        Err(e) => {
+            match e {
+                HeaderError::BadStat => {}
+                _ => { assert!(false); }
+            }
+        }
+        Ok(_) => { assert!(false); }
+    }
+    // ... and the trailing reserved u32 at 52..56
+    let mut b5 = good.to_vec();
+    b5[55] = 7;
+    match decode_header(&b5) {
+        Err(e) => {
+            match e {
+                HeaderError::BadStat => {}
+                _ => { assert!(false); }
+            }
+        }
+        Ok(_) => { assert!(false); }
     }
 }

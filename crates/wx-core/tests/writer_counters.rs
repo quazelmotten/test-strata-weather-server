@@ -5,7 +5,7 @@
 // assertion lives in this single sequential test (other phase-A gates that need
 // counters get their own files/binaries too).
 
-use wx_core::storage::{BinHeader, write_bin_atomic, write_bin_atomic_stream, PlaneSource,
+use wx_core::storage::{BinHeader, StatMeta, write_bin_atomic, write_bin_atomic_stream, PlaneSource,
                        TouchedDirs, counters_snapshot, counters_reset, expected_size};
 use std::fs::create_dir_all;
 use std::fs::read_dir;
@@ -105,6 +105,7 @@ fn writer_counters_and_batched_dir_fsync() {
         levels: [850.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let plane: [f32; 12] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
     let want_bytes = expected_size(&hdr) as u64;
@@ -165,6 +166,7 @@ fn writer_counters_and_batched_dir_fsync() {
         levels: [850.0].to_vec(),
         scan_ns: true,
         winds_grid: false,
+        stat: StatMeta::instantaneous(),
     };
     let wronglen = write_bin_atomic_stream(format!("{0}/wrong.bin", da), &hdr2, 1,
                                            OnePlane { data: &plane[..], n: 1 });

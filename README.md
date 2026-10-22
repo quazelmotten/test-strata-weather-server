@@ -241,7 +241,10 @@ data_dir/
   <model>/<run>/                   # YYYYMMDDHH, +MM when the run minute OR second
                                    # != 0, +SS when the run second != 0 (10/12/14 chars)
     grid.bin                       # serialized grid definition
-    manifest.json                  # params, levels, fhs, units, stat info + ranges
+    manifest.json                  # human-facing inventory (params, levels,
+                                   # fhs, units, stat info + ranges); since
+                                   # V1.3 E0 the guard itself lives in the
+                                   # .bin headers, not in this file
     <PARAM>/<level_type>/f<FFF>.bin  # e.g. TMP/isobaric/f006.bin
 ```
 
@@ -266,11 +269,23 @@ data_dir/
   exist: Code Table 4.4's finest unit is SECOND. The reader is strict about
   non-canonical names (`f001m5.bin`, `f001m70.bin` are ignored, not guessed),
   while tolerating `f006m00.bin` as an alias for `f006.bin`.
-* `<param>/<level_type>/f<FFF>.bin`: magic `WXPTBIN1`, u32 version=1, u32 nx,
-  u32 ny, u16 nlevels, flags byte (bit0 scan N→S, bit1 winds-grid-relative),
-  then nlevels × f32 level values (pressure-sorted), then raw little-endian
-  f32 planes laid out `[level][y][x]`. f32 because GRIB packing precision is
-  already below f32; bitmap-masked points (§ sec 6) are stored as NaN.
+* `<param>/<level_type>/f<FFF>.bin`: magic `WXPTBIN1`, u32 version (**`BIN_VERSION`
+  = 2**; a version-1 file from a pre-V1.3-E0 store is detected BEFORE anything is
+  indexed and TRIGGERS AUTOMATIC RECOVERY — see §9 — never mis-parsed), u32 nx,
+  u32 ny, u16 nlevels, flags byte (bit0 scan N→S, bit1 winds-grid-relative), then
+  the PDT 4.8 STAT BLOCK that V1.3 phase E0 added (fixed header grew 24→56 bytes,
+  +32 per field file): u8 `stat_kind` at byte 23 (0 instantaneous, 1 accumulation,
+  2 average, 3 maximum, 4 minimum, 5 other), u8 `stat_processed` at byte 24, reserved zero
+  at 25–27, i64 LE `begin_secs` / `end_secs` / `step_secs` at offsets 28 / 36 / 44
+  (seconds past the RUN time; 0 when there is no range), reserved zero at 52–55.
+  The strict reader refuses kind > 5, processed > 1 or non-zero reserved bytes
+  (`HeaderError::BadStat`) instead of guessing. Then nlevels × f32 level values
+  (pressure-sorted) starting at offset 56, then raw little-endian f32 planes laid
+  out `[level][y][x]`. f32 because GRIB packing precision is already below f32;
+  bitmap-masked points (§ sec 6) are stored as NaN. THE POINT of the stat block:
+  the accumulation/average guard and its time window live INSIDE each field file,
+  so spec §6.3 stays enforced even when `manifest.json` is missing, corrupt or
+  never written — this header is exactly what a warm start reads back.
 * `grid.bin`: magic `WXPTGRID`, u32 version (**`GRID_VERSION` = 2**; a version-1
   file from a pre-V1.1-phase-4 store is detected on read and TRIGGERS AUTOMATIC
   RECOVERY — see §9 — instead of being silently ignored), kind byte (0 regular lat/lon,
@@ -307,9 +322,17 @@ data_dir/
   `stat_ranges`, one entry per statistically processed forecast hour:
   `{"fh_secs":1800,"begin":"2026-10-19T12:30:00Z","end":"2026-10-19T13:00:00Z",
   "step_secs":0}`. Two accumulations of ONE parameter have DIFFERENT windows,
-  which is why the range travels with the forecast hour rather than the field;
-  a warm start restores those ranges from this file, so the accumulation guard
-  survives restarts.
+  which is why the range travels with the forecast hour rather than the field.
+  SINCE V1.3 PHASE E0 THIS FILE IS PURELY OPERATIONAL INVENTORY: a warm start
+  reads the guard AND the per-fh windows back from each field file's own header
+  (the stat block above), never from here — so a MISSING or UNPARSABLE manifest
+  costs a loud once-per-run note plus one counted ingest error, yet every
+  answer stays right and `/ready` + `/v1/inventory` stay truthful
+  (`warm_boot_without_manifest_keeps_the_accumulation_guard`,
+  `corrupt_manifest_boot_is_loud_counted_and_still_answers_right`). A FAILED
+  manifest write likewise blocks the source file's ingested-record, so the
+  next scan round retries until inventory catches up
+  (`manifest_write_failure_blocks_state_record_and_retries_next_round`).
 * Retention: runs beyond `retention_runs` are removed from the in-memory index
   first, then deleted on disk; stale mmap handles stay valid until their last
   `Arc` reference drops (Linux unlink-while-mapped), so in-flight queries never
@@ -723,6 +746,13 @@ live in §10 and docs/DECISIONS.md.
   requirement: the SOURCE files must still be present in `ingest_dir` (if they were
   already pruned upstream the run is simply gone, LOUDLY — no silent empty inventory).
   No manual `rm -rf <data_dir>` step is needed anymore.
+  V1.3 phase E0 GENERALIZED this to FIELD files: `BIN_VERSION` went 1→2 when the
+  header gained the PDT 4.8 stat block, and the warm start now PRE-CHECKS every
+  field file's 12-byte header (`bin_version_of_path`) BEFORE anything is indexed;
+  a foreign version triggers exactly this same recovery, naming both versions in
+  the log (`found bin version 1, current 2`), so a pre-E0 store upgrades itself
+  on first boot instead of mis-parsing headers
+  (`v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source`).
 * **Stability timing is MONOTONIC (V1.2 phase B0).** The file-stability window is
   measured with `std::time::Instant`, never against wall-clock mtimes, so NTP step-
   backs, container restore or VM pause cannot freeze ingest. File IDENTITY is still

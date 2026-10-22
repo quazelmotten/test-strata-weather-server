@@ -12,7 +12,7 @@
 //     must survive repeated merges.
 
 use wx_ingest::store::{merge_field, merge_write_field};
-use wx_core::storage::{open_field,};
+use wx_core::storage::{open_field, StatMeta};
 use std::fs::read_dir;
 use std::fs::remove_file;
 use std::fs::remove_dir;
@@ -86,12 +86,12 @@ fn reingesting_a_level_replaces_it_instead_of_duplicating() {
     let path = format!("{0}/TMP_isobaric_f006.bin", dir);
 
     // 837.55 hPa: f32 storage rounds it, so disk value != requested f64.
-    let r1 = merge_write_field(path.to_string(), 100, NX, NY, true, false,
+    let r1 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                                [(837.55, plane(10.0))].to_vec());
     assert!(r1.is_ok());
 
     // (1) same f64 again -> still ONE level, plane REPLACED
-    let r2 = merge_write_field(path.to_string(), 100, NX, NY, true, false,
+    let r2 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                                [(837.55, plane(20.0))].to_vec());
     assert!(r2.is_ok());
     let mf1 = open_field(path.to_string());
@@ -119,7 +119,7 @@ fn reingesting_a_level_replaces_it_instead_of_duplicating() {
         Ok(f) => { stored_lv = f.header.levels[0] as f64; }
     }
     assert!(stored_lv != 837.55); // proves the f64 values really differ
-    let r3 = merge_write_field(path.to_string(), 100, NX, NY, true, false,
+    let r3 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                                [(stored_lv, plane(30.0))].to_vec());
     assert!(r3.is_ok());
     let mf3 = open_field(path.to_string());
@@ -139,10 +139,10 @@ fn reingesting_a_level_replaces_it_instead_of_duplicating() {
 
     // (3) the named 837.5 path (exactly representable) keeps working too
     let p2 = format!("{0}/TMP2_isobaric_f000.bin", dir);
-    let a = merge_write_field(p2.to_string(), 100, NX, NY, true, false,
+    let a = merge_write_field(p2.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                               [(837.5, plane(1.0)), (1000.0, plane(2.0))].to_vec());
     assert!(a.is_ok());
-    let b = merge_write_field(p2.to_string(), 100, NX, NY, true, false,
+    let b = merge_write_field(p2.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                               [(837.5, plane(9.0))].to_vec());
     assert!(b.is_ok());
     match b {
@@ -162,7 +162,7 @@ fn duplicates_inside_one_batch_resolve_first_entry_wins() {
         (850.0, plane(11.0)),
         (850.0, plane(22.0)),
     ].to_vec();
-    let r = merge_write_field(path.to_string(), 100, NX, NY, true, false, grp);
+    let r = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(), grp);
     assert!(r.is_ok());
     let mf = open_field(path.to_string());
     match mf {
@@ -193,7 +193,7 @@ fn slice_readback_matches_scalar_readback_and_order_survives_merges() {
         (2.0, plane(2.0)),
         (8.0, plane(3.0)),
     ].to_vec();
-    let r = merge_write_field(path.to_string(), 103, NX, NY, true, false, seed);
+    let r = merge_write_field(path.to_string(), 103, NX, NY, true, false, StatMeta::instantaneous(), seed);
     assert!(r.is_ok());
 
     // merge with NOTHING new: readback-only pass, planes must come back IDENTICAL
@@ -224,7 +224,7 @@ fn slice_readback_matches_scalar_readback_and_order_survives_merges() {
 
     // merge a NEW level into the existing file: order stays ASCENDING and every
     // pre-existing plane survives bit-for-bit.
-    let r2 = merge_write_field(path.to_string(), 103, NX, NY, true, false,
+    let r2 = merge_write_field(path.to_string(), 103, NX, NY, true, false, StatMeta::instantaneous(),
                                [(4.0, plane(4.0))].to_vec());
     assert!(r2.is_ok());
     let mf = open_field(path.to_string());
