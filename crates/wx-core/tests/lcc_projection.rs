@@ -123,3 +123,243 @@ fn lcc_inverse_roundtrip() {
         }
     }
 }
+
+// ===========================================================================
+// V1.4 phase T additions: strict §9.2 golden pins for the FOUR CORNER NODES +
+// CENTER NODE (the checks above pin only the NW node exactly and range-check
+// the center area).
+//
+// External truth source: tests/fixtures/rotation_expected.csv -- committed
+// table produced by scripts/validate_rotation.py with PYPROJ (independent
+// implementation): each row stores the geographic coordinates of stored grid
+// node (i,j) computed with pyproj's OWN LCC inverse on the fixture's exact
+// earth shape (sphere R = 6371229 m from Code Table byte 6), origin pinned to
+// (Lo1, La1) exactly like our GridLambert. expected.json's wgrib2 -ll2ij
+// table covers random probe longitudes but NOT the corner/center nodes, so
+// these rows are the external goldens for them; feeding the CSV lat/lon
+// through OUR forward transform and requiring the printed (i,j) back within
+// 1e-4 GRID UNITS is a genuine cross-implementation check (the same table
+// already backs wx-ingest/tests/rotation_vs_pyproj.rs at 1e-6 deg for the
+// wind angle). The CSV's i/j columns follow OUR storage convention (0-based
+// i, j counted from the La1/north row -- verified: row (0,0) carries lat
+// 21.11389 == La1, row (0,40) lat 20.0489 < it, so NO wgrib2 south-counting
+// flip applies to this table). Rows marked SELF-CONSISTENCY below use our own
+// inverse() and pin internal identities only, never external truth.
+// ===========================================================================
+
+use wx_core::grid::D2R;
+use wx_core::grid::norm_lon;
+use wx_core::tables::parse_f64;
+use std::fs::read_to_string;
+
+struct CsvRow {
+    i: f64,
+    j: f64,
+    lat: f64,
+    lon: f64,
+}
+
+fn hrrr_pyproj_rows() -> Vec<CsvRow> {
+    let txt = match read_to_string("../../tests/fixtures/rotation_expected.csv") {
+        Err(_e) => { panic!(); }
+        Ok(t) => { t }
+    };
+    let mut out: Vec<CsvRow> = Vec::<CsvRow>::new();
+    for ln0 in txt.split('\n') {
+        // tolerate CRLF if the table is ever regenerated on Windows
+        let ln: &str = if !ln0.is_empty() &&
+                         ln0[ln0.len() - 1 .. ln0.len()] == *"\r" {
+            &ln0[0 .. ln0.len() - 1]
+        } else {
+            ln0
+        };
+        let parts: Vec<&str> = ln.split(',').collect();
+        if parts.len() < 6 || parts[0] != "hrrr_small.grib2" {
+            continue;
+        }
+        let fi = parse_f64(parts[1]);
+        let fj = parse_f64(parts[2]);
+        let fl = parse_f64(parts[3]);
+        let fo = parse_f64(parts[4]);
+        if let (Some(a), Some(b), Some(la), Some(lo)) = (fi, fj, fl, fo) {
+            out.push(CsvRow { i: a, j: b, lat: la, lon: lo });
+        }
+    }
+    out
+}
+
+/// Ungated twin of GridLambert::project's arithmetic: the SAME forward
+/// transform + linear scaling + scan fold, WITHOUT the §6.1 closed-node-
+/// rectangle gate (which would reject on-boundary CSV points that print
+/// rounding pushes ~1e-8 cells past an edge -- see the artifact test below).
+/// §9.2 validates PROJECTION MATH against external truth; the domain gate is
+/// §6.1 territory and is pinned separately in lcc_out_of_domain.rs.
+fn fwd_ij(g: &GridLambert, lat: f64, lon: f64) -> (f64, f64) {
+    let xy = g.for_point(norm_lon(lon) * D2R, lat * D2R);
+    match xy {
+        None => { panic!(); }
+        Some((x, y)) => {
+            let di = (x - g.x0) * g.inv_dx;
+            let dj_north = (y - g.y0) * g.inv_dy;
+            let dj = if g.j_south { -dj_north } else { dj_north };
+            (di, dj)
+        }
+    }
+}
+
+#[test]
+fn lcc_corner_and_center_nodes_match_pyproj_truth_1e_4() {
+    // spec §9.2 literal demand: "the four corners, the center, and at least
+    // 20 random points ... to within 1e-4 grid units" vs an EXTERNAL tool.
+    // Every hrrr_small row in the pyproj table (corners (0,0),(60,0),(0,40),
+    // (60,40), center (30,20) plus 16 random nodes) must survive our forward
+    // transform within 1e-4 storage cells. External truth: PYPROJ, not our
+    // own math (self-consistency pins are the round-trip test further down).
+    let g = make_lcc();
+    let gl = match g {
+        GridDef::Lambert(ref gg) => { gg.clone() }
+        _ => { panic!(); }
+    };
+    let rows = hrrr_pyproj_rows();
+    assert!(rows.len() >= 20);
+    // the five §9.2-mandated nodes must all be present in the table
+    let wanted: [[f64; 2]; 5] = [
+        [0.0, 0.0], [60.0, 0.0], [0.0, 40.0], [60.0, 40.0], [30.0, 20.0],
+    ];
+    for w in wanted {
+        let mut found = false;
+        for r in &rows {
+            if r.i == w[0] && r.j == w[1] {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("corner/center node ({0},{1}) missing from pyproj table", w[0], w[1]);
+            panic!();
+        }
+    }
+    // the table's NW row must agree with the fixture's declared Lo1/La1
+    for r in &rows {
+        if r.i == 0.0 && r.j == 0.0 {
+            assert!(abs_diff(r.lat, 21.11389) <= 1e-9);
+            assert!(abs_diff(norm_lon(r.lon), 233.44) <= 1e-9);
+        }
+    }
+    let mut worst = 0.0;
+    for r in &rows {
+        let p = fwd_ij(&gl, r.lat, r.lon);
+        let dxi = abs_diff(p.0, r.i);
+        let dxj = abs_diff(p.1, r.j);
+        let d = if dxi > dxj { dxi } else { dxj };
+        if d > worst {
+            worst = d;
+        }
+        if d > 1e-4 {
+            println!("node ({0},{1}): our forward gives ({2},{3}), off from pyproj by {4} cells",
+                     r.i, r.j, p.0, p.1, d);
+            panic!();
+        }
+    }
+    println!("pyproj corner/center/random forwards: {0} rows, worst {1} grid units (limit 1e-4)",
+             rows.len(), worst);
+}
+
+#[test]
+fn lcc_pyproj_negative_lon_forms_project_identically() {
+    // The CSV prints longitudes in -180..180 form; §4.3 requires 0..360 to
+    // behave identically. Through the PUBLIC domain-checked project(), both
+    // conventions must return the SAME Option bit-for-bit on every external
+    // row (Some==Some or None==None -- the boundary artifact below applies
+    // equally to both forms).
+    let g = make_lcc();
+    let gl = match g {
+        GridDef::Lambert(ref gg) => { gg.clone() }
+        _ => { panic!(); }
+    };
+    for r in hrrr_pyproj_rows() {
+        let a = gl.project(r.lat, r.lon);
+        let b = gl.project(r.lat, r.lon + 360.0);
+        if a != b {
+            println!("row ({0},{1}): -180 form {2:?} vs 0..360 form {3:?}", r.i, r.j, a, b);
+            panic!();
+        }
+    }
+}
+
+#[test]
+fn lcc_pyproj_boundary_node_print_artifact_pinned() {
+    // Pin a documented HEAD subtlety so nobody silently widens PROJ_NODE_EPS:
+    // pyproj printed the NE node (60,0) to 9 decimals; that quantization
+    // (~1.1e-8 grid cells ~ 32 um north of the La1 row, measured) sits
+    // OUTSIDE the closed node rectangle's 1e-9 eps, so the DOMAIN-GATED
+    // project() rejects the printed coordinate while the ungated projection
+    // MATH still reproduces (60,0) at 1.1e-8 << 1e-4 (golden test above).
+    // This is a FIXTURE PRINT artifact, not a projection error and not a
+    // spec behaviour change. The other four goldened nodes land slightly on
+    // the INSIDE of the rectangle and are accepted within 1e-4 -- pinned too.
+    let g = make_lcc();
+    let gl = match g {
+        GridDef::Lambert(ref gg) => { gg.clone() }
+        _ => { panic!(); }
+    };
+    let rows = hrrr_pyproj_rows();
+    let mut ne_seen = false;
+    for r in &rows {
+        let corner_or_center = ((r.i == 0.0 || r.i == 60.0) && (r.j == 0.0 || r.j == 40.0))
+                             || (r.i == 30.0 && r.j == 20.0);
+        if !corner_or_center {
+            continue;
+        }
+        if r.i == 60.0 && r.j == 0.0 {
+            ne_seen = true;
+            if gl.project(r.lat, r.lon).is_some() {
+                println!("NE-node printed coord accepted: did PROJ_NODE_EPS widen?");
+                panic!();
+            }
+        } else {
+            match gl.project(r.lat, r.lon) {
+                None => {
+                    println!("node ({0},{1}) printed coord rejected", r.i, r.j);
+                    panic!();
+                }
+                Some((di, dj)) => {
+                    assert!(abs_diff(di, r.i) <= 1e-4 && abs_diff(dj, r.j) <= 1e-4);
+                }
+            }
+        }
+    }
+    if !ne_seen {
+        println!("no (60,0) row in table");
+        panic!();
+    }
+}
+
+#[test]
+fn lcc_corner_and_center_nodes_self_roundtrip() {
+    // SELF-CONSISTENCY pin (explicitly NOT external truth): inverse() at each
+    // of the five mandated nodes yields full-f64 coordinates (no 9-decimal
+    // print quantization) that the public domain-checked project() must send
+    // back to the exact node within 1e-6 cells -- i.e. all five corner/center
+    // NODES lie inside the accepted rectangle and round-trip exactly (all
+    // five errors measured <= 7.4e-13). External-truth coverage for the same
+    // points is the pyproj golden test above.
+    let gl = GridLambert::new(61, 41, 21.11389, 233.44, 229.53, 26.5,
+                              26.5, 35.0, 3000.0, 3000.0, 1, 0, 6, true);
+    let pts: [[f64; 2]; 5] = [
+        [0.0, 0.0], [60.0, 0.0], [0.0, 40.0], [60.0, 40.0], [30.0, 20.0],
+    ];
+    for pt in pts {
+        let pos = gl.inverse(pt[0], pt[1]);
+        match gl.project(pos.0, pos.1) {
+            None => {
+                println!("exact node ({0},{1}) rejected via its own inverse coords", pt[0], pt[1]);
+                panic!();
+            }
+            Some((di, dj)) => {
+                assert!(abs_diff(di, pt[0]) <= 1e-6);
+                assert!(abs_diff(dj, pt[1]) <= 1e-6);
+            }
+        }
+    }
+}
