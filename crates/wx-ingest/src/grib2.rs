@@ -361,6 +361,33 @@ pub fn f64_abs(x: f64) -> f64 {
 // section parsers
 // ---------------------------------------------------------------------------
 
+/// V1.4 phase B1 GLOBAL GRID-POINT CEILING. A grid definition is trusted
+/// content: before this cap existed a forged 0x000F4240 x 0x000F4240 template
+/// 3.0 (nx = ny = 1e6) parsed cleanly and every downstream plane allocation
+/// sized itself from nx*ny — 1e12 points, ~4 TB per parameter field, an
+/// instant OOM/abort on the ingest pool (release profile runs overflow
+/// checks OFF, so even the multiply itself wrapped silently; see the red-run
+/// captures in tests/bounds_grid_cap.rs). 2^26 = 67.1M points is ~64x the
+/// largest grid any current NCEP/AI product ships (GFS 0.25 deg = 1,038,240;
+/// HRRR 3 km CONUS = 1,904,901), so real producers clear it by two orders of
+/// magnitude while absurd shapes get a typed reject the content-hash
+/// quarantine machinery absorbs instead of an abort. CONFIG PLUMBING DEFERRED
+/// ON PURPOSE: raising/lowering this knob from config.toml is a follow-up
+/// (config.rs owned by another agent this wave); until then it is a
+/// compile-time constant.
+pub const MAX_GRID_POINTS: u64 = 1 << 26;
+
+/// Shared grid-size ceiling check for every section-3 template (V1.4 phase
+/// B1). nx, ny arrive as unsigned u32 slots, so the u64 product cannot wrap;
+/// the comparison is one multiply + one compare per MESSAGE parse, not per
+/// point — hot-path cost is nil.
+fn grid_points_ok(nx: u32, ny: u32) -> Result<(), GribErr> {
+    if (nx as u64) * (ny as u64) > MAX_GRID_POINTS {
+        return Err(GribErr::BadField("grid point count exceeds MAX_GRID_POINTS"));
+    }
+    return Ok(());
+}
+
 /// Section 1 template 1.0 -> reference time + end-of-file flag.
 /// Payload offsets: [7..8] year u2, [9] mon, [10] day, [11] hr, [12] min,
 /// [13] sec, [14] production status (CT 1.3, bit 0x08 = end of file).
@@ -462,6 +489,10 @@ fn parse_grid_regular(p: &[u8]) -> Result<GridDef, GribErr> {
     if dlon <= 0.0 || dlat <= 0.0 || nx == 0 || ny == 0 {
         return Err(GribErr::BadField("zero grid increment or size"));
     }
+    match grid_points_ok(nx, ny) {
+        Err(e) => { return Err(e); }
+        Ok(()) => {}
+    }
     let g = GridRegular {
         nx: nx,
         ny: ny,
@@ -494,6 +525,13 @@ fn parse_grid_lambert(p: &[u8]) -> Result<GridDef, GribErr> {
     let latin2 = sm_i4(p, 64) as f64 / 1.0e6;
     if dx_mm <= 0 || dy_mm <= 0 || nx == 0 || ny == 0 {
         return Err(GribErr::BadField("non-positive Lambert dx/dy or size"));
+    }
+    // V1.4 phase B1: same ceiling as template 3.0 (HRRR 1799 x 1059 clears it
+    // by ~35x; a forged 1e6 x 1e6 LCC would otherwise size every plane from
+    // the product and OOM the ingest pool before any DRT unpack runs).
+    match grid_points_ok(nx, ny) {
+        Err(e) => { return Err(e); }
+        Ok(()) => {}
     }
     // earth shape byte (Code Table 3.2) at payload offset 9
     let mut g = GridLambert::new(nx, ny, la1, lo1, lov, lad, latin1, latin2,
@@ -575,6 +613,14 @@ fn parse_grid_gaussian(p: &[u8]) -> Result<GridDef, GribErr> {
     let nlat = be_u32(p, 62);
     if nx == 0 || ny == 0 || nlat == 0 || ny != 2 * nlat {
         return Err(tmpl_skip("thinned/regional or missing dimensions"));
+    }
+    // V1.4 phase B1: operational gaussian grids clear the ceiling by ~19x
+    // (T-coefficients x row counts stay near 3-4M points); the cap fires
+    // only on absurd declared dimensions. Placed BEFORE the basic-angle and
+    // latitude-table work so a huge shape never reaches any later stage.
+    match grid_points_ok(nx, ny) {
+        Err(e) => { return Err(e); }
+        Ok(()) => {}
     }
     // basic angle / direction-derivative ratio -> units (wgrib2 semantics)
     let basic = sm_i4(p, 33);
@@ -789,6 +835,25 @@ pub fn decode_sec7(s3: &GridDef, s5: &[u8], s6: Option<&[u8]>, s7: &[u8]) -> Res
         return Err(GribErr::Truncated);
     }
     let ngrid = (wx_nx(s3) as usize) * (wx_ny(s3) as usize);
+    // V1.4 phase B1 BITMAP LENGTH GUARD: bm_defined indexes bm[k >> 3] for
+    // every k < ngrid (simple/complex/ieee interleave AND the codec backends'
+    // defined_count), and NO call site ever proved the bitmap actually covers
+    // the grid — a section 6 truncated by even one octet walked off the end
+    // mid-interleave -> slice panic -> whole-process abort under release
+    // panic="abort" (red-run captures: bounds_simple_ieee.rs, both bitmap
+    // tests panicked at grib2.rs:866 pre-fix). The GRIB format requires
+    // ceil(npoints/8) bitmap octets, so this rejects ONLY corrupt streams
+    // (clean fixtures byte-identical; a WELL-FORMED full-set bitmap decodes
+    // exactly like no-bitmap, pinned by that same test file). Constructed
+    // once per message, covering every DRT uniformly.
+    match bitmap_of(s6) {
+        None => {}
+        Some(b) => {
+            if b.len() < (ngrid + 7) / 8 {
+                return Err(GribErr::BadField("bitmap too short"));
+            }
+        }
+    }
     // V1.3 phase E4a DEGENERATE SECTION 7 (zero data octets): the framing
     // layer accepts a 5-octet section 7 (see the `floor_ln` sites in
     // decode_stream), and here it becomes a full-size plane WITHOUT running
@@ -879,6 +944,22 @@ fn dec_simple(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<V
         return Err(GribErr::BadField("simple packing nbits"));
     }
     let bm = bitmap_of(s6);
+    // V1.4 phase B1 EXTENT PRE-CHECK (the anti-abort net for DRT 5.0): the
+    // bit-walk below reads exactly ndef * nbits bits, one per DEFINED point,
+    // and get_bits indexes b[p >> 3] with NO bounds proof of its own. Before
+    // this check a forged/truncated section 7 walked off the payload end ->
+    // slice-index panic -> process abort under release panic="abort" (red
+    // run: bounds_simple_ieee.rs panicked at grib2.rs:291 pre-fix). One
+    // multiply + one compare here makes EVERY inner-loop read provably in
+    // range (highest touched bit need_bits-1 lives in byte (need_bits-1)>>3
+    // <= len-1 when need_bits <= len*8), so the hot loop stays untouched.
+    // With no bitmap defined_count returns ngrid in O(1); with one it costs
+    // the same O(ngrid) byte scan the interleave loop performs anyway.
+    let ndef = codecs::defined_count(bm, ngrid);
+    let need_bits = (ndef as u64) * (nbits as u64);
+    if need_bits > (s7.len() as u64) * 8 {
+        return Err(GribErr::Truncated);
+    }
     let f2 = pow2(e_exp);
     let f10 = pow10(-s_dec);
     let mut out = Vec::<f32>::new();
@@ -963,6 +1044,55 @@ fn dec_complex(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize,
 
     let bm = bitmap_of(s6);
 
+    // V1.4 phase B1 SCALAR SANITY, all of it a function of ALREADY-CHECKED
+    // bytes and executed BEFORE any Vec growth or bit-walk:
+    //   * np (section-5 "number of data points") must equal the bitmap-defined
+    //     count: the format requires it (the SAME cross-check dec_jpeg /
+    //     dec_png / dec_aec already run), it bounds np by ngrid hence by
+    //     MAX_GRID_POINTS, and without it the final interleave indexed
+    //     ud[j] past the end when the stream stored FEWER values than the
+    //     grid declared -> slice panic (red run: grib2.rs:1110 pre-fix).
+    //   * every group covers at least one value, so ngroups <= np bounds the
+    //     refs/widths/lens allocations. A forged 0xFFFFFFFF ngroups used to
+    //     push three vectors toward multi-GB (OOM-class) while the group walk
+    //     ran the bit cursor off the payload (red run: grib2.rs:291 pre-fix);
+    //     the exact header-extent proof below additionally refuses any
+    //     ngroups whose three fixed phases cannot fit section 7, which is
+    //     the "ngroups vs s7.len()" sanity computed from validated scalars.
+    let ndef = codecs::defined_count(bm, ngrid);
+    if np != ndef {
+        return Err(GribErr::BadField("complex packing defined-point count mismatch"));
+    }
+    if ngroups > np {
+        return Err(GribErr::BadField("complex packing group count exceeds point count"));
+    }
+
+    // V1.4 phase B1 HEADER-EXTENT PRE-CHECK: extra-octets seeds, group
+    // references, group widths and the RESERVED group-length slots sit at bit
+    // offsets that are pure functions of the section-5 scalars checked above,
+    // so the end offset of the length phase is computable BEFORE reading any
+    // of it. Prove it fits in s7 once per message; the walks below then touch
+    // only provably-in-range bytes. Zero-width phases legitimately consume
+    // nothing and need no special case. The eo region bound also covers the
+    // uint_n/int_n seed reads (they index b[off + k] unchecked -- red run:
+    // grib2.rs:303 pre-fix).
+    let eoz = eo as usize;
+    let nseed = if spatial == 2 { 2 } else { 1 };
+    if eoz > 0 && eoz * (nseed + 1) > s7.len() {
+        return Err(GribErr::Truncated);
+    }
+    let avail_bits = (s7.len() as u64) * 8;
+    let mut hb: u64 = (eoz * (nseed + 1)) as u64 * 8;
+    hb += (ngroups as u64) * (nbits as u64);
+    hb = ((hb + 7) / 8) * 8;                    // byte-align after refs
+    hb += (ngroups as u64) * (wbits as u64);
+    hb = ((hb + 7) / 8) * 8;                    // byte-align before lens
+    hb += (ngroups as u64) * (lbits as u64);    // complex_pk.c reserves a slot
+    hb = ((hb + 7) / 8) * 8;                    // for ALL ngroups lengths
+    if hb > avail_bits {
+        return Err(GribErr::Truncated);
+    }
+
     // degenerate: zero groups -> every defined point is the reference value
     if ngroups == 0 {
         let outv = ((ref0) * pow10(-s_dec)) as f32;
@@ -1014,12 +1144,34 @@ fn dec_complex(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize,
     pos = ((lphase + ngroups * (lbits as usize) + 7) / 8) * 8;
 
     let total = {
-        let mut t = 0;
-        for v in &lens { t += v; }
+        // V1.4 B1: saturating, NOT wrapping -- release builds run with
+        // overflow checks OFF, so a forged lens array could wrap this sum
+        // right back onto np (the `total != np` gate then passed on a stream
+        // conceptually holding np + k*2^64 values) and the ud push loop
+        // below iterated the TRUE sum: OOM-class hang. Clean streams never
+        // come within 2^63 of the limit, so saturation changes nothing for
+        // them (checksum goldens byte-identical).
+        let mut t: usize = 0;
+        for v in &lens { t = t.saturating_add(*v); }
         t
     };
     if total != np {
         return Err(GribErr::BadField("complex packing point count mismatch"));
+    }
+
+    // V1.4 phase B1 VALUE-PHASE EXTENT PROOF: the continuous bitstream reads
+    // exactly sum(lens[gi] * widths[gi]) bits starting where the reserved
+    // length phase ended (bit hb computed above). Both factors are content
+    // scalars already validated in range, so ONE pass over the group arrays
+    // here proves EVERY get_bits in the group walk below in range; the walk
+    // itself stays untouched. Saturating arithmetic can only tighten rejects,
+    // never loosen a proof (an absurd product saturates high -> refused).
+    let mut val_bits: u64 = 0;
+    for gi in 0..ngroups {
+        val_bits = val_bits.saturating_add((lens[gi] as u64) * (widths[gi] as u64));
+    }
+    if hb.saturating_add(val_bits) > avail_bits {
+        return Err(GribErr::Truncated);
     }
 
     // ---- continuous value bitstream ----
@@ -1130,6 +1282,17 @@ fn dec_runlength(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Resul
     if nbits < 1 || nbits > 32 || mv as u32 > mvl as u32 {
         return Err(GribErr::BadField("run-length params inconsistent"));
     }
+    // V1.4 phase B1 LEVEL-TABLE EXTENT PRE-CHECK: the table lives INSIDE
+    // section 5 at payload offsets 10+2i .. 12+2i for i = 1..mvl, and mvl is
+    // a forged u16 read from s5 itself. Before this check the walk ran
+    // sm_i2(s5, 10 + i*2) -- an unchecked be_u16 -- for slots past a tiny
+    // payload: slice panic -> process abort under panic="abort" (red run:
+    // bounds_runlength.rs panicked at grib2.rs:252 pre-fix on BOTH forgeries).
+    // One compare against the declared payload length closes it, and it also
+    // bounds the `levels` allocation at <= (s5.len()-10)/2 entries.
+    if 12 + (mvl as usize) * 2 > s5.len() {
+        return Err(GribErr::Truncated);
+    }
     let mut levels = Vec::<f64>::new();
     let mut i = 1;
     while i <= mvl as u16 {
@@ -1201,6 +1364,21 @@ fn dec_ieee(s5: &[u8], s6: Option<&[u8]>, s7: &[u8], ngrid: usize) -> Result<Vec
         return Err(GribErr::BadField("ieee packing precision unsupported"));
     }
     let bm = bitmap_of(s6);
+    // V1.4 phase B1 EXTENT PRE-CHECK: ieee_f4 reads 4 unchecked bytes per
+    // DEFINED point; a truncated or short section 7 walked off the payload
+    // end -> slice panic -> abort (red run: bounds_simple_ieee.rs panicked
+    // at grib2.rs:256 pre-fix). Proving ndef * 4 <= len once here makes
+    // every loop read in range (ngrid is already capped at MAX_GRID_POINTS,
+    // so the product cannot wrap usize).
+    let ndef = codecs::defined_count(bm, ngrid);
+    match ndef.checked_mul(4) {
+        None => { return Err(GribErr::Truncated); }
+        Some(n) => {
+            if n > s7.len() {
+                return Err(GribErr::Truncated);
+            }
+        }
+    }
     let mut out = Vec::<f32>::new();
     let mut j = 0;
     for k in 0..ngrid {

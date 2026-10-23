@@ -164,8 +164,97 @@ fn bytes_to_ints(buf: &[u8], nbytes: usize, nsamples: usize) -> Vec<i64> {
 // DRT 5.40 JPEG2000
 // ---------------------------------------------------------------------------
 
+/// Per-axis ceiling for a JPEG2000 codestream's DECLARED image size, and the
+/// total-pixels ceiling shared with the section-3 grid parser
+/// (`grib2::MAX_GRID_POINTS`). A GRIB section-7 image holds exactly the
+/// defined points of ONE field, so a codestream declaring more cannot be
+/// true of this message. V1.4 phase B1: hayro allocates its f32 sample
+/// buffers straight from Xsiz/Ysiz BEFORE we ever get to compare sample
+/// counts, so an unchecked forged codestream header OOM-aborted the process
+/// (the corruption sweep's red capture: `memory allocation of
+/// 176093662592 bytes failed` from one flipped bit pair inside a SIZ box).
+/// This helper runs BEFORE decode and refuses on the declared geometry only.
+fn j2k_dims_ok(s7: &[u8]) -> Result<(), GribErr> {
+    // Raw codestream only (what wgrib2/NCEP emit: SOC `FF 4F` at offset 0).
+    // Anything else (e.g. a JP2 container) keeps passing through to hayro
+    // unchanged -- acceptance semantics identical to before this guard, and
+    // no producer in scope emits containers (see module docs).
+    if s7.len() < 2 || s7[0] != 0xFF || s7[1] != 0x4F {
+        return Ok(());
+    }
+    // Walk marker segments until SIZ (FF 51). Between SOC and SIZ there may
+    // be marker segments: `FF <m> <Ld(2)> <payload(Ld-2)>`, standalone
+    // markers FF30..FF3F (no length), and FF-fill / zero-fill bytes.
+    let mut p = 2usize;
+    let mut found = false;
+    while p + 4 <= s7.len() && !found {
+        if s7[p] == 0xFF && s7[p + 1] == 0x51 {
+            found = true;
+            break;
+        }
+        if s7[p] != 0xFF {
+            return Err(codec_fail("jpeg-marker-sync"));
+        }
+        let m = s7[p + 1];
+        if m == 0xFF {
+            p += 1; // MSB fill
+            continue;
+        }
+        if m == 0x00 {
+            p += 1; // zero fill after a lone FF-ish byte
+            continue;
+        }
+        if (0x30..=0x3F).contains(&m) {
+            p += 2; // standalone parameterless marker
+            continue;
+        }
+        let ln = ((s7[p + 2] as usize) << 8) | (s7[p + 3] as usize);
+        if ln < 2 {
+            return Err(codec_fail("jpeg-marker-length"));
+        }
+        p += 2 + ln; // Ld counts itself but not the two marker bytes
+    }
+    if !found {
+        return Err(codec_fail("jpeg-siz-missing"));
+    }
+    // SIZ layout (ISO 15444-1, final spec: NO Zsiz byte):
+    //   FF51 | Lsiz(2) | Rsiz(2) | Xsiz(4) | Ysiz(4) | XOsiz | YOsiz | ...
+    let need = p + 4 + 2 + 2 + 4 + 4 + 4 + 4;
+    if s7.len() < need {
+        return Err(codec_fail("jpeg-siz-short"));
+    }
+    let xs = be_u32(s7, p + 6) as u64;
+    let ys = be_u32(s7, p + 10) as u64;
+    let xo = be_u32(s7, p + 14) as u64;
+    let yo = be_u32(s7, p + 18) as u64;
+    if xo > xs || yo > ys {
+        return Err(codec_fail("jpeg-siz-offsets"));
+    }
+    let w = xs - xo;
+    let h = ys - yo;
+    if w > MAX_DIM_PX || h > MAX_DIM_PX {
+        return Err(codec_fail("jpeg-declared-dimension"));
+    }
+    match w.checked_mul(h) {
+        None => { return Err(codec_fail("jpeg-declared-area")); }
+        Some(a) => {
+            if a > crate::grib2::MAX_GRID_POINTS {
+                return Err(codec_fail("jpeg-declared-area"));
+            }
+        }
+    }
+    return Ok(());
+}
+
 /// Decode a JPEG2000-packed section 7 into packed integer samples.
 pub fn jpeg_samples(s7: &[u8], expect_n: usize) -> Result<Vec<i64>, GribErr> {
+    // V1.4 phase B1: refuse forged DECLARED dimensions before hayro sizes
+    // its sample buffers from them (unchecked third-party allocation was an
+    // OOM-abort class; see j2k_dims_ok).
+    match j2k_dims_ok(s7) {
+        Err(e) => { return Err(e); }
+        Ok(()) => {}
+    }
     let settings = hayro_jpeg2000::DecodeSettings::default();
     let img = hayro_jpeg2000::Image::new(s7, &settings);
     match img {
@@ -209,6 +298,12 @@ pub fn jpeg_samples(s7: &[u8], expect_n: usize) -> Result<Vec<i64>, GribErr> {
 // ---------------------------------------------------------------------------
 
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+/// V1.4 phase B1 documented PER-AXIS dimension ceiling, shared by the PNG
+/// IHDR cap and the JPEG2000 declared-size guard: any real GRIB producer
+/// field is far under it (HRRR 1799 x 1059, GFS 1440 x 721), and the total
+/// pixels of either stream is additionally capped by grib2::MAX_GRID_POINTS.
+const MAX_DIM_PX: u64 = 1 << 16; // 65536 px per axis, documented limit
 
 /// True when `s7[p+4..p+8]` equals the ASCII chunk name `nm`.
 fn chunk_is(s7: &[u8], p: usize, n0: u8, n1: u8, n2: u8, n3: u8) -> bool {
@@ -305,10 +400,45 @@ fn png_unfiltered(s7: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize, usize), GribErr
     if w == 0 || h == 0 {
         return Err(GribErr::BadField("png zero dimension"));
     }
+    // V1.4 phase B1 IHDR ALLOCATION CAPS. w and h are UNBOUNDED u32 read
+    // straight from the stream, and the inflate buffer below is allocated
+    // upfront at (rowlen + 1) * h bytes: a forged 65535 x 65535 16-bit image
+    // asked for ~8.6 GB before a single IDAT byte was even looked at, and
+    // with overflow checks OFF dimensions large enough to wrap usize could
+    // shrink that product down to a small need that then PASSED the
+    // total_out check while discarding most of the field -- corrupt input
+    // either OOMing the ingest pool or silently decoding wrong (worst on
+    // 32-bit builds, where these products wrap daily). Documented caps:
+    // each axis <= MAX_DIM_PX (any real GRIB producer field is far under
+    // it; HRRR is 1799 x 1059 and GFS 1440 x 721), and w * h <= the SAME
+    // global grid ceiling the section-3 parser enforces, since one
+    // PNG-packed message holds exactly one field. Every product below is
+    // CHECKED, so no wrap can smuggle an absurd allocation through any
+    // more (red run: bounds_png_ihdr.rs showed both forgeries escaping with
+    // a late CodecFailure(png-inflate-length) instead of a documented
+    // reject).
+    if (w as u64) > MAX_DIM_PX || (h as u64) > MAX_DIM_PX {
+        return Err(GribErr::BadField("png dimension exceeds decoder cap"));
+    }
+    let npix = match w.checked_mul(h) {
+        None => { return Err(GribErr::BadField("png pixel count exceeds decoder cap")); }
+        Some(n) => {
+            if (n as u64) > crate::grib2::MAX_GRID_POINTS {
+                return Err(GribErr::BadField("png pixel count exceeds decoder cap"));
+            }
+            n
+        }
+    };
 
     let nbytes = (depth as usize) / 8;
-    let rowlen = w * nbytes;
-    let need = (rowlen + 1) * h;
+    let rowlen = match w.checked_mul(nbytes) {
+        None => { return Err(GribErr::BadField("png row length overflow")); }
+        Some(r) => { r }
+    };
+    let need = match (rowlen + 1).checked_mul(h) {
+        None => { return Err(GribErr::BadField("png buffer size overflow")); }
+        Some(n) => { n }
+    };
 
     // ---- inflate the concatenated IDAT stream (zlib wrapper, RFC PNG) ----
     // inflate writes exactly `need` bytes; the buffer starts zeroed so a short
@@ -372,7 +502,7 @@ fn png_unfiltered(s7: &[u8]) -> Result<(Vec<u8>, Vec<u8>, usize, usize), GribErr
         }
     }
 
-    return Ok((rows, filters, nbytes, w * h));
+    return Ok((rows, filters, nbytes, npix));
 }
 
 /// Decode a PNG-packed section 7 into packed integer samples. The PNG holds one
