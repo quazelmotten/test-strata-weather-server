@@ -110,3 +110,61 @@ fn wind_pair_rule_message_clear() {
     let ps2: Vec<String> = vec!["TMP".to_string(), "UGRD".to_string(), "VGRD".to_string()];
     if let Some(_mg) = check_wind_pair(ps2.clone(), true) { panic!(); }
 }
+
+// ---------------------------------------------------------------------------
+// V1.4 phase B2: MODEL-NAME CHARSET GUARD
+// Model names become ONE DIRECTORY LEVEL under data_dir (`<data_dir>/<model>/`)
+// AND appear in retention paths. Auditors reproduced name="../evil" writing
+// OUTSIDE data_dir and watched retention delete ARBITRARY trees two levels up.
+// Names must therefore match [A-Za-z0-9_-]+ EXACTLY: no '/', no NUL, no dot
+// traversal, no whitespace, no shell/TOML metacharacters. Empty names keep the
+// pre-B2 message ("a model name is empty").
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::needless_return)]
+fn head_named(name: &str) -> String {
+    let t = "[server]\nbind = \"b\"\ndata_dir = \"d\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\n\n[[models]]\nname = \"";
+    let t = format!("{0}{1}", t, name);
+    let t = t + "\"\ningest_dir = \"i\"\nfile_glob = \"x*\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:1000\"]\n";
+    return t;
+}
+
+#[test]
+fn model_name_traversal_is_rejected_with_a_clear_message() {
+    // THE auditor repro: "../evil" escaped data_dir.
+    match validate_text(&head_named("../evil")) {
+        Ok(_ms) => { panic!(); }
+        Err(e) => {
+            assert!(bytes_contains(e.as_bytes(), "../evil".as_bytes()));
+            assert!(bytes_contains(e.as_bytes(), "model name".as_bytes()));
+        }
+    }
+    // Every shape that would break the ONE-DIR-LEVEL invariant must fail.
+    for bad in ["..", ".", "gfs/../x", "gfs sub", "gfs/safe", "gfs.exe", "gf$s", ""].iter() {
+        let t = head_named(bad);
+        match validate_text(&t) {
+            Ok(_ms) => { panic!(); }
+            Err(e) => {
+                if bad.is_empty() {
+                    // the dedicated empty-name message stays (pre-B2 contract)
+                    assert!(bytes_contains(e.as_bytes(), "empty".as_bytes()));
+                } else {
+                    assert!(bytes_contains(e.as_bytes(), "model name".as_bytes()));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn model_name_charset_accepts_the_safe_grammar() {
+    for good in ["gfs", "hrrr", "gfs_model-1", "HRRR-3km", "m0", "_x-9"].iter() {
+        match validate_text(&head_named(good)) {
+            Err(_e) => { panic!(); }
+            Ok(ms) => {
+                assert!(ms.len() == 1);
+                assert!(ms[0].name == *good);
+            }
+        }
+    }
+}

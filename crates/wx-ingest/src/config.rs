@@ -270,6 +270,15 @@ pub fn validate_config(cfg: &PointConfig) -> Result<Vec<ResolvedModel>, String> 
         if model.name.is_empty() {
             return Err("a model name is empty".to_string());
         }
+        // V1.4 phase B2 MODEL-NAME CHARSET (auditors reproduced name="../evil"
+        // writing OUTSIDE data_dir and retention deleting ARBITRARY trees two
+        // levels up): the name becomes EXACTLY ONE directory level under
+        // <data_dir>/<model>/ and re-enters every retention path, so it must
+        // match [A-Za-z0-9_-]+ — no '/', no dots (traversal), no whitespace or
+        // shell/TOML metacharacters. Rejected HERE, before any byte is written.
+        if !safe_model_name(model.name.as_str()) {
+            return Err(format!("config error: model name '{0}' is invalid: model names must match [A-Za-z0-9_-]+ exactly (one flat directory level under data_dir); characters like '/', '.' and whitespace allow traversal ('../evil') or break tooling", model.name));
+        }
         for prev in &out {
             if prev.name == model.name {
                 return Err(format!("duplicate model name '{}'", model.name));
@@ -488,6 +497,34 @@ pub fn wind_pair_gap(params: &[ResolvedParam]) -> Option<(String, String)> {
         return Some(("VGRD".to_string(), "UGRD".to_string()));
     }
     return None;
+}
+
+// ---------------------------------------------------------------------------
+// V1.4 phase B2: MODEL-NAME CHARSET GUARD
+// ---------------------------------------------------------------------------
+
+/// True when `s` is NON-EMPTY and every byte matches [A-Za-z0-9_-]. This is
+/// deliberately NOT a regex and NOT `is_alphanumeric()`: the name becomes one
+/// FLAT directory level under <data_dir>/<model>/ and reappears verbatim in
+/// retention paths, so anything outside the explicit ASCII grammar (dots for
+/// traversal, slashes, spaces, non-ASCII look-alikes) is rejected at startup
+/// rather than discovered by an operator mid-retention. Empty input fails
+/// here too even though `validate_config` already refuses it earlier with its
+/// own dedicated message.
+pub fn safe_model_name(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    for b in s.as_bytes() {
+        let ok = (*b >= 0x41 && *b <= 0x5A) // A-Z
+            || (*b >= 0x61 && *b <= 0x7A)   // a-z
+            || (*b >= 0x30 && *b <= 0x39)   // 0-9
+            || *b == b'_' || *b == b'-';
+        if !ok {
+            return false;
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

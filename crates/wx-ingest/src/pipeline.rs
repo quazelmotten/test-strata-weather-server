@@ -18,6 +18,7 @@ use notify::RecommendedWatcher;
 use wx_core::tables::{canonical_level_name, lookup_level_type, param_units, digit_at};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::cmp::Ordering as CmpOrdering;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -27,7 +28,11 @@ use std::fs::create_dir_all;
 use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
+use std::fs::File;
+use std::fs::canonicalize;
+use std::os::unix::io::AsRawFd;
 use std::io::Read;
+use std::io::Write;
 use std::io::ErrorKind;
 use serde::Deserialize;
 
@@ -515,6 +520,131 @@ impl LiveCounters {
     }
 }
 
+// ---------------------------------------------------------------------------
+// V1.4 phase B2 — data_dir SINGLE-INSTANCE LOCK (advisory flock(2))
+// ---------------------------------------------------------------------------
+
+// libc surface via `extern "C"` — the established binding style in this repo
+// (tests/disk_full_retry.rs, wx-core/tests/writer_failures.rs,
+// wx-server/tests/exit_codes.rs; wx-server itself binds clock_gettime the same
+// way through its own `libc` crate). wx-ingest deliberately does NOT add the
+// libc dependency: glibc's flock constants are ABI-stable numbers.
+extern "C" {
+    #[link_name = "flock"]
+    fn libc_flock(fd: i32, operation: i32) -> i32;
+}
+
+const FLOCK_EX: i32 = 2;    // exclusive lock
+const FLOCK_NB: i32 = 4;    // non-blocking: refuse loudly instead of waiting
+
+/// Process-wide registry of held data_dir locks: canonical lock path ->
+/// (the fd holder, live Pipeline handles in THIS process). WHY ref-counted:
+/// MANY warm-start gates legitimately hold TWO live pipelines over ONE
+/// data_dir in the SAME process to simulate a restart without dropping the
+/// old one first (restart.rs opens p2 while p1 is STILL ALIVE; likewise
+/// field_upgrade.rs, poison_quarantine.rs, stat_durability.rs, grid_upgrade
+/// .rs...). A plain per-open flock would EWOULDBLOCK the second IN-PROCESS
+/// handle and break those established tests — the kernel treats every open
+/// file description as a distinct locker even inside one process. So: N
+/// opens OK in-process (exactly ONE flock holder), cross-process EXCLUSIVE.
+/// One registry slot: (fd holder, live Pipeline handle count IN THIS PROCESS).
+type DirLockEntry = (Arc<File>, u32);
+
+/// The ref-counted lock registry itself (see `DATA_DIR_LOCKS`). Named because
+/// the nested shape trips clippy's type-complexity budget on its own.
+type DirLockRegistry = Mutex<HashMap<String, DirLockEntry>>;
+
+/// Poison-tolerant locking everywhere below: the map holds only refcounts,
+/// and a panic elsewhere must not make boot impossible. (`OnceLock` because
+/// `HashMap::new` is not a const fn on this toolchain.)
+static DATA_DIR_LOCKS: std::sync::OnceLock<DirLockRegistry> = std::sync::OnceLock::new();
+
+#[allow(clippy::needless_return)]
+fn data_dir_locks() -> &'static DirLockRegistry {
+    return DATA_DIR_LOCKS.get_or_init(|| Mutex::new(HashMap::<String, DirLockEntry>::new()));
+}
+
+/// Take (or SHARE) the single-instance advisory lock for one data_dir. The
+/// lock file lives at `<state_dir>/.wxpoint.lock`; the flock is attached to
+/// the fd kept in the registry, so it survives every in-process reopen and
+/// dies exactly when the LAST holder drops (fd close) or the process exits.
+/// Err carries an operator-actionable message NAMING THE LOCK PATH.
+pub fn acquire_data_dir_lock(state_dir: &str) -> Result<String, String> {
+    let lock_path = join_path(state_dir, ".wxpoint.lock");
+    let f = match File::create(&lock_path) {
+        Err(e) => { return Err(format!("cannot create the single-instance lock file {0}: {1}", lock_path, e)); }
+        Ok(h) => { h }
+    };
+    // Canonicalize AFTER creating so symlinked or differently-spelled paths
+    // collapse onto ONE registry key (two spellings of one data_dir are one
+    // instance, and the flock itself serializes any residual race).
+    let key = match canonicalize(&lock_path) {
+        Ok(p) => { p.to_string_lossy().to_string() }
+        Err(_) => { lock_path.to_string() }
+    };
+    let slot = data_dir_locks().lock();
+    let mut g = match slot {
+        Ok(m) => { m }
+        Err(poisoned) => { poisoned.into_inner() }
+    };
+    match g.get_mut(&key) {
+        // THIS PROCESS already holds the flock: share it, bump the count.
+        Some(entry) => {
+            entry.1 += 1;
+            return Ok(key);
+        }
+        None => {}
+    }
+    let fd = f.as_raw_fd();
+    let mut r = unsafe { libc_flock(fd, FLOCK_EX | FLOCK_NB) };
+    if r != 0 {
+        // One immediate retry: without errno we cannot tell EINTR from
+        // EWOULDBLOCK, and a genuine competing holder fails twice in a row.
+        r = unsafe { libc_flock(fd, FLOCK_EX | FLOCK_NB) };
+    }
+    if r != 0 {
+        return Err(format!("{0} is ALREADY OPEN by another wxpoint PROCESS: the advisory lock on {1} was refused (flock LOCK_EX|LOCK_NB). Two processes sharing one data_dir race state saves, retention deletions and atomic renames — stop the other instance or point [server].data_dir elsewhere", state_dir, lock_path));
+    }
+    g.insert(key.clone(), (Arc::new(f), 1));
+    return Ok(key);
+}
+
+/// Release ONE in-process handle; the LAST one removes the registry entry and
+/// closes the fd with it, which is what releases the kernel lock for other
+/// processes (no explicit LOCK_UN needed: close(2) does it).
+pub fn release_data_dir_lock(key: String) {
+    let slot = data_dir_locks().lock();
+    let mut g = match slot {
+        Ok(m) => { m }
+        Err(poisoned) => { poisoned.into_inner() }
+    };
+    let mut remove_now = false;
+    match g.get_mut(key.as_str()) {
+        Some(entry) => {
+            if entry.1 > 1 {
+                entry.1 -= 1;
+            } else {
+                remove_now = true;
+            }
+        }
+        None => {}
+    }
+    if remove_now {
+        g.remove(&key); // final Arc<File> dies here -> close -> flock released
+    }
+}
+
+impl Drop for Pipeline {
+    /// Releasing the LAST pipeline handle over a data_dir frees the next
+    /// PROCESS (supervisor restart, test child) — not just this process exit.
+    fn drop(self: &mut Self) {
+        match self.dir_lock_key.take() {
+            None => {}
+            Some(k) => { release_data_dir_lock(k); }
+        }
+    }
+}
+
 pub struct Pipeline {
     pub models: Vec<ResolvedModel>,
     pub data_dir: String,
@@ -559,6 +689,19 @@ pub struct Pipeline {
     // seventh = already escalated (suppresses repeat notes/counts/records past
     // the threshold). See io_failure().
     pub io_streaks: Vec<(String, String, u64, i64, String, u32, bool)>,
+    // V1.4 phase B2 BOUNDED MANIFEST RETRY (risk #8): CONSECUTIVE rounds whose
+    // ONLY failing write step for one candidate IDENTITY (model, path, size,
+    // mtime_ns, content hash — same key shape as io_streaks, same IN-MEMORY-
+    // ONLY reasoning: a restart deserves fresh retries) was the manifest
+    // refresh. At MANIFEST_FAIL_BOUND the file is marked REC_OK anyway so a
+    // permanently un-writable manifest target stops re-decoding the source
+    // every round; any group/fsync failure or success resets the count.
+    pub manifest_streaks: Vec<(String, String, u64, i64, String, u32)>,
+    // V1.4 phase B2: Some(canonical lock path) while this pipeline shares the
+    // process-local single-instance registry slot for `data_dir` (released in
+    // Drop -> the LAST handle's drop closes the fd -> other processes may
+    // open the data_dir again). See acquire_data_dir_lock.
+    pub dir_lock_key: Option<String>,
     pub queue: WatchQueue,
     pub watchers: Vec<RecommendedWatcher>,
     pub pool: ThreadPool,
@@ -636,6 +779,32 @@ pub const IO_FAIL_ESCALATION_ROUNDS: u32 = 5;
 /// Bound on the in-memory I/O streak table (evict-oldest; an evicted identity
 /// simply restarts its count, which can only DELAY escalation, never fake it).
 pub const IO_STREAK_CAP: usize = 512;
+
+/// V1.4 phase B2 — BOUNDED PURE-MANIFEST RETRY (risk #8). Since V1.3 E0 a
+/// failed manifest refresh BLOCKS the kind=OK record so the source file is
+/// retried next round: correct fail-closed behavior for TRANSIENT failures
+/// (manifest_fail_retry.rs pins it), but a PERMANENT manifest-write failure
+/// made the retry INFINITE — every round re-decoded the same file forever
+/// while its .bin data was already durable, published and answering queries.
+/// N = **3** consecutive pure-manifest failures for the SAME file identity
+/// (model, path, size, mtime_ns, content hash) then mark REC_OK anyway, warn
+/// LOUDLY, and let the store settle. WHY ACCEPTING IS SAFE: the accumulation
+/// guard does not live in the manifest anymore — stat_durability.rs pins that
+/// each field file carries its OWN durable PDT 4.8 header, validated at open,
+/// and that a warm boot with a missing/corrupt manifest still answers from
+/// those headers (mid-window accumulation queries stay rejected). A missing
+/// manifest therefore costs INVENTORY ONLY, never an answer change. WHY 3:
+/// two full retries cover any transient blip (the disk_full_retry story needs
+/// even fewer), the third attempt failing identically means "persistent" with
+/// overwhelming probability, and the bound keeps worst-case wasted decode at
+/// three rounds. Group-write or directory-fsync failures are NOT this shape:
+/// they keep today's UNBOUNDED block-and-retry (disk-full recovery must not
+/// expire) and RESET the manifest streak.
+pub const MANIFEST_FAIL_BOUND: u32 = 3;
+
+/// Bound on the pure-manifest streak table (evict-oldest, same reasoning as
+/// [`IO_STREAK_CAP`]: eviction can only delay the bound, never fake it).
+pub const MANIFEST_STREAK_CAP: usize = 512;
 
 /// FILENAME-DERIVED RUN-TIME HINT — AN ORDERING HEURISTIC, NOTHING MORE.
 /// Scans the BASENAME for digit runs of at least 10 characters and reads the
@@ -734,6 +903,40 @@ pub fn epoch_now_ns() -> i64 {
     match d {
         Err(_e) => { return 0; }
         Ok(v) => { return v.as_nanos() as i64; }
+    }
+}
+
+/// V1.4 phase B2 startup WRITABILITY PROBE: prove the freshly created state
+/// dir actually accepts WRITES by creating, writing and removing one tiny
+/// file inside it. `create_dir_all` alone sails through EROFS/EACCES/ENOSPC
+/// when the directory already existed, which is exactly how a read-only data
+/// mount used to boot "successfully" and then silently re-decode the world
+/// every round (state never persisted). Every error names the failing path
+/// and its OS reason so the exit-3 message is actionable on its own. Probe
+/// cleanup tolerates a concurrent unlink (NotFound) but fails loudly on
+/// anything else — a dir that cannot clean up after itself cannot run the
+/// atomic temp+rename writers either.
+fn probe_state_writable(state_dir: &str) -> Result<(), String> {
+    let probe = join_path(state_dir, ".wxpoint-startup-probe");
+    let f = File::create(&probe);
+    match f {
+        Err(e) => { return Err(format!("data_dir state dir \"{0}\" is NOT writable (probe create failed): {1}", state_dir, e)); }
+        Ok(mut h) => {
+            let w = h.write_all(b"wxpoint startup writability probe");
+            match w {
+                Err(e) => { return Err(format!("data_dir state dir \"{0}\" is NOT writable (probe write failed): {1}", state_dir, e)); }
+                Ok(_) => {}
+            }
+        }
+    }
+    match remove_file(&probe) {
+        Err(e) => {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(format!("data_dir state dir \"{0}\" is NOT writable (probe cleanup failed): {1}", state_dir, e));
+            }
+            return Ok(());
+        }
+        Ok(_) => { return Ok(()); }
     }
 }
 
@@ -1063,7 +1266,36 @@ impl Pipeline {
         let models = validate_config(&cfg)?;
         let data_dir = cfg.server.data_dir;
         let state_dir = join_path(&data_dir, "state");
-        let _c = create_dir_all(&state_dir);
+        // ---- V1.4 phase B2: FAIL-FAST data_dir + SINGLE-INSTANCE LOCK ------
+        // Pre-B2 the create_dir_all error below was DISCARDED (`let _c = ...`):
+        // an uncreatable data_dir (path under a regular file, typo) booted a
+        // pipeline that re-decoded EVERYTHING every round because the state
+        // store could never persist, and the whole registry died at restart.
+        // Now data_dir must EXIST and be WRITABLE before anything touches it:
+        // mkdir both levels WITH error checks, then PROBE by writing a real
+        // temp file under state/ (mkdir alone sails through EROFS/ENOSPC when
+        // the directory already exists). Failures return Err, so main's
+        // startup path keeps exiting with code 3 (spec §3 fail loudly). THEN
+        // take the advisory single-instance flock BEFORE loading state, so
+        // two boots can never race the corrupt-state quarantine, retention
+        // sweeps or state saves below (cross-process exclusive; in-process
+        // opens share the holder — see acquire_data_dir_lock).
+        match create_dir_all(&data_dir) {
+            Err(e) => { return Err(format!("cannot create data_dir \"{0}\": {1}", data_dir, e)); }
+            Ok(_) => {}
+        }
+        match create_dir_all(&state_dir) {
+            Err(e) => { return Err(format!("cannot create state dir \"{0}\": {1}", state_dir, e)); }
+            Ok(_) => {}
+        }
+        match probe_state_writable(state_dir.as_str()) {
+            Err(e) => { return Err(e); }
+            Ok(_) => {}
+        }
+        let dir_lock_key = match acquire_data_dir_lock(state_dir.as_str()) {
+            Err(e) => { return Err(e); }
+            Ok(k) => { k }
+        };
         let st = StateStore::load(state_dir);
         match st {
             Err(e) => { return Err(e); }
@@ -1108,6 +1340,8 @@ impl Pipeline {
             wind_pair_enforce: enforce,
             stale_verdicts: Vec::<(String, String)>::new(),
             io_streaks: Vec::<(String, String, u64, i64, String, u32, bool)>::new(),
+            manifest_streaks: Vec::<(String, String, u64, i64, String, u32)>::new(),
+            dir_lock_key: Some(dir_lock_key),
             queue: q,
             watchers: Vec::<RecommendedWatcher>::new(),
             pool: pool.unwrap(),
@@ -1145,6 +1379,22 @@ impl Pipeline {
         if p.state.discarded_legacy {
             p.note(format!("STATE UPGRADE: {} was written by format version {}, this build expects version {} — DISCARDED {} record(s) LOUDLY; every source file will be RE-INGESTED exactly once (idempotent), then normal warm-start resumes",
                 p.state.file_path, p.state.found_version, STATE_VERSION, p.state.discarded_records));
+        }
+        // V1.4 phase B2 LOUD CORRUPT-STATE NOTE: unparsable files.json bytes
+        // are now quarantined at load (rename to files.json.corrupt.<stamp>,
+        // empty state, boot continues) instead of hard-exiting code 3 on
+        // EVERY restart until an operator ran `rm`. Warn ONCE here naming the
+        // offender, the destination (or the honest fallback when the rename
+        // itself failed) and the parser's own words. Expected cost: exactly
+        // one idempotent re-ingest; expected benefit: a RUNNING server.
+        if p.state.quarantined_bad {
+            let dest_txt = if p.state.quarantine_dest.is_empty() {
+                format!("{0} could NOT be moved aside, so it STAYS PUT and the first successful state save will REPLACE those bytes", p.state.file_path)
+            } else {
+                format!("{0} was MOVED ASIDE to {1}", p.state.file_path, p.state.quarantine_dest)
+            };
+            p.note(format!("STATE QUARANTINE: {0}: parser said ({1}). Boot CONTINUES with EMPTY ingest state — every source file will be RE-INGESTED exactly once (idempotent: merge dedup + atomic renames), then warm start resumes. Well-formed LEGACY docs keep their dedicated version-gate story; only UNPARSABLE bytes take this path.",
+                dest_txt, p.state.quarantine_reason));
         }
         // V1.3 phase E3b SHARED-DIRECTORY WARNING (non-fatal): models with
         // equal-or-nested ingest dirs and non-disjoint globs now BOTH ingest
@@ -1214,18 +1464,42 @@ fn ingest_run_dir(p: &mut Pipeline, mdl: &ResolvedModel, run_dir: &str,
     let gb = read_bytes_maybe(&gp);
     match gb {
         None => {
-            // V1.3 phase E3b MISSING-GRID LOUDNESS: a CORRUPT grid.bin gets the
-            // storage-format recovery treatment above (loud note + delete +
-            // forget), but a MISSING (or unreadable) one used to `return`
-            // SILENTLY, leaving an orphan run tree that /v1/inventory never
-            // shows and nobody ever mentions. Now: ONE loud note per run per
-            // rebuild + one error. Deliberately NOT auto-deleted: the source
-            // files may re-deliver the grid on the next scan round (unlike the
-            // version-mismatch case, there is nothing wrong to repair — just
-            // something absent), and deleting could race a producer that is
-            // mid-write when boot happens.
-            p.note(format!("MISSING GRID: run dir {} has no readable grid.bin — the run stays INVISIBLE to queries until its source re-delivers it (not deleted on purpose); errors counter advanced", run_dir));
+            // V1.3 phase E3b MISSING-GRID LOUDNESS + V1.4 phase B2 AUTO-HEAL
+            // (AUDIT_1.3 P1): E3b made the orphan LOUD, but its promise —
+            // "stays INVISIBLE until its source re-delivers" — was DEAD for a
+            // STATIC ingest dir: the source keeps its kind=OK record, so
+            // scan_round skips it as unchanged FOREVER and nothing ever
+            // re-delivers anything. B2 heals instead: FORGET this model's
+            // (model,path) records under its ingest dir (drop_under, the same
+            // machinery as the version-mismatch recovery below), so the NEXT
+            // scan round RE-DECODES from source — idempotent by construction
+            // (merge dedup + atomic renames) — and the cold writer atomically
+            // REWRITES grid.bin. When grid.bin EXISTS but cannot be READ
+            // (EACCES, ESTALE, mid-write race at boot) the unreadable HUSK is
+            // removed FIRST: `ingest_file` emits grid.bin only when stat()
+            // says absent, so keeping the husk would block the rewrite and
+            // resurrect the dead end one level down. The RUN TREE stays put:
+            // field .bin headers are durable and validated at open (stat_
+            // durability.rs gates), and unlike the version-mismatch case
+            // there is nothing wrong to repair INSIDE the tree — grid.bin
+            // alone is absent/unreadable. Loud note + one error kept (the E3b
+            // gate pins both).
+            let mut husk = "".to_string();
+            match std::fs::metadata(&gp) {
+                Err(_) => {}
+                Ok(_md) => {
+                    match remove_file(&gp) {
+                        Ok(_) => { husk = " (an UNREADABLE grid.bin existed: husk REMOVED first so the rewrite can land)".to_string(); }
+                        Err(e) => { husk = format!(" (removing the unreadable grid.bin husk FAILED: {0} — it stays and may block the rewrite until fixed)", e); }
+                    }
+                }
+            }
+            p.note(format!("MISSING GRID: run dir {} has no readable grid.bin{} — AUTO-HEAL: forgetting model '{}'s ingest records under {} so the next scan round RE-DECODES from source and atomically rewrites grid.bin (run tree kept; errors counter advanced)",
+                run_dir, husk, mdl.name, mdl.ingest_dir));
             p.counters.errors += 1;
+            let dropped = p.state.drop_under(mdl.name.as_str(), &mdl.ingest_dir);
+            p.note(format!("GRID AUTO-HEAL: forgot {} ingest record(s) under {} — expect exactly ONE idempotent re-ingest of that model's sources on the next scan round", dropped, mdl.ingest_dir));
+            p.save_state();
             return;
         }
         Some(b) => {
@@ -1853,9 +2127,55 @@ impl Pipeline {
                                     // per failed step.
                                     self.counters.errors += 1;
                                     self.live.add(1, 0, 0, 0, 0, out.groups as u64);
-                                    self.progress(format!("FAILED {0}: {1} of {2} write step(s) failed (group writes + manifest refresh), retrying next round",
-                                        rd.0, out.failed_groups, out.groups + out.failed_groups));
+                                    // ---- V1.4 phase B2 BOUNDED MANIFEST RETRY ----
+                                    // A failure whose EVERY failed step was the
+                                    // manifest refresh (manifest_failed == total
+                                    // failures, both > 0) is a PURE-MANIFEST
+                                    // shape: count it against the same-file
+                                    // streak and, at the bound, mark REC_OK so
+                                    // the re-decode storm ENDS (safety argument +
+                                    // N=3 rationale at MANIFEST_FAIL_BOUND; the
+                                    // per-round error above already keeps the
+                                    // ingest-error counter truthful). Group/fsync
+                                    // failures are NOT this shape: disk-full
+                                    // recovery must not expire, so they keep
+                                    // today's unbounded retry and reset the
+                                    // manifest streak.
+                                    let pure_manifest = out.manifest_failed > 0 && out.manifest_failed >= out.failed_groups;
+                                    let mut nman = 0u32;
+                                    if pure_manifest {
+                                        nman = self.manifest_failure_bump(mdl.name.as_str(), rd.0.as_str(), rd.1, rd.2, rd.3.as_str());
+                                    } else {
+                                        self.manifest_streak_clear(mdl.name.as_str(), rd.0.as_str());
+                                    }
+                                    let tail = if !pure_manifest {
+                                        "retrying next round".to_string()
+                                    } else if nman < MANIFEST_FAIL_BOUND {
+                                        format!("manifest-only failure {0}/{1} for THIS content, blocking the state record and retrying next round", nman, MANIFEST_FAIL_BOUND)
+                                    } else {
+                                        // The bounded accept: durable .bin data +
+                                        // headers are already published and
+                                        // queryable; only the inventory lags.
+                                        self.state.upsert(FileRec {
+                                            model: mdl.name.to_string(),
+                                            path: rd.0.clone(),
+                                            size: rd.1,
+                                            mtime_ns: rd.2,
+                                            hash: rd.3.clone(),
+                                            kind: REC_OK,
+                                        });
+                                        self.manifest_streak_clear(mdl.name.as_str(), rd.0.as_str());
+                                        self.note(format!("MANIFEST-Failure BOUND: {0} failed ONLY its manifest refresh for {1} CONSECUTIVE rounds (same size/mtime/content) — marking it INGESTED ANYWAY to stop an endless re-decode storm. The errors counter advanced for every failing round INCLUDING this one, so /metrics stays truthful; this WARN names the accepted inventory gap. Safe because each .bin carries its OWN durable, at-open-validated statistical header (the accumulation guard survives any manifest loss — stat_durability.rs gates); the run inventory rebuilds whenever that run ingests again.",
+                                            rd.0, nman));
+                                        format!("MANIFEST-Failure BOUND reached after {0} consecutive manifest-only failures: marked ingested anyway, inventory lags until that run next ingests", nman)
+                                    };
+                                    self.progress(format!("FAILED {0}: {1} of {2} write step(s) failed ({3})",
+                                        rd.0, out.failed_groups, out.groups + out.failed_groups, tail));
                                 } else {
+                                    // Success clears any pending manifest streak
+                                    // for this path (content changes start a new
+                                    // identity and therefore a fresh count).
+                                    self.manifest_streak_clear(mdl.name.as_str(), rd.0.as_str());
                                     self.state.upsert(FileRec {
                                         model: mdl.name.to_string(),
                                         path: rd.0.clone(),
@@ -2082,6 +2402,53 @@ impl Pipeline {
         self.io_streaks = kept;
     }
 
+    /// V1.4 phase B2 — one PURE-MANIFEST write failure against a candidate
+    /// IDENTITY (model, path, size, mtime_ns, content hash), returning the NEW
+    /// consecutive count (1 on first sighting). Same table discipline as
+    /// [`Pipeline::io_failure`]: in-memory only (a restart deserves fresh
+    /// retries), bounded by [`MANIFEST_STREAK_CAP`] with evict-oldest, and any
+    /// identity change (re-delivery!) starts a NEW entry, so a changed file
+    /// never inherits an old streak. Only the pure-manifest shape reaches this
+    /// function; group/fsync failures clear instead (see scan_round).
+    #[allow(clippy::too_many_arguments)]
+    pub fn manifest_failure_bump(self: &mut Self, model: &str, path: &str, size: u64,
+                                 mtime_ns: i64, hash: &str) -> u32 {
+        let mut at: Option<usize> = None;
+        for k in 0 .. self.manifest_streaks.len() {
+            let e = &self.manifest_streaks[k];
+            if e.0 == model && e.1 == path && e.2 == size && e.3 == mtime_ns && e.4 == hash {
+                at = Some(k);
+                break;
+            }
+        }
+        match at {
+            None => {
+                while self.manifest_streaks.len() >= MANIFEST_STREAK_CAP {
+                    let _x = self.manifest_streaks.remove(0);
+                }
+                self.manifest_streaks.push((model.to_string(), path.to_string(), size, mtime_ns, hash.to_string(), 1));
+                return 1;
+            }
+            Some(k) => {
+                self.manifest_streaks[k].5 += 1;
+                return self.manifest_streaks[k].5;
+            }
+        }
+    }
+
+    /// Forget every manifest streak for one (model, path): success, a NON-
+    /// manifest failure shape, or a bounded accept all end the run of pure-
+    /// manifest failures. Identity changes need no clearing (new key).
+    pub fn manifest_streak_clear(self: &mut Self, model: &str, path: &str) {
+        let mut kept: Vec<(String, String, u64, i64, String, u32)> = Vec::<(String, String, u64, i64, String, u32)>::new();
+        for e in &self.manifest_streaks {
+            if e.0 != model || e.1 != path {
+                kept.push(e.clone());
+            }
+        }
+        self.manifest_streaks = kept;
+    }
+
     /// Already noted/counted this (path,content-hash) verdict?
     fn seen_verdict(self: &Self, path: String, hash: String) -> bool {
         for v in &self.stale_verdicts {
@@ -2221,6 +2588,12 @@ pub struct FileOutcome {
     /// ANY non-zero value means the source file is NOT recorded as ingested and
     /// gets retried next round.
     pub failed_groups: usize,
+    /// Of those failures, how many were MANIFEST REFRESHES specifically (the
+    /// remainder are group writes / the batched directory fsync). V1.4 phase
+    /// B2: `manifest_failed == failed_groups && > 0` identifies a PURE-MANIFEST
+    /// failure, the only shape the bounded retry (`MANIFEST_FAIL_BOUND`) may
+    /// eventually accept; everything else keeps unbounded block-and-retry.
+    pub manifest_failed: usize,
     pub bytes_written: u64,     // storage BYTES_WRITTEN_TOTAL delta
     pub renames: u64,           // RENAMES_TOTAL delta (groups + grid.bin + manifests)
     pub ms: i64,                // monotonic time spent on this file
@@ -2410,6 +2783,9 @@ impl Pipeline {
         let mut runs: Vec<(i64, String)> = Vec::<(i64, String)>::new();
         let mut written = 0usize;
         let mut failed = 0usize;
+        // V1.4 phase B2: manifest-refresh failures counted SEPARATELY so the
+        // caller can recognize the PURE-MANIFEST shape (see FileOutcome).
+        let mut man_failed = 0usize;
         // V1.3 phase E1 STAT COLLISION GUARD (see `StoreGroup` docs): the
         // extended group key lets statistically-DISTINCT messages of one
         // source file coexist as separate groups, but storage layout has ONE
@@ -2542,12 +2918,13 @@ impl Pipeline {
         // state permanently — the amplifier of the manifest-loss defect.
         for r in &runs {
             if !update_run_manifest(self, mdl.name.clone(), r.0) {
-                self.note(format!("manifest update failed for run {0}: source file NOT marked ingested, retrying next round", r.1));
+                self.note(format!("manifest update failed for run {0}: the state record STAYS BLOCKED this round (transient shape retries; a persistent failure ends at MANIFEST_FAIL_BOUND), retrying next round", r.1));
                 // NO extra error count here: the caller's `failed_groups > 0`
                 // branch is the single point where a file-with-any-write-
                 // failure gets exactly ONE error (same rule as a failed GROUP,
                 // see the "ONE error per file-with-failure" comment there).
                 failed += 1;
+                man_failed += 1;
             }
         }
         // ---- DIRECTORY FSYNCS ONCE per DISTINCT DIRECTORY TOUCHED ------------
@@ -2564,6 +2941,7 @@ impl Pipeline {
         return FileOutcome {
             groups: written,
             failed_groups: failed,
+            manifest_failed: man_failed,
             bytes_written: c1.bytes_written - c0.bytes_written,
             renames: c1.renames - c0.renames,
             ms: (self.clock.elapsed_ns() - t0) / 1000000,

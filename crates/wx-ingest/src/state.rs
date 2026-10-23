@@ -7,7 +7,11 @@
 //! file, instead of the first scanner starving the rest forever. A `files.json`
 //! whose version differs from [`STATE_VERSION`] is DISCARDED LOUDLY once —
 //! exactly one full re-ingest after such an upgrade, documented in
-//! docs/DECISIONS.md §14 and the README upgrade note. The state file itself is
+//! docs/DECISIONS.md §14 and the README upgrade note. V1.3 phase B2 split the
+//! remaining failure mode: a file whose BYTES never parse at all is no longer
+//! a boot-fatal Err (exit 3 every restart until manual `rm`) but QUARANTINED
+//! to `files.json.corrupt.<UTC-stamp>` so boot continues with empty state and
+//! the bad bytes stay available for forensics. The state file itself is
 //! written atomically (temp + fsync + rename), mirroring the .bin policy.
 //!
 //! Content hash: FNV-1a 64 over first 64 KiB ++ last 64 KiB (whole file once
@@ -156,6 +160,24 @@ pub struct StateStore {
     pub found_version: u32,
     /// Number of records that were discarded along with the old-version file.
     pub discarded_records: usize,
+    /// V1.4 phase B2 CORRUPT-STATE QUARANTINE: true when `files.json` EXISTED
+    /// but its BYTES never parsed as a StateDoc at all (truncated write, hand
+    /// edit, filesystem garbage — malformed LEGACY docs included, since the
+    /// version gate cannot run on an unparsable doc). Pre-B2 this returned Err
+    /// from `load`, which hard-exited boot with code 3 on EVERY restart until
+    /// an operator manually removed the file. Now: the bad bytes are RENAMED
+    /// aside to `files.json.corrupt.<UTC-stamp>` (preserved for forensics),
+    /// loading starts EMPTY, and boot CONTINUES; the pipeline renders
+    /// [`StateStore::quarantine_dest`] + [`StateStore::quarantine_reason`] in
+    /// exactly one loud boot warning. Costs one idempotent re-ingest (merge
+    /// dedup + atomic renames), the same trade as every other recovery trap.
+    pub quarantined_bad: bool,
+    /// Where the bad file was MOVED (`""` when the rename itself failed — the
+    /// unreadable original then stays put and the first successful save
+    /// overwrites it; the boot note says so honestly).
+    pub quarantine_dest: String,
+    /// The parser's own message, quoted verbatim in the boot note.
+    pub quarantine_reason: String,
 }
 
 impl StateStore {
@@ -171,12 +193,38 @@ impl StateStore {
             discarded_legacy: false,
             found_version: 0,
             discarded_records: 0,
+            quarantined_bad: false,
+            quarantine_dest: "".to_string(),
+            quarantine_reason: "".to_string(),
         };
         match read_to_string(&file) {
             Err(_) => { st.reindex(); return Ok(st); }
             Ok(text) => {
                 match from_str::<StateDoc>(&text) {
-                    Err(e) => { return Err(format!("bad state file {}: {}", file, e)); }
+                    // V1.4 phase B2 CORRUPT-STATE QUARANTINE (auditors repro:
+                    // one torn/truncated files.json killed boot with exit 3 on
+                    // EVERY restart until a human ran `rm`). A doc that never
+                    // PARSES cannot even carry its version, so the E3b gate
+                    // below cannot decide anything — treat it as garbage: move
+                    // the bytes aside under a collision-proof UTC stamp, start
+                    // EMPTY, let the caller warn LOUDLY and boot ON. Well-
+                    // FORMED legacy docs keep their dedicated version-gate
+                    // story untouched (state_hygiene pins it).
+                    Err(e) => {
+                        // `to_string()`, NOT `format!("{0}", e)` (same call
+                        // shape as `deserialize_text` above, and it sidesteps
+                        // the single-argument format-lint the workspace
+                        // denies). Pre-B2 threw the parser's whole complaint
+                        // away by exiting; B2 keeps it verbatim in the boot
+                        // warning next to the preserved bytes.
+                        let reason = e.to_string();
+                        let dest = quarantine_corrupt_state(file.as_str());
+                        st.quarantined_bad = true;
+                        st.quarantine_dest = dest;
+                        st.quarantine_reason = reason;
+                        st.reindex();
+                        return Ok(st);
+                    }
                     Ok(doc) => {
                         // V1.3 phase E3b VERSION GATE: a doc written by another
                         // format version is DISCARDED LOUDLY (the caller notes
@@ -360,6 +408,43 @@ pub fn join_path(dir: &str, name: &str) -> String {
 /// makes the composite key unambiguous (V1.3 phase E3b).
 pub fn state_key(model: &str, path: &str) -> String {
     return format!("{0}\u{1f}{1}", model, path);
+}
+
+/// V1.4 phase B2: compact, SORTABLE, collision-proof UTC stamp for corrupt-
+/// state quarantining — `<YYYYMMDDTHHMMSSZ>-<9-digit ns>.ns`. Built from the
+/// same wall clock (`crate::pipeline::epoch_now_ns`) whose domain file mtimes
+/// live in; the sub-second tail makes two boots inside one calendar second
+/// rename onto DISTINCT names, so nothing is ever silently overwritten. Falls
+/// back to a raw `ns<total>` form only if the clock itself failed (then an
+/// ISO civil date cannot be trusted, but uniqueness still holds).
+#[allow(clippy::needless_return)]
+pub fn corrupt_state_stamp(ns: i64) -> String {
+    let ns2 = if ns < 0 { 0 } else { ns };
+    let secs = ns2 / 1000000000;
+    let frac = ns2 - secs * 1000000000;
+    let iso = crate::store::iso_utc(secs); // "YYYY-MM-DDTHH:MM:SSZ"
+    if iso.is_empty() {
+        return format!("ns{0}", ns2);
+    }
+    let mut compact = "".to_string();
+    for ch in iso.chars() {
+        if ch != '-' && ch != ':' {
+            compact.push(ch);
+        }
+    }
+    return format!("{0}-{1:09}ns", compact, frac);
+}
+
+/// Rename `<state>/files.json` to `files.json.corrupt.<UTC-stamp>` and return
+/// the destination path, or `""` when the rename itself failed (permissions):
+/// the original bytes then stay PUT, and the first successful save overwrites
+/// them — the boot note renders that honestly instead of pretending otherwise.
+fn quarantine_corrupt_state(file: &str) -> String {
+    let dest = format!("{0}.corrupt.{1}", file, corrupt_state_stamp(crate::pipeline::epoch_now_ns()));
+    match std::fs::rename(file, &dest) {
+        Ok(_) => { return dest; }
+        Err(_) => { return "".to_string(); }
+    }
 }
 
 /// True when `path` lies UNDER `dir` (matched on `<dir>/`, so a sibling whose
