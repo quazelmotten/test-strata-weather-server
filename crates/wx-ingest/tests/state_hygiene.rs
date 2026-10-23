@@ -24,21 +24,18 @@ use std::fs::read_dir;
 use std::fs::read_to_string;
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -59,7 +56,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
@@ -89,10 +86,10 @@ fn rec(path: String, size: u64, kind: u8) -> FileRec {
     return FileRec {
         model: "m".to_string(),
         path: path.to_string(),
-        size: size,
+        size,
         mtime_ns: 1000,
         hash: "00000000000000ab".to_string(),
-        kind: kind,
+        kind,
     };
 }
 
@@ -100,13 +97,10 @@ fn rec(path: String, size: u64, kind: u8) -> FileRec {
 fn touch(path: String) {
     let d = File::create(&path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut h) => {
             let w = h.write_all("x".as_bytes());
-            match w {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if w.is_err() { panic!(); }
         }
     }
 }
@@ -115,12 +109,12 @@ fn touch(path: String) {
 fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
     let root = "/tmp/opencode/wxpoint-state-idx".to_string();
     rm_tree(&root);
-    let _c = create_dir_all(&join_path(&root, "data"));
+    let _c = create_dir_all(join_path(&root, "data"));
     let st_dir = join_path(&join_path(&root, "data"), "state");
     let _c2 = create_dir_all(&st_dir);
 
     let mut st = match StateStore::load(st_dir.to_string()) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(s) => { s }
     };
     // three records, TWO under one ingest dir, one under another
@@ -135,7 +129,7 @@ fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
     for k in 0 .. st.recs.len() {
         let want = st.recs[k].clone();
         match st.find("m", want.path.as_str()) {
-            None => { assert!(false); return; }
+            None => { panic!(); }
             Some(got) => {
                 assert!(got.size == want.size);
                 assert!(got.kind == want.kind);
@@ -143,10 +137,10 @@ fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
         }
     }
     match st.find("m", "/root/a/f1.grib2") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.size == 11); }
     }
-    assert!(st.recs[0].path == "/root/a/f1.grib2".to_string()); // ORDER PRESERVED
+    assert!(st.recs[0].path == "/root/a/f1.grib2"); // ORDER PRESERVED
 
     // structural change rebuilds the index: drop everything under /root/a
     // (V1.3 phase E3b: drop_under is MODEL-scoped; every record here is model "m")
@@ -154,10 +148,10 @@ fn find_uses_the_derived_index_and_stays_correct_across_structural_changes() {
     assert!(st.recs.len() == 1);
     match st.find("m", "/root/a/f1.grib2") {
         None => {}
-        Some(_) => { assert!(false); return; }
+        Some(_) => { panic!(); }
     }
     match st.find("m", "/root/b/f3.grib2") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.kind == REC_IGNORED); }
     }
     rm_tree(&root);
@@ -183,7 +177,7 @@ fn prune_missing_forgets_only_records_whose_source_actually_vanished() {
     touch(kept_sib.to_string());
 
     let mut st = match StateStore::load(st_dir.to_string()) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(s) => { s }
     };
     st.upsert(rec(present.to_string(), 1, REC_OK));                        // exists -> KEPT
@@ -197,16 +191,16 @@ fn prune_missing_forgets_only_records_whose_source_actually_vanished() {
     assert!(st.prune_missing(&ing) == 2);
     assert!(st.recs.len() == 2);
     match st.find("m", present.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.kind == REC_OK); }
     }
     match st.find("m", kept_sib.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.kind == REC_IGNORED); }
     }
     match st.find("m", join_path(&ing, "gone.grib2").as_str()) {
         None => {}
-        Some(_) => { assert!(false); return; }
+        Some(_) => { panic!(); }
     }
 
     // A QUARANTINED file that STILL EXISTS is never re-armed by pruning.
@@ -215,7 +209,7 @@ fn prune_missing_forgets_only_records_whose_source_actually_vanished() {
     st.upsert(rec(poison.to_string(), 5, REC_FAILED));
     assert!(st.prune_missing(&ing) == 0);
     match st.find("m", poison.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.kind == REC_FAILED); }
     }
     rm_tree(&root);
@@ -230,22 +224,19 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
     let _c1 = create_dir_all(&st_dir);
 
     let mut st = match StateStore::load(st_dir.to_string()) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(s) => { s }
     };
     st.upsert(rec("/r/ok.grib2".to_string(), 1, REC_OK));
     st.upsert(rec("/r/ign.grib2".to_string(), 2, REC_IGNORED));
     st.upsert(rec("/r/bad.grib2".to_string(), 3, REC_FAILED));
-    match st.save() {
-        Err(_e) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if let Err(_e) = st.save() { panic!(); }
 
     // THE WRITER since V1.3 phase E3b: same keys, same ORDER, `kind` present,
     // VERSION IS NOW 2 and every record carries its `"model"` namespace key.
     let f = join_path(&st_dir, "files.json");
     let txt = match read_to_string(&f) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t) => { t }
     };
     assert!(txt.contains("{\"version\":2,\"recs\":["));
@@ -263,13 +254,13 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
 
     // restart: every verdict is remembered, so nothing is re-ingested
     let st2 = match StateStore::load(st_dir.to_string()) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(s) => { s }
     };
     assert!(st2.recs.len() == 3);
     assert!(!st2.discarded_legacy);
     match st2.find("m", "/r/bad.grib2") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(g) => { assert!(g.kind == REC_FAILED); }
     }
 
@@ -280,15 +271,15 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
     write_bytes(&f, legacy.as_bytes());
     let st3_r = StateStore::load(st_dir.to_string());
     match st3_r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(s3) => {
             assert!(s3.discarded_legacy);
             assert!(s3.found_version == 1);
             assert!(s3.discarded_records == 1);
-            assert!(s3.recs.len() == 0);
+            assert!(s3.recs.is_empty());
             match s3.find("m", "/r/old.grib2") {
                 None => {}
-                Some(_) => { assert!(false); return; }
+                Some(_) => { panic!(); }
             }
         }
     }
@@ -299,16 +290,16 @@ fn state_file_on_disk_is_byte_compatible_and_survives_a_restart_including_legacy
     write_bytes(&f, v2_nokind.as_bytes());
     let st4_r = StateStore::load(st_dir.to_string());
     match st4_r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(s4) => {
             assert!(!s4.discarded_legacy);
             assert!(s4.recs.len() == 1);
             match s4.find("m", "/r/new.grib2") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(g) => {
                     assert!(g.kind == REC_OK);
                     assert!(g.size == 8);
-                    assert!(g.model == "m".to_string());
+                    assert!(g.model == "m");
                 }
             }
         }

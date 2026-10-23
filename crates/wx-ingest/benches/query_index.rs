@@ -15,15 +15,15 @@ use std::sync::Arc;
 /// GFS-like: 8 isobaric levels (canonical descending order), 1440 x 720.
 fn gfs_levels() -> Vec<f32> {
     let lv: [f32; 8] = [1000.0, 925.0, 850.0, 700.0, 500.0, 300.0, 250.0, 200.0];
-    return lv.to_vec();
+    lv.to_vec()
 }
 
 /// Write one f<FFF>.bin (all 8 level planes) analytically: value(li,j,i) =
 /// 250 + 10*li + j so every (level,time,node) expectation is exact in f32.
 fn write_fh_file(path: &str, nx: u32, ny: u32) -> bool {
     let hdr = BinHeader {
-        nx: nx,
-        ny: ny,
+        nx,
+        ny,
         levels: gfs_levels(),
         scan_ns: true,
         winds_grid: false,
@@ -45,8 +45,8 @@ fn write_fh_file(path: &str, nx: u32, ny: u32) -> bool {
     }
     let wr = write_bin_atomic(path.to_string(), &hdr, &refs);
     match wr {
-        Err(_) => { return false; }
-        Ok(_) => { return true; }
+        Err(_) => { false}
+        Ok(_) => { true}
     }
 }
 
@@ -54,20 +54,20 @@ fn write_fh_file(path: &str, nx: u32, ny: u32) -> bool {
 fn open_warm(path: &str) -> Result<Arc<MmapField>, String> {
     let of = open_field(path.to_string());
     match of {
-        Err(e) => { return Err(e.to_string()); }
+        Err(e) => { Err(e.to_string())}
         Ok(mf) => {
             let region = &mf.region;
             let n = region.len();
             let mut acc = 0u8;
             let mut off = 0usize;
             while off < n {
-                acc = acc ^ region[off];
-                off = off + 4096usize;
+                acc ^= region[off];
+                off += 4096usize;
             }
             if acc == 1u8 && n == 0usize {
                 // observer; never taken
             }
-            return Ok(Arc::new(mf));
+            Ok(Arc::new(mf))
         }
     }
 }
@@ -77,10 +77,7 @@ pub fn bench_query(c: &mut Criterion) {
     let dir = "/tmp/opencode/wxpoint-bench";
     use std::fs::create_dir_all;
     let mk = create_dir_all(dir);
-    match mk {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if mk.is_err() { return; }
     let f0 = format!("{0}/wxingest_q_f000.bin", dir);
     let f6 = format!("{0}/wxingest_q_f006.bin", dir);
     if !write_fh_file(&f0, 1440u32, 720u32) {

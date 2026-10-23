@@ -40,27 +40,27 @@ fn c_str(s: &str) -> Vec<i8> {
         buf.push(b as i8);
     }
     buf.push(0);
-    return buf;
+    buf
 }
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -68,21 +68,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -103,13 +100,13 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 /// Count entries whose name contains ".tmp." anywhere under `dir`.
 fn count_tmp_litter(dir: &str) -> usize {
     let mut hits = 0;
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => { return hits; }
         Ok(it) => {
             for e in it {
@@ -132,7 +129,7 @@ fn count_tmp_litter(dir: &str) -> usize {
             }
         }
     }
-    return hits;
+    hits
 }
 
 fn grouping_cfg(data: &str, ing: &str) -> String {
@@ -140,8 +137,8 @@ fn grouping_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -168,7 +165,7 @@ fn unwritable_group_dir_fails_once_and_retries_cleanly() {
     counters_reset();
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -187,35 +184,26 @@ fn unwritable_group_dir_fails_once_and_retries_cleanly() {
     assert!(count_notes(&p, "group write failed") >= 1);
 
     // ---- the source file is NOT marked ingested -> next round retries ----
-    match p.state.find("gfs", src.as_str()) {
-        Some(_) => { assert!(false); return; }
-        None => {}
-    }
+    if p.state.find("gfs", src.as_str()).is_some() { panic!(); }
 
     // ---- no temp litter, and the unwritable field really is absent ------
     assert!(count_tmp_litter(&data) == 0);
-    match stat_size_mtime(&join_path(&lvl_dir, "f000.bin")) {
-        Ok(_) => { assert!(false); return; }
-        Err(_) => {}
-    }
+    if stat_size_mtime(&join_path(&lvl_dir, "f000.bin")).is_ok() { panic!(); }
     // the writable groups (TMP/height_above_ground) did land: partial progress
     // is allowed because each GROUP is atomic on its own.
     let agl_dir = join_path(&join_path(&run_dir, "TMP"), "height_above_ground");
-    match stat_size_mtime(&join_path(&agl_dir, "f000.bin")) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime(&join_path(&agl_dir, "f000.bin")).is_err() { panic!(); }
 
     // ---- index must not expose the unwritable field ---------------------
     let snap = p.shared.get_index();
     let sref = &*snap;
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(iso) => {
             let c_r = build_context(sref, "gfs", None, "TMP", iso, 850.0, 0.0,
                                     TimeInterpMode::Linear);
             match c_r {
-                Ok(_) => { assert!(false); return; }
+                Ok(_) => { panic!(); }
                 Err(_) => {
                     // expected: the unwritable level is simply NOT in the index
                 }
@@ -234,16 +222,16 @@ fn unwritable_group_dir_fails_once_and_retries_cleanly() {
     let snap2 = p.shared.get_index();
     let s2 = &*snap2;
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(iso) => {
             let c_r = build_context(s2, "gfs", None, "TMP", iso, 850.0, 21600.0,
                                     TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 9.0, 351.5);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => { assert!(pv.value == 421.0); }
                     }
                 }
@@ -262,5 +250,5 @@ fn count_notes(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }

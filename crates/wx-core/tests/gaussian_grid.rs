@@ -41,22 +41,19 @@ fn gaussian_table_goldens_small_nj() {
             Some(v) => v,
             None => {
                 println!("ny={0}: table missing", c.0);
-                assert!(false);
-                return;
+                panic!();
             }
         };
         if got.len() != c.1.len() {
             println!("ny={0}: len {1} vs {2}", c.0, got.len(), c.1.len());
-            assert!(false);
-            return;
+            panic!();
         }
         let mut k = 0usize;
         while k < got.len() {
             if abs_diff(got[k], c.1[k]) > 1e-8 {
                 println!("ny={0} idx {1}: {2:.10} vs golden {3:.10}",
                          c.0, k, got[k], c.1[k]);
-                assert!(false);
-                return;
+                panic!();
             }
             k += 1;
         }
@@ -66,19 +63,10 @@ fn gaussian_table_goldens_small_nj() {
 #[test]
 fn gaussian_table_odd_ny_and_bounds() {
     // odd ny would require an equator row we do not model: rejected loudly
-    match gaussian_latitudes(1537) {
-        Some(v) => { println!("odd ny accepted: {0:?}", v); assert!(false); }
-        None => {}
-    }
-    match gaussian_latitudes(1) {
-        Some(_) => { assert!(false); }
-        None => {}
-    }
+    if let Some(v) = gaussian_latitudes(1537) { println!("odd ny accepted: {0:?}", v); panic!(); }
+    if gaussian_latitudes(1).is_some() { panic!(); }
     // ny=0 likewise
-    match gaussian_latitudes(0) {
-        Some(_) => { assert!(false); }
-        None => {}
-    }
+    if gaussian_latitudes(0).is_some() { panic!(); }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,27 +79,26 @@ fn gaussian_table_odd_ny_and_bounds() {
 fn gaussian_table_1536_matches_live_gfs() {
     let pos = match gaussian_latitudes(1536) {
         Some(v) => v,
-        None => { assert!(false); return; }
+        None => { panic!(); }
     };
     if pos.len() != 768 {
         println!("expected 768 positive rows, got {0}", pos.len());
-        assert!(false);
-        return;
+        panic!();
     }
     // topmost row: file La1 = 89.910324 (wgrib2 printed; measured delta was
     // +5.3e-7 deg — well inside this 1e-4 guard)
     if abs_diff(pos[0], 89.910324) > 1e-4 {
         println!("top row {0:.6} vs file 89.910324", pos[0]);
-        assert!(false);
-        return;
+        panic!();
     }
     // strictly descending
     let mut k = 1usize;
     while k < pos.len() {
-        if !(pos[k] < pos[k - 1]) {
+        // NaN-safe exact equivalent of !(a < b): partial_cmp yields None for
+        // NaN and map_or(true, ..) keeps the original "not less" verdict.
+        if pos[k].partial_cmp(&pos[k - 1]) != Some(std::cmp::Ordering::Less) {
             println!("table not monotonic at {0}", k);
-            assert!(false);
-            return;
+            panic!();
         }
         k += 1;
     }
@@ -126,8 +113,7 @@ fn gaussian_table_1536_matches_live_gfs() {
     }
     if best > 1e-6 {
         println!("no table row within 1e-6 of 40.006506 (closest {0:.8})", best);
-        assert!(false);
-        return;
+        panic!();
     }
 }
 
@@ -147,15 +133,13 @@ fn gaussian_rows_monotonic_symmetric_full_circle() {
     let ts = g.row_lats();
     if ts.len() != 1536 {
         println!("row table len {0}", ts.len());
-        assert!(false);
-        return;
+        panic!();
     }
     let mut k = 1usize;
     while k < ts.len() {
-        if !(ts[k] < ts[k - 1]) {
+        if ts[k].partial_cmp(&ts[k - 1]) != Some(std::cmp::Ordering::Less) {
             println!("rows not decreasing at {0}", k);
-            assert!(false);
-            return;
+            panic!();
         }
         k += 1;
     }
@@ -165,8 +149,7 @@ fn gaussian_rows_monotonic_symmetric_full_circle() {
     while k < ts.len() {
         if ts[k] != -ts[ts.len() - 1 - k] {
             println!("mirror broken at {0}: {1} vs {2}", k, ts[k], ts[ts.len() - 1 - k]);
-            assert!(false);
-            return;
+            panic!();
         }
         k += 1;
     }
@@ -177,7 +160,7 @@ fn gaussian_rows_monotonic_symmetric_full_circle() {
     if abs_diff(t4[0], 59.44440829) > 1e-8 || abs_diff(t4[1], 19.87571915) > 1e-8
        || abs_diff(t4[2], -19.87571915) > 1e-8 || abs_diff(t4[3], -59.44440829) > 1e-8 {
         println!("ny=4 ordered table wrong: {0:?}", t4);
-        assert!(false);
+        panic!();
     }
     // SN scan mirrors the ORDER too (row 0 = La1 side = southernmost here)
     let g4n = GridGaussian::new(8, 4, 0.0, -59.44440829, 59.44440829, 45.0, 0x40, 6, false);
@@ -186,8 +169,7 @@ fn gaussian_rows_monotonic_symmetric_full_circle() {
     while j < 4 {
         if t4n[j] != t4[3 - j] {
             println!("SN ordering wrong at {0}", j);
-            assert!(false);
-            return;
+            panic!();
         }
         j += 1;
     }
@@ -217,15 +199,13 @@ fn gaussian_project_node_exact_and_roundtrip() {
                 Some(v) => v,
                 None => {
                     println!("node ({0},{1}) projected out", rows[r], cols[c]);
-                    assert!(false);
-                    return;
+                    panic!();
                 }
             };
             if pr.0 != colf || pr.1 != rows[r] as f64 {
                 println!("node ({0},{1}) -> ({2:?},{3:?}) not exact",
                          rows[r], cols[c], pr.0, pr.1);
-                assert!(false);
-                return;
+                panic!();
             }
             c += 1;
         }
@@ -235,13 +215,13 @@ fn gaussian_project_node_exact_and_roundtrip() {
     // lon -95.0390625 == 264.9609375 bit-exactly after normalization
     let pr = match gd.project(ts[400], -95.0390625) {
         Some(v) => v,
-        None => { assert!(false); return; }
+        None => { panic!(); }
     };
     let want_i = ((2261.0 * dlon) - 360.0) + 360.0; // 264.9609375 east form
     let _ = want_i;
     if pr.0 != 2261.0 || pr.1 != 400.0 {
         println!("negative-lon node -> {0:?}", pr);
-        assert!(false);
+        panic!();
     }
     // jittered midpoints: dj strictly increases as lat walks south, always
     // bracketed by the enclosing node pair
@@ -256,24 +236,22 @@ fn gaussian_project_node_exact_and_roundtrip() {
             Some(v) => v,
             None => {
                 println!("midpoint lat {0} projected out", lat);
-                assert!(false);
-                return;
+                panic!();
             }
         };
         let dj = pr.1;
         if !(dj > (rowbase as f64) && dj < (rowbase as f64 + 1.0)) {
             println!("dj {0} outside bracket [{1},{2}] (lat {3})",
                      dj, rowbase, rowbase + 1, lat);
-            assert!(false);
-            return;
+            panic!();
         }
         if abs_diff(dj, rowbase as f64 + f) > 1e-9 {
             println!("dj {0} vs expected {1}", dj, rowbase as f64 + f);
-            assert!(false);
+            panic!();
         }
         if k > 0 && rowbase == ((k - 1) * 7) % 1535 && frac[k % 3] > frac[(k - 1) % 3] && dj <= prev_dj {
             println!("non-monotone within same row pair at k={0}", k);
-            assert!(false);
+            panic!();
         }
         prev_dj = dj;
         k += 1;
@@ -284,37 +262,22 @@ fn gaussian_project_node_exact_and_roundtrip() {
 fn gaussian_out_of_domain_poles_and_beyond_rows() {
     let gd = GridDef::Gaussian(gfs_like_grid());
     // poles are ALWAYS out of domain on a gaussian grid (no pole nodes)
-    match gd.project(90.0, 0.0) {
-        Some(v) => { println!("north pole accepted: {0:?}", v); assert!(false); }
-        None => {}
-    }
-    match gd.project(-90.0, 123.4) {
-        Some(v) => { println!("south pole accepted: {0:?}", v); assert!(false); }
-        None => {}
-    }
+    if let Some(v) = gd.project(90.0, 0.0) { println!("north pole accepted: {0:?}", v); panic!(); }
+    if let Some(v) = gd.project(-90.0, 123.4) { println!("south pole accepted: {0:?}", v); panic!(); }
     // beyond the outermost ROW (but inside the pole) is also out
-    match gd.project(89.95, 0.0) {
-        Some(v) => { println!("lat 89.95 accepted: {0:?}", v); assert!(false); }
-        None => {}
-    }
-    match gd.project(-89.95, 0.0) {
-        Some(v) => { println!("lat -89.95 accepted: {0:?}", v); assert!(false); }
-        None => {}
-    }
+    if let Some(v) = gd.project(89.95, 0.0) { println!("lat 89.95 accepted: {0:?}", v); panic!(); }
+    if let Some(v) = gd.project(-89.95, 0.0) { println!("lat -89.95 accepted: {0:?}", v); panic!(); }
     // just inside the top row answers (tiny positive j)
     let pr = match gd.project(89.910324 - 1e-6, 0.0) {
         Some(v) => v,
-        None => { assert!(false); return; }
+        None => { panic!(); }
     };
     if !(pr.1 > 0.0 && pr.1 < 0.05) {
         println!("inside-top-row dj {0}", pr.1);
-        assert!(false);
+        panic!();
     }
     // lat outside [-90,90] rejected like every other grid
-    match gd.project(91.0, 0.0) {
-        Some(_) => { assert!(false); }
-        None => {}
-    }
+    if gd.project(91.0, 0.0).is_some() { panic!(); }
 }
 
 #[test]
@@ -322,14 +285,14 @@ fn gaussian_seam_wrap_semantics_match_regular() {
     let gd = GridDef::Gaussian(gfs_like_grid());
     if !gd.lon_wrap() {
         println!("3072 x 360/3072 grid must wrap");
-        assert!(false);
+        panic!();
     }
     // -0.1 and 359.9 normalize identically -> bit-identical projections
-    let a = match gd.project(40.0, -0.1) { Some(v) => v, None => { assert!(false); return; } };
-    let b = match gd.project(40.0, 359.9) { Some(v) => v, None => { assert!(false); return; } };
+    let a = match gd.project(40.0, -0.1) { Some(v) => v, None => { panic!(); } };
+    let b = match gd.project(40.0, 359.9) { Some(v) => v, None => { panic!(); } };
     if a != b {
         println!("seam mismatch: {0:?} vs {1:?}", a, b);
-        assert!(false);
+        panic!();
     }
     // one quarter-cell west of column 0 lands in the seam cell between
     // column nx-1 and column 0 with weight 0.75/0.25 (spec §9.5 semantics,
@@ -337,10 +300,10 @@ fn gaussian_seam_wrap_semantics_match_regular() {
     let dlon = 360.0 / 3072.0;
     let c = match gd.project(40.0, -0.25 * dlon) {
         Some(v) => v,
-        None => { assert!(false); return; }
+        None => { panic!(); }
     };
     if abs_diff(c.0, 3071.75) > 1e-12 {
         println!("seam di {0} want 3071.75", c.0);
-        assert!(false);
+        panic!();
     }
 }

@@ -40,7 +40,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -61,12 +61,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -87,22 +87,19 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn exists_any(path: &str) -> bool {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return false; }
         Ok(_) => { return true; }
@@ -189,7 +186,7 @@ fn raw_param_with_units_override_answers_with_them() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     // LOUD NOTE SUPPRESSED when units are supplied.
@@ -201,7 +198,7 @@ fn raw_param_with_units_override_answers_with_them() {
     let sref = &*snap;
     let m = sref.find_model("rawu");
     match m {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => {
             let mut found = false;
             for fe in &mm.runs[0].fields {
@@ -211,7 +208,7 @@ fn raw_param_with_units_override_answers_with_them() {
                 found = true;
                 // THE FIX: units reach FieldDef (-> /v1/models, inventory and
                 // every point response) instead of the pre-E2 empty string.
-                assert!(fe.fd.units == "kg/m^2".to_string());
+                assert!(fe.fd.units == "kg/m^2");
             }
             assert!(found);
         }
@@ -220,11 +217,11 @@ fn raw_param_with_units_override_answers_with_them() {
     // answer at node (10 N, 350 E) = 42, carrying the configured units.
     let c = build_context(sref, "rawu", None, "d0c19n5", 1, 0.0, 0.0, TimeInterpMode::Linear);
     match c {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(ctx) => {
             let v = evaluate_point(&ctx, 10.0, 350.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(qr) => { assert!(qr.value == 42.0); }
             }
         }
@@ -254,7 +251,7 @@ fn raw_param_without_units_boots_with_loud_note() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // exactly ONE startup note, naming the param AND the fix...
@@ -271,7 +268,7 @@ fn raw_param_without_units_boots_with_loud_note() {
     let sref = &*snap;
     let m = sref.find_model("rawn");
     match m {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => {
             let mut found = false;
             for fe in &mm.runs[0].fields {
@@ -279,18 +276,18 @@ fn raw_param_without_units_boots_with_loud_note() {
                     continue;
                 }
                 found = true;
-                assert!(fe.fd.units == "".to_string());
+                assert!(fe.fd.units.is_empty());
             }
             assert!(found);
         }
     }
     let c = build_context(sref, "rawn", None, "d0c19n5", 1, 0.0, 0.0, TimeInterpMode::Linear);
     match c {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(ctx) => {
             let v = evaluate_point(&ctx, 10.0, 350.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(qr) => { assert!(qr.value == 42.0); }
             }
         }
@@ -314,7 +311,7 @@ fn units_override_validation_matrix() {
     // named table param + units -> HARD error naming the param
     let t1 = param_text("name = \"TMP\"\n  units = \"K\"\n");
     match validate_text(&t1) {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!(); }
         Err(e) => {
             assert!(bytes_contains(e.as_bytes(), b"units override is only valid"));
             assert!(bytes_contains(e.as_bytes(), b"'TMP'"));
@@ -324,7 +321,7 @@ fn units_override_validation_matrix() {
     // naming the resolved canonical param too
     let t2 = param_text("discipline = 0\n  category = 0\n  number = 0\n  units = \"K\"\n");
     match validate_text(&t2) {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!(); }
         Err(e) => {
             assert!(bytes_contains(e.as_bytes(), b"units override is only valid"));
             assert!(bytes_contains(e.as_bytes(), b"'TMP'"));
@@ -333,29 +330,29 @@ fn units_override_validation_matrix() {
     // out-of-table raw triple + units -> ACCEPTED with those units
     let t3 = param_text("discipline = 0\n  category = 19\n  number = 5\n  units = \"kg/m^2\"\n");
     match validate_text(&t3) {
-        Err(e) => { println!("unexpected reject: {e}"); assert!(false); return; }
+        Err(e) => { println!("unexpected reject: {e}"); panic!(); }
         Ok(ms) => {
-            assert!(ms[0].params[0].key == "d0c19n5".to_string());
-            assert!(ms[0].params[0].units == "kg/m^2".to_string());
+            assert!(ms[0].params[0].key == "d0c19n5");
+            assert!(ms[0].params[0].units == "kg/m^2");
             assert!(ms[0].params[0].raw);
         }
     }
     // out-of-table raw triple WITHOUT units -> accepted, units "", raw flag set
     let t4 = param_text("discipline = 0\n  category = 19\n  number = 5\n");
     match validate_text(&t4) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(ms) => {
-            assert!(ms[0].params[0].units == "".to_string());
+            assert!(ms[0].params[0].units.is_empty());
             assert!(ms[0].params[0].raw);
         }
     }
     // named param without units -> unchanged behavior, raw flag FALSE
     let t5 = param_text("name = \"TMP\"\n");
     match validate_text(&t5) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(ms) => {
             assert!(!ms[0].params[0].raw);
-            assert!(ms[0].params[0].units == "K".to_string());
+            assert!(ms[0].params[0].units == "K");
         }
     }
 }

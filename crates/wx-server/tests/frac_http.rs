@@ -28,11 +28,11 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -53,27 +53,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!();}
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -83,15 +80,12 @@ fn copy_file(src: String, dst: String) {
 }
 
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -112,26 +106,26 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }
 
 fn has(body: &[u8], pat: &str) -> bool {
-    return bytes_contains(body, pat.as_bytes());
+    bytes_contains(body, pat.as_bytes())
 }
 
 // ONE ingest dir feeds BOTH models; the per-model file_glob does the separation
 // (spec §3: filenames are only ever a glob filter, never metadata).
 fn cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"frac\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"frac_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n[[models]]\nname = \"robust\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"robust_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"robust_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 struct Ctx {
@@ -151,7 +145,7 @@ fn serve_setup(root: String) -> Option<Ctx> {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -174,10 +168,10 @@ fn serve_setup(root: String) -> Option<Ctx> {
     let svc = app.into_service();
     let rt_r = Runtime::new();
     let rt = match rt_r {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(rtx) => { rtx }
     };
-    return Some(Ctx { p: p, svc: svc, rt: rt });
+    Some(Ctx { p, svc, rt })
 }
 
 async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
@@ -200,10 +194,10 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
     let b = resp.into_body();
     let col = b.collect().await;
     match col {
-        Err(_e) => { return (code, Vec::<u8>::new()); }
+        Err(_e) => { (code, Vec::<u8>::new())}
         Ok(cc) => {
             let bb = cc.to_bytes();
-            return (code, bb.to_vec());
+            (code, bb.to_vec())
         }
     }
 }
@@ -213,7 +207,7 @@ fn fractional_hours_over_http() {
     let root = "/tmp/opencode/wxpoint-frac-http".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;
@@ -319,7 +313,7 @@ fn robust_model_answers_despite_skipped_messages() {
     let root2 = "/tmp/opencode/wxpoint-robust-http".to_string();
     let cx_o = serve_setup(root2.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;

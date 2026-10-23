@@ -27,7 +27,7 @@ use std::io::Write;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -48,12 +48,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -74,7 +74,7 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
         Err(_) => { return; }
         Ok(mut w) => {
@@ -86,7 +86,7 @@ fn write_bytes(path: &str, bytes: &[u8]) {
 
 #[allow(clippy::needless_return)]
 fn exists_any(path: &str) -> bool {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return false; }
         Ok(_) => { return true; }
@@ -156,7 +156,7 @@ fn hybrid_sec4_decodes_raw_dimensionless_levels() {
     let r = decode_file("../../tests/fixtures/hybrid_small.grib2".to_string(),
                         ParamFilter::All);
     let (msgs, st) = match r {
-        Err(e) => { println!("decode failed: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("decode failed: {e:?}"); panic!(); }
         Ok(pair) => { pair }
     };
     assert!(st.messages_total == 8);
@@ -208,7 +208,7 @@ fn hybrid_wildcard_stores_ascending_stack_and_answers_exact() {
                                "\"hybrid:*\"").as_bytes());
     let p1r = Pipeline::open(&cfgp);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -223,7 +223,7 @@ fn hybrid_wildcard_stores_ascending_stack_and_answers_exact() {
     let snap = p1.shared.get_index();
     let sref = &*snap;
     let m = match sref.find_model("hyb") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => { mm }
     };
     assert!(m.runs.len() == 1);
@@ -234,7 +234,7 @@ fn hybrid_wildcard_stores_ascending_stack_and_answers_exact() {
         }
     }
     let fe = match hyb_field {
-        None => { println!("no TMP level_code 105 field in index"); assert!(false); return; }
+        None => { println!("no TMP level_code 105 field in index"); panic!(); }
         Some(f) => { f }
     };
     // TWO forecast hours grouped from six messages, three RAW levels each,
@@ -256,17 +256,17 @@ fn hybrid_wildcard_stores_ascending_stack_and_answers_exact() {
             let c1r = build_context(sref, "hyb", None, "TMP", 105, l, fhh,
                                     TimeInterpMode::Linear);
             let c1 = match c1r {
-                Err(e) => { println!("ctx L={l} fh={fhh}: {e:?}"); assert!(false); return; }
+                Err(e) => { println!("ctx L={l} fh={fhh}: {e:?}"); panic!(); }
                 Ok(c) => { c }
             };
             let q = evaluate_point(&c1, NODE_LAT, NODE_LON);
             match q {
-                Err(other) => { println!("probe L={l} fh={fhh}: {other:?}"); assert!(false); }
+                Err(other) => { println!("probe L={l} fh={fhh}: {other:?}"); panic!(); }
                 Ok(pv) => {
                     let w = hyb_want(l, if kf == 0 { 0.0 } else { 6.0 });
                     if !(pv.value == w) {
                         println!("L={l} fh={fhh}: got {0} want {w}", pv.value);
-                        assert!(false);
+                        panic!();
                     }
                 }
             }
@@ -301,7 +301,7 @@ fn hybrid_bracket_interpolation_is_analytic() {
                                "\"hybrid:*\"").as_bytes());
     let p1r = Pipeline::open(&cfgp);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -313,17 +313,17 @@ fn hybrid_bracket_interpolation_is_analytic() {
     let c1r = build_context(sref, "hyv", None, "TMP", 105, 152.5, 0.0,
                             TimeInterpMode::Linear);
     let c1 = match c1r {
-        Err(e) => { println!("ctx 152.5: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("ctx 152.5: {e:?}"); panic!(); }
         Ok(c) => { c }
     };
     let q1 = evaluate_point(&c1, NODE_LAT, NODE_LON);
     match q1 {
-        Err(other) => { println!("probe 152.5: {other:?}"); assert!(false); }
+        Err(other) => { println!("probe 152.5: {other:?}"); panic!(); }
         Ok(pv) => {
             let w = hyb_want(152.5, 0.0); // = 1800
             if absdiff(pv.value, w) > 1e-9 {
                 println!("152.5: got {0} want {w}", pv.value);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -331,16 +331,16 @@ fn hybrid_bracket_interpolation_is_analytic() {
     let c2r = build_context(sref, "hyv", None, "TMP", 105, 203.5, 0.0,
                             TimeInterpMode::Linear);
     let c2 = match c2r {
-        Err(e) => { println!("ctx 203.5: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("ctx 203.5: {e:?}"); panic!(); }
         Ok(c) => { c }
     };
     match evaluate_point(&c2, NODE_LAT, NODE_LON) {
-        Err(other) => { println!("probe 203.5: {other:?}"); assert!(false); }
+        Err(other) => { println!("probe 203.5: {other:?}"); panic!(); }
         Ok(pv) => {
             let w = hyb_want(203.5, 0.0); // = 2208
             if absdiff(pv.value, w) > 1e-9 {
                 println!("203.5: got {0} want {w}", pv.value);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -349,16 +349,16 @@ fn hybrid_bracket_interpolation_is_analytic() {
     let c3r = build_context(sref, "hyv", None, "TMP", 105, 50.0, 10800.0,
                             TimeInterpMode::Linear);
     let c3 = match c3r {
-        Err(e) => { println!("ctx fh3 blend: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("ctx fh3 blend: {e:?}"); panic!(); }
         Ok(c) => { c }
     };
     match evaluate_point(&c3, NODE_LAT, NODE_LON) {
-        Err(other) => { println!("probe fh3 blend: {other:?}"); assert!(false); }
+        Err(other) => { println!("probe fh3 blend: {other:?}"); panic!(); }
         Ok(pv) => {
             let w = hyb_want(50.0, 3.0); // = 985
             if absdiff(pv.value, w) > 1e-9 {
                 println!("fh3 blend: got {0} want {w}", pv.value);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -384,7 +384,7 @@ fn hybrid_out_of_range_never_extrapolates() {
                                "\"hybrid:*\"").as_bytes());
     let p1r = Pipeline::open(&cfgp);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -397,11 +397,11 @@ fn hybrid_out_of_range_never_extrapolates() {
         let cr = build_context(sref, "hyr", None, "TMP", 105, wr, 0.0,
                                TimeInterpMode::Linear);
         match cr {
-            Ok(_) => { println!("hybrid:{wr} unexpectedly resolvable"); assert!(false); }
+            Ok(_) => { println!("hybrid:{wr} unexpectedly resolvable"); panic!(); }
             Err(e) => {
                 match e {
                     SelectError::LevelOutOfRange => {}
-                    other => { println!("hybrid:{wr}: wrong error {other:?}"); assert!(false); }
+                    other => { println!("hybrid:{wr}: wrong error {other:?}"); panic!(); }
                 }
             }
         }
@@ -430,7 +430,7 @@ fn hybrid_isobaric_same_param_stacks_never_mix() {
                                "\"isobaric:*\", \"hybrid:*\"").as_bytes());
     let p1r = Pipeline::open(&cfgp);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -443,7 +443,7 @@ fn hybrid_isobaric_same_param_stacks_never_mix() {
     let snap = p1.shared.get_index();
     let sref = &*snap;
     let m = match sref.find_model("hyi") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => { mm }
     };
     let mut n105 = 0usize;
@@ -468,22 +468,22 @@ fn hybrid_isobaric_same_param_stacks_never_mix() {
     let c1r = build_context(sref, "hyi", None, "TMP", 105, 128.0, 0.0,
                             TimeInterpMode::Linear);
     let c1 = match c1r {
-        Err(e) => { println!("ctx hyb128: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("ctx hyb128: {e:?}"); panic!(); }
         Ok(c) => { c }
     };
     match evaluate_point(&c1, NODE_LAT, NODE_LON) {
-        Err(other) => { println!("probe hyb128: {other:?}"); assert!(false); }
+        Err(other) => { println!("probe hyb128: {other:?}"); panic!(); }
         Ok(pv) => {
             let w = hyb_want(128.0, 0.0); // 1604
             if absdiff(pv.value, w) > 1e-9 {
                 println!("hyb128: got {0} want {w}", pv.value);
-                assert!(false);
+                panic!();
             }
             // belt AND braces: nothing near the DISJOINT isobaric band (~1e5)
             // leaked into a hybrid-stack answer (hybrid values top out ~2721)
             if pv.value > 10000.0 || pv.value < 0.0 {
                 println!("hyb128 magnitude leak: {0}", pv.value);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -492,16 +492,16 @@ fn hybrid_isobaric_same_param_stacks_never_mix() {
     let c2r = build_context(sref, "hyi", None, "TMP", 100, 700.0, 0.0,
                             TimeInterpMode::Linear);
     let c2 = match c2r {
-        Err(e) => { println!("ctx iso700: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("ctx iso700: {e:?}"); panic!(); }
         Ok(c) => { c }
     };
     match evaluate_point(&c2, NODE_LAT, NODE_LON) {
-        Err(other) => { println!("probe iso700: {other:?}"); assert!(false); }
+        Err(other) => { println!("probe iso700: {other:?}"); panic!(); }
         Ok(pv) => {
             let w = iso_want(700.0); // 101280
             if absdiff(pv.value, w) > 1e-9 {
                 println!("iso700: got {0} want {w}", pv.value);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -512,11 +512,11 @@ fn hybrid_isobaric_same_param_stacks_never_mix() {
     let c3r = build_context(sref, "hyi", None, "TMP", 100, 300.0, 0.0,
                             TimeInterpMode::Linear);
     match c3r {
-        Ok(_) => { println!("iso300 unexpectedly resolvable"); assert!(false); }
+        Ok(_) => { println!("iso300 unexpectedly resolvable"); panic!(); }
         Err(e) => {
             match e {
                 SelectError::LevelOutOfRange => {}
-                other => { println!("iso300: wrong error {other:?}"); assert!(false); }
+                other => { println!("iso300: wrong error {other:?}"); panic!(); }
             }
         }
     }
@@ -543,7 +543,7 @@ fn hybrid_config_matrix_and_rejects() {
     let good = tmp_cfg("hym", "/d", "/i", "hybrid_small.grib2",
                        "\"hybrid:*\", \"hybrid:837.5\", \"hybrid:1\"");
     match validate_text(&good) {
-        Err(e) => { println!("good hybrid config rejected: {e}"); assert!(false); }
+        Err(e) => { println!("good hybrid config rejected: {e}"); panic!(); }
         Ok(vm) => {
             let specs = &vm[0].params[0].level_specs;
             assert!(specs.len() == 3);
@@ -555,11 +555,11 @@ fn hybrid_config_matrix_and_rejects() {
     // ...and rejected, naming the bad spec like every other case does
     let bad = tmp_cfg("hym", "/d", "/i", "hybrid_small.grib2", "\"hybridx:1\"");
     match validate_text(&bad) {
-        Ok(_) => { println!("typo hybrid level accepted?!"); assert!(false); }
+        Ok(_) => { println!("typo hybrid level accepted?!"); panic!(); }
         Err(e) => {
             if e.find("bad level spec").is_none() {
                 println!("unexpected rejection text: {e}");
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -635,10 +635,7 @@ fn unknown_level_type_stays_decode_ok_store_skip() {
     let raw = read_bytes("../../tests/fixtures/hybrid_small.grib2");
     let offs = sec4_payload_offsets(&raw);
     assert!(offs.len() == 8);
-    let mut patched = Vec::<u8>::new();
-    for k in 0 .. raw.len() {
-        patched.push(raw[k]);
-    }
+    let mut patched: Vec<u8> = raw.to_vec();
     // message 0 (hybrid coord 1, fh 0): first fixed surface type 105 -> 200
     // (freezing level: a KNOWN name but unconfigured here; also proves
     // pass-through normalization leaves the value untouched)
@@ -657,7 +654,7 @@ fn unknown_level_type_stays_decode_ok_store_skip() {
     let pth = join_path(&ing, "hybrid_small.grib2");
     let r = decode_file(pth, ParamFilter::All);
     let (msgs, st) = match r {
-        Err(e) => { println!("patched decode failed: {e:?}"); assert!(false); return; }
+        Err(e) => { println!("patched decode failed: {e:?}"); panic!(); }
         Ok(pair) => { pair }
     };
     assert!(st.messages_total == 8);
@@ -675,7 +672,7 @@ fn unknown_level_type_stays_decode_ok_store_skip() {
                                "\"hybrid:*\"").as_bytes());
     let p1r = Pipeline::open(&cfgp);
     let mut p1 = match p1r {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -686,7 +683,7 @@ fn unknown_level_type_stays_decode_ok_store_skip() {
     let snap = p1.shared.get_index();
     let sref = &*snap;
     let m = match sref.find_model("hyu") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => { mm }
     };
     let mut lv: Vec<f64> = Vec::<f64>::new();
@@ -703,11 +700,11 @@ fn unknown_level_type_stays_decode_ok_store_skip() {
     let c1r = build_context(sref, "hyu", None, "TMP", 105, 1.0, 0.0,
                             TimeInterpMode::Linear);
     match c1r {
-        Ok(_) => { println!("hybrid:1 resolved though its plane became type 200"); assert!(false); }
+        Ok(_) => { println!("hybrid:1 resolved though its plane became type 200"); panic!(); }
         Err(e) => {
             match e {
                 SelectError::LevelOutOfRange => {}
-                other => { println!("wrong error {other:?}"); assert!(false); }
+                other => { println!("wrong error {other:?}"); panic!(); }
             }
         }
     }

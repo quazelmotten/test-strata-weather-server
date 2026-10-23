@@ -151,6 +151,16 @@ Pa) — never converted.
 curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP&level=isobaric:837.5&lat=41.25&lon=-95.93&valid=2026-10-19T19:30:00Z'
 ```
 
+**Raw-first wire format + targeted %-decode (V1.3 phase E6).** The server
+reads the RAW query string; the canonical form uses bare colons and commas
+(curl style). Exactly two escapes ARE additionally accepted, and ONLY inside
+`level` and `param` VALUES: `%3A`/`%3a` → `:` and `%2C`/`%2c` → `,` (encoded
+requests yield byte-identical responses — `point_http.rs` pins upper-hex,
+lower-hex, and mixed forms against their bare counterparts). Everything else
+passes through as literal bytes: `+` never decodes to a space, unknown or
+malformed `%` sequences survive verbatim (`param=TMP%zz` is an
+unknown-parameter 404, not a decode error), and no other key accepts escapes.
+
 ```json
 {"model":"gfs","run":"2026-10-19T12:00:00Z","valid":"2026-10-19T19:30:00Z",
   "lat":41.25,"lon":-95.93,"level":"isobaric:837.5",
@@ -282,9 +292,13 @@ machinery. They partition the STRUCTURAL subset of
 `wxpoint_skipped_messages_total` — policy skips like wind-pair drops or
 orphaned components count in the TOTAL only — and the exact template numbers
 are spelled out in the ingest-log note, e.g. "2 skipped: 2 grid template
-3.40"), `wxpoint_ingest_lag_seconds`
-(newest ingested
-file mtime → now), and — V1.3 phase E3a — `wxpoint_state_writes_total` /
+3.40"), `wxpoint_data_age_seconds`
+(renamed from `wxpoint_ingest_lag_seconds` in V1.3 phase E6: this gauge is
+NOW − newest ingested file mtime, i.e. how STALE the freshest data on disk is —
+it was never a publish latency), the TRUE latency pair `wxpoint_ingest_publish_latency_seconds`
+/ `_max` (per source file: file mtime → publish completion, wall-vs-wall, last
+value + lifetime maximum — spec §7's "file mtime → queryable" metric, which
+the old name only approximated), and — V1.3 phase E3a — `wxpoint_state_writes_total` /
 `wxpoint_state_bytes_written`: successful `state/files.json` saves and the
 bytes they serialized. The storage counters above deliberately EXCLUDE this
 writer, so these two gauges close the observability gap; batched per-chunk
@@ -582,14 +596,14 @@ refactor; the **phase-6 acceptance sweep** re-ran all three bench files again
 (`cargo bench --workspace`, 100 samples each). Milestone-5 numbers kept for
 reference; session variance on the pure kernels is ~±2%.
 
-| Kernel | milestone-5 | phase 5 before | phase 5 after | phase-6 sweep median | V1.2 phase-D sweep median |
-|---|---|---|---|---|---|
-| regular lat/lon project (per point) | 20.6 ns | 20.5 ns | 20.5 ns | **20.430 ns** | unchanged (prior row stands; not re-measured in D) |
-| LCC project, precomputed consts | 84.7 ns | 86.4 ns | 86.5 ns | **86.187 ns** | unchanged (prior row stands; not re-measured in D) |
-| bilinear over heap f32 slab | 30.7 ns | 30.9 ns | 31.0 ns | **30.746 ns** | **30.85 ns** |
-| bilinear over mmap field (server h_at pattern) | 32.5 ns | 33.1 ns | 33.0 ns | **32.663 ns** | **32.90 ns** |
-| full vertical+time point query via index accessor | 364.5 ns | 354.6 ns → 135.0 ns (−62%) | **136.62 ns** | **147.55 ns (+8.0% — see note below)** |
-| `/v1/point` handler: parse + lookup + render | 879.2 ns | 828.8 ns → 694.3 ns (−16%) | **681.74 ns** | **671.08 ns (−1.6%, improved)** |
+| Kernel | milestone-5 | phase 5 before | phase 5 after | phase-6 sweep median | V1.2 phase-D sweep median | V1.3 E6 sweep median |
+|---|---|---|---|---|---|---|
+| regular lat/lon project (per point) | 20.6 ns | 20.5 ns | 20.5 ns | **20.430 ns** | unchanged (prior row stands; not re-measured in D) | **27.584 ns** |
+| LCC project, precomputed consts | 84.7 ns | 86.4 ns | 86.5 ns | **86.187 ns** | unchanged (prior row stands; not re-measured in D) | **107.98 ns** |
+| bilinear over heap f32 slab | 30.7 ns | 30.9 ns | 31.0 ns | **30.746 ns** | **30.85 ns** | **37.87 ns** |
+| bilinear over mmap field (server h_at pattern) | 32.5 ns | 33.1 ns | 33.0 ns | **32.663 ns** | **32.90 ns** | **50.39 ns** |
+| full vertical+time point query via index accessor | 364.5 ns | 354.6 ns → 135.0 ns (−62%) | **136.62 ns** | not recorded (pre-E6 reference = V1.2-D's **147.55 ns, +8.0% — see note below**) | **147.55 ns (+8.0%)** | **185.49 ns** |
+| `/v1/point` handler: parse + lookup + render | 879.2 ns | 828.8 ns → 694.3 ns (−16%) | **681.74 ns** | not recorded (pre-E6 reference = V1.2-D's **671.08 ns, −1.6%** improvement) | **671.08 ns (−1.6%, improved)** | **668.10 ns (flat)** |
 
 Handler-level percentile pass (200k iterations, no HTTP, warm page cache;
 criterion 0.5 prints medians only): **p50 = p90 = p99 = 1 µs, mean 1.007 µs,
@@ -615,10 +629,39 @@ time's bracket differs from the other's: the old code reused ONE bracket pair ac
 both forecast hours). Composing those per-slot brackets costs extra work on exactly
 the differing-bracket path this bench exercises, so the median rose ~8%. This is an
 accepted correctness-over-speed trade, explicitly per the spec's priority order
-(correctness first; a fast wrong answer is a bug), and it stays 2.5x faster than
+(spec §8 priority order: correctness first; a fast wrong answer is a bug), and it stays 2.5x faster than
 milestone-5 and far inside the §8 latency budget (server-side p50 ≤10 µs, p99 ≤50
 µs measured under load). The handler itself got FASTER in the same sweep (681.7 ->
 671.1 ns), so the end-to-end request path did not regress.
+
+**V1.3 E6 release-candidate re-run (this table's last column).** Plain
+`cargo bench` per crate on the otherwise-idle machine right before tagging
+(no `--release` flag — the bench profile matches the historical columns —
+and no `target-cpu=native`, which remains NOT shipped). Read honestly, and
+against the RIGHT baselines: the projection arms compare against the E4b
+back-to-back session (28.7 / 105.9 / 88.6 ns — the Grid enum gained a variant
+since the phase-6 column, which is why phase-6's 20.4/86.2 are not the
+reference here): regular **−3.9%**, LCC **+2.0%**, gaussian **+12.3%**
+(criterion's own verdict line reads "Performance has regressed" — reported
+verbatim, not explained away). The bilinear arms compare against their
+V1.2-D columns: heap **+22.8%**, mmap h_at **+53.2%**. Full point query
+**+25.7%** vs the pre-E6 147.55 ns reference; handler **−0.4%** = unchanged.
+The split is systematic, not random: every MICRO arm reads higher while both
+MACRO arms (which include I/O and render work that dominates wall time)
+stand still — the same session-sensitivity signature already documented for
+the E4b re-run (codegen placement + governor state; the pure-kernel column
+has always carried ~±2% and this session ran further out). Two facts
+anchor the interpretation: (1) E6 touched NO hot-path arithmetic — the only
+additions are one byte-scan over the query string (`normalize_qs` Borrowed
+fast path) and one relaxed atomic store per published FILE on the ingest
+side; (2) the end-to-end indicators from the SAME sweep confirm no practical
+regression: smoke.sh avg point-query 30.2 µs (previous 28.9 µs, both deep
+inside budget), loadtest server-side mean 11.4 µs / buckets ≤20 µs / ≤50 µs
+at 282,265 req/s, and realistic ingest wall-to-first-improved (§7.4). The
+bench HARNESS files themselves additionally received lint-only `--fix`
+rewrites in E6 (mechanical, semantics-preserving by contract, but codegen
+may move), which is part of why micro numbers shifted. No number was
+cherry-picked: all seven medians are printed in the table as measured.
 
 The −62% on the index accessor is the removal of the per-query units `String`
 clone, the per-slot level `Vec<f64>`, the forecast-hour scratch `Vec<f64>` and
@@ -633,13 +676,13 @@ oha mix: 8 URLs (exact-node GFS, seam, vertical interp, time interp,
 multi-param, HRRR LCC, 404 unknown model, 422 bad level), `--worker-threads 8
 -c 64 -z 20s --no-tui --urls-from-file`, keep-alive.
 
-| Metric | portable (phase 5 before) | portable (phase 5 after) | portable (phase-6 sweep, 2 runs) | target-cpu=native (pre-phase-5 / phase-6 sweep) | V1.2 phase-D sweep (15 s) |
-|---|---|---|---|---|---|
-| throughput (client, 8 workers) | 286,868 req/s | 286,872 req/s | **287,451 / 286,342 req/s** | 275,293 req/s / 281,305 req/s | **272,647 req/s** |
-| server-side mean latency (/metrics delta) | 12.5 µs | 10.0 µs | **9.4 µs** (n = 5,752,100 / 5,730,170 queries) | 13.4 µs / 9.9 µs | **10.3 µs** (n = 4,091,386) |
-| server-side p50 / p99 (histogram buckets) | ≤20 µs / ≤50 µs | ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** | ≤20 µs / ≤50 µs / ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** |
-| client p50 / p99 (oha) | 0.21 ms / 0.42 ms | 0.21 ms / 0.42 ms | **0.211 ms / 0.431 ms** | similar | similar (shorter 15 s window) |
-| status mix in the mix | — | — | **200: 4,297,215 · 422: 717,234 · 404: 715,667** (run B) | — | — |
+| Metric | portable (phase 5 before) | portable (phase 5 after) | portable (phase-6 sweep, 2 runs) | target-cpu=native (pre-phase-5 / phase-6 sweep) | V1.2 phase-D sweep (15 s) | V1.3 E6 sweep (20 s) |
+|---|---|---|---|---|---|---|
+| throughput (client, 8 workers) | 286,868 req/s | 286,872 req/s | **287,451 / 286,342 req/s** | 275,293 req/s / 281,305 req/s | **272,647 req/s** | **282,265 req/s** |
+| server-side mean latency (/metrics delta) | 12.5 µs | 10.0 µs | **9.4 µs** (n = 5,752,100 / 5,730,170 queries) | 13.4 µs / 9.9 µs | **10.3 µs** (n = 4,091,386) | **11.4 µs** (n = 5,649,715) |
+| server-side p50 / p99 (histogram buckets) | ≤20 µs / ≤50 µs | ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** | ≤20 µs / ≤50 µs / ≤10 µs / ≤50 µs | **≤10 µs / ≤50 µs** | **≤20 µs / ≤50 µs** |
+| client p50 / p99 (oha) | 0.21 ms / 0.42 ms | 0.21 ms / 0.42 ms | **0.211 ms / 0.431 ms** | similar | similar (shorter 15 s window) | not emitted this run (script flags) |
+| status mix in the mix | — | — | **200: 4,297,215 · 422: 717,234 · 404: 715,667** (run B) | — | — | **200: 4,237,416 · 422: 706,616 · 404: 705,621** (+62 deadline aborts) |
 
 §8 targets: **p50 < 50 µs MET** (bucket ≤10 µs), **p99 < 250 µs MET** (bucket
 ≤50 µs), **≥50k req/s on 8 cores MET ×5.5** (272,647 req/s in the V1.2 phase-D 15 s
@@ -656,13 +699,22 @@ WHERE values are read from, never arithmetic; equivalence is pinned by
 `alloc_free_kernels.rs` + `alloc_free_select.rs` + the probes.tsv value
 assertions inside `hotpath_full_alloc.rs`. `target-cpu=native` was measured again
 in this sweep and is still NOT better (−1.8% throughput, mean latency 9.9 vs
-9.4 µs), so the shipped build stays portable.
+9.4 µs), so the shipped build stays portable. The V1.3 E6 release-candidate
+re-run confirms every §8 target holds on the tag tree: **282,265 req/s**
+(×5.6 of the ≥50k target), server-side mean **11.4 µs** with buckets
+**≤20 µs / ≤50 µs** (p50 < 50 µs MET, p99 < 250 µs MET), success rate 100%
+with only 62 deadline aborts, and `scripts/smoke.sh` **SMOKE PASS** at a
+release-build average point-query time of **30.2 µs** over its 422
+correctness probes (previous session: 28.9 µs — ordinary session drift of
+the kind §7.1 documents, deep inside budget).
 
-Note on script robustness found during this sweep: `loadtest.sh`'s pre-hammering
-sanity probe originally fired once per URL and could race the field-by-field
-publisher (a 200-class HRRR URL answered 422 while its level stack was still
-partial). The script now waits each URL out (bounded 15 s) instead of failing;
-product behaviour unchanged (§9 documents the window itself).
+Note on script robustness found during that sweep: `loadtest.sh`'s
+pre-hammering sanity probe originally fired once per URL and could race the then
+field-by-field publisher (a 200-class HRRR URL answered 422 while its level
+stack was still partial). The script waits each URL out (bounded 15 s) instead
+of failing — kept as belt-and-braces even though publish became PER FILE in
+V1.2 phase B, which closed the half-stack window within one file (§9; the
+concurrency harness observes zero transient 422s).
 
 ### 7.3 Ingest → queryable (`scripts/ingestbench.sh`)
 
@@ -767,6 +819,16 @@ forecast hour (148 messages, 192 MB file, 4 params x 37 levels) became queryable
 **1.35-1.64 s** after the file was stable, and the whole six-file delivery was
 queryable **15.7 s** after the scan started (K=4).
 
+**V1.3 E6 re-confirmation (same script + dataset, release-candidate build):**
+`[main/plain]` first-queryable **5.01 s**, all-visible **13.92 s**, peak RSS
+**3066 MB**, server CPU **21.98 s** — roughly 11% FASTER wall-to-everything than
+the V1.2-D column above (5.62 s / 15.73 s / 26.0 s), consistent with the E3a
+batched-state-save work removing per-file overhead; RSS essentially unchanged,
+as expected since the K=4 plane-residency law below did not move. The script
+output now also carries the E3a state counters (`state_saves=2
+state_bytes=2014` for this whole delivery), closing the observability gap the
+SCOPE note above describes.
+
 **Memory guidance for `decode_batch_files` (K).** Peak RSS scales with K because a
 consumed file's GROUP planes stay resident until that file is written: one realistic
 file's planes are 4 params x 37 levels x 1440 x 720 x 4 B = **614 MB**, so K=1
@@ -828,7 +890,7 @@ tolerance. All green in the V1.2 phase-D sweep (`cargo test --workspace`: 153 te
 | 6 | Poles and domain edges defined and tested | `poles_global_grid` (lat ±90 on a global regular grid: exact node row, no wrap artefacts), `out_of_domain_edges` (west/east/south edges incl. "a hair outside"), smoke HRRR edge probe (`lat=59.0` → 422) | defined semantics (node rectangle, never extrapolate) on synthetic grids; real-file caveat in §9 | n/a — behaviour is defined, asserted exactly |
 | 7 | Masked points return `null`, never a blended number | `nan_neighbor_missing_data`, `masked_points_are_nan_for_every_codec`, `bilinear_kernel_affine_nan` | fixture bitmap masking every 97th node, re-checked through all seven packings | must be exactly `null` + `missing_data` (NaN positions preserved per codec) |
 | 8 | Time interpolation of accumulations is rejected | `stat_small_messages`, `stat_point_checks`, `jpeg_twin_keeps_pdt48_metadata_and_values`, `time_guard_stat_and_none`, `error_status_table` (422 `stat_time_guard`), `fractional_hours_over_http` guard cases | PDT 4.8 fixtures `stat_small.grib2` (+ JPEG twin) validated against wgrib2 readback/checksums | n/a — status/token equality |
-| 9 | Ingest under hammering queries: no error, no partial data | `concurrent_publishers_and_readers_never_tear`, `ingest_churn_vs_queries_http`, `retention_evicts_after_publish_stale_snapshot_still_reads` | invariant assertions over live publish/evict churn (zero 5xx, zero torn JSON bodies, settled-state batch proves transient 422s disappear) | n/a — invariants; documented transient 422s counted separately (§9) |
+| 9 | Ingest under hammering queries: no error, no partial data | `concurrent_publishers_and_readers_never_tear`, `ingest_churn_vs_queries_http`, `retention_evicts_after_publish_stale_snapshot_still_reads` | invariant assertions over live publish/evict churn (zero 5xx, zero torn JSON bodies, settled-state batch proves transient 422s disappear) | n/a — invariants; the transient-422 window CLOSED at file granularity in V1.2-B (`fin[5] == 0` pinned) |
 
 **What "real files" means here (honesty note, V1.2 phase D).** Every fixture in
 `tests/fixtures/` and `tests/perfdata/` is SYNTHETIC: written by our own generator
@@ -1088,15 +1150,21 @@ live in §10 and docs/DECISIONS.md.
    re-delivers; unlike the CORRUPT-grid upgrade trap it is NOT auto-deleted —
    nothing is wrong to repair, something is merely absent, and deleting could
    race a producer mid-write at boot (`missing_gridbin.rs`).
-* **Exit codes** (`crates/wx-server/src/main.rs`, asserted nowhere but documented
-   behaviour): `0` normal shutdown; `2` usage error (no `--config` and no
-   `WXPOINT_CONFIG`, nothing started); `1` config validation failed loudly (spec
-   §3); `3` pipeline initialisation failed (data dir/state unreadable); `4` the
-   startup wind-pair PREFLIGHT rejected the config (grid-relative model with only
-   one of UGRD/VGRD) BEFORE any data was ingested or any port bound; `7` the
-   PROVISIONAL post-boot enforcement fired (V1.3 phase E3b: the same violation
-   proven by DECODED evidence after a deferred preflight — see
-   `[ingest].wind_pair_enforce`; `exit_codes.rs` pins both halves).
+* **Exit codes** (`crates/wx-server/src/main.rs`) — honest assertion ledger,
+   updated V1.3 phase E6 (the old "asserted nowhere" sentence was stale):
+   `0` normal shutdown; `2` usage error (no `--config`, no `WXPOINT_CONFIG`) —
+   ASSERTED (`missing_config_argument_exits_with_the_usage_code`); `1` config
+   validation failed loudly (spec §3) — ASSERTED ×3 (nonexistent config file,
+   data-dir/ingest-dir OVERLAP guard incl message naming both paths, unknown
+   param name); `4` startup wind-pair PREFLIGHT rejected a half-paired
+   grid-relative model whose dir was STABLE at boot — ASSERTED since E6
+   (`stable_wind_half_pair_exits_four_at_boot`); `6` the bind address could
+   not be bound — ASSERTED since E6 (`an_unbindable_address_exits_six`); `7`
+   PROVISIONAL post-boot wind enforcement fired — ASSERTED both halves
+   (rc==7 with default enforce, plus rc==124 timeout-negative control with
+   `wind_pair_enforce=false`, violation note required in both). STILL WIRED
+   BUT UNTESTED (hard to force from a black-box spawn): `3` pipeline-init
+   failure, `5` tokio-runtime init, `8` HTTP server error.
 * **Residual publish window (per-file granularity).** Because visibility flips once
   per SOURCE FILE, a scan round that consumes several files can momentarily expose
   one forecast hour without the next (normal: products DO arrive hour by hour) or
@@ -1114,6 +1182,13 @@ live in §10 and docs/DECISIONS.md.
   `level_out_of_range` answers; they are gone at file granularity, and §4.5's
   "forecast hour by forecast hour" requirement still holds because products arrive
   one forecast hour at a time.
+   HISTORY (clearly historical now): the V1.1-era design point WAS per-field
+   publish with an accepted bounded transient-422 window, counted separately
+   by tests and recorded as an "open follow-up" to coarsen publish; that
+   follow-up was TAKEN in V1.2 phase B (docs/DECISIONS.md), so any text
+   describing per-field publish or a LIVE transient-422 window as CURRENT
+   behaviour is stale — within one source file there is no such window and
+   the concurrency harness pins zero transient 422s (`fin[5] == 0`).
 * **Operator log lines are emitted ONCE (V1.2 phase D).** Per-FILE OUTCOME lines
   (`ingested …`, `failed … quarantined`, `ignored …`, `skipped …`) travel through
   the LIVE printer's FIFO only; the round streamer prints NOTES. Before this fix the
@@ -1135,6 +1210,30 @@ live in §10 and docs/DECISIONS.md.
   `lat=89.9` → 422, `lat=89.875` → 200 exact node). Everything up to the node
   rectangle edges is exercised on production-scale geometry (still synthetic bytes,
   per the §8 honesty note).
+* **Production-data verification stays MANUAL / NETWORK-gated (V1.3 phase E5).**
+  Spec §13 keeps CI offline, so the live-bytes proof lives in
+  `scripts/realdata_acceptance.sh` (§8): fetch → release server → 20 wgrib2/pyproj
+  pins → SUMMARY line. It must be RUN by hand before trusting a new production
+  product line, and its date pinning needs care: the fixture-era gates default to
+  a pinned `GFS_YMD`, and live NOMADS data ROLLED OVER between sessions once
+  (docs/DECISIONS.md §18 drift lesson) — refetch with explicit `GFS_YMD`/`GFS_HH`
+  when the default day ages out.
+* **Percent-decoding is deliberately narrow (V1.3 phase E6).** Only `%3A`/`%3a`
+  and `%2C`/`%2c` inside `level` and `param` VALUES decode (§3). Every other
+  encoding stays literal BYTES: `%2B` is not `+`, `%20` is not a space, and a
+  fully-URL-encoded timestamp (`valid=2026-10-19T18%3A00%3A00Z`) answers 400
+  `bad_time` — curl's default sends bare colons, only aggressive encoders hit
+  this, and the escape hatch is documented rather than silently widened because
+  decoding `+` (form encoding) would change existing 404-class behaviour.
+* **Real-data gate cost when enabled.** With `tests/realdata/` populated the
+  DEBUG-profile suite pays roughly an hour per run (the slice-decode gates run
+  unoptimized); CI without those files skips them cleanly in seconds. Use
+  `cargo test --release` for quick full-suite passes against live slices.
+* **Storage scales linearly per grid plane (sizing guidance).** One full
+  native HRRR 3 km CONUS plane (1799×1059 f32) is ≈7.6 MB; one full GFS 0.25°
+  plane (1440×721 f32) ≈4.0 MB. A run's footprint is planes × levels × params
+  with no compression — configure `retention_runs` against your disk, not
+  against the GRIB files' compressed sizes.
 
 ## 10. Decision log (V1.1)
 
@@ -1168,12 +1267,13 @@ docs/DECISIONS.md.
   the arc-swapped index snapshot, with fixed-inline buffers (8 params / 8 entries,
   documented fallback beyond that). Error paths still allocate — deliberate: they
   are cold and clarity beats micro-optimisation there.
-* **Publish granularity (follow-up, not taken).** Per-field publish kept because
-  §4.5 demands forecast-hour-by-forecast-hour visibility; the transient 422 window
-  it creates (§9) is bounded, self-healing, and covered by tests that count it
-  separately instead of asserting it away. Coarsening to per-forecast-hour-group
-  publish would trade spec-mandated incremental visibility for fewer transient
-  errors; recorded as the open follow-up.
+* **Publish granularity (HISTORICAL — follow-up SINCE TAKEN).** This entry
+  once said "per-field publish kept ... open follow-up". That was the
+  V1.1-era state. V1.2 phase B took the follow-up: publish moved to ONE
+  SOURCE FILE per swap, which removed the half-stack window entirely
+  (concurrency harness observes zero transient 422s) at a small measured
+  cost to wall-to-first-queryable. Kept here, marked historical, because
+  DECISIONS.md cross-references it.
 * **No bounded/bit-risky optimizations.** §8 targets were met on first measurement,
   so none were attempted; any optimization that could change an output bit needs a
   test proving the new result at least as correct, and we never needed one.
@@ -1186,3 +1286,62 @@ docs/DECISIONS.md.
   `gen_perfdata.sh`, values analytic and exact-in-f32, every field validated against
   wgrib2 readback/checksums); real NOAA file NAMES/framing beyond the two accepted
   terminator forms have not been exercised end-to-end.
+
+---
+
+## 11. Release notes (V1.3)
+
+Phase-by-phase rationale lives in docs/DECISIONS.md; §19 there is the final
+acceptance record (sweep numbers, gate logs, deviations register). Headline
+changes over V1.2:
+
+* **Statistical-process durability — `.bin` header v2 (E0).** Every field
+  file carries its accumulation/average/max-min guard and its window
+  (begin/end/step seconds) INSIDE the durable header, so spec §6.3 stays
+  enforced even with `manifest.json` missing or corrupt; the manifest is now
+  a human-readable inventory, and warm start reads guards back from headers.
+* **Per-forecast-hour stat guards + collision accounting (E1).** The §6.3
+  guard became per-forecast-hour precise (mixed-kind files no longer degrade
+  a whole field), and statistically distinct groups colliding on one field
+  file resolve first-in-message-order with rejects counted in
+  `wxpoint_stat_collisions_total`.
+* **Provenance & units honesty (E2).** Every result carries its own `"run"`
+  (top-level echo only when unanimous, else JSON `null`); `/v1/models`
+  renamed `winds_grid` → `source_winds_grid` (stored winds are always
+  earth-relative); params accept an optional raw `units = "..."` override.
+* **Ingest robustness batch (E3a/E3b).** Manifest-update retry; batched
+  state saves + dedicated state-write counters; pread-based content hashing;
+  symlinked ingest dirs; missing `grid.bin` loud-but-non-destructive; atomic
+  retention sweep; per-model state keys; provisional wind-pair enforcement
+  (exit 7 post-boot when preflight defers; `[ingest].wind_pair_enforce=false`
+  opts out).
+* **Skip observability (E4a).** Structural skips tallied BY KIND
+  (`wxpoint_skip_coordlists_total` / `_grid_total` / `_pdt_total`) with exact
+  template numbers named in the log note; degenerate section-7 messages skip
+  cleanly instead of erroring.
+* **Gaussian grids + HYBRID levels (E4b/E4c).** GRIB grid template 3.40
+  (quasi-regular gaussian, `GRID_VERSION` 3, no polar nodes) decodes and
+  projects end to end, and level type 105 (hybrid) indexes/queries with RAW
+  dimensionless coordinates — making today's operational GFS `sfluxgrbf`
+  line fully queryable, surface AND upper-air. Documented deviation: the
+  spec sketched isobaric examples; hybrid (not log-pressure) support is what
+  production actually needs (docs/DECISIONS.md §16–§17).
+* **Live-data acceptance harness (E5).** `scripts/realdata_acceptance.sh`
+  (MANUAL/NETWORK): real GFS/HRRR slices → release server → 20 independent
+  wgrib2/pyproj pins incl. wind rotation, same-run time blends, PDT 4.8
+  guards; SUMMARY line must read 20/20 (§8).
+* **Metrics semantics, wire format, hygiene closeout (E6).**
+  `wxpoint_ingest_lag_seconds` RENAMED `wxpoint_data_age_seconds` (it was
+  always staleness, never latency) and the TRUE latency pair
+  `wxpoint_ingest_publish_latency_seconds` / `_max` added (file mtime →
+  publish completion, wall-vs-wall, last + lifetime max); targeted
+  `%3A`/`%2C` decoding inside level/param values (§3, §9); exit-code ledger
+  completed with rc==4 and rc==6 black-box assertions; the clippy
+  all-targets surface went from 229 abort-truncated (~623 full-surface
+  mid-flight) to ZERO diagnostics on both gate forms with all affected test
+  binaries rerun green (docs/DECISIONS.md §19).
+
+V1.2-era changes (per-file publish granularity, chunked decode pipeline,
+retention-aware skipping, once-only operator logs) are summarized in §7.4
+and in §9/§10's supersession notes, with full detail in docs/DECISIONS.md's
+V1.2 sections.

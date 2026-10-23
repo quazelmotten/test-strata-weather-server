@@ -30,13 +30,13 @@ fn c_str(s: &str) -> Vec<i8> {
         buf.push(b as i8);
     }
     buf.push(0);
-    return buf;
+    buf
 }
 
 /// Count `.tmp.` entries directly inside `dir`.
 fn count_tmp_in(dir: &str) -> usize {
     let mut hits: usize = 0;
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => { return hits; }
         Ok(it) => {
             for e in it {
@@ -47,18 +47,17 @@ fn count_tmp_in(dir: &str) -> usize {
                         let ps = pp.to_str();
                         match ps {
                             None => {}
-                            Some(s) => {
-                                if s.contains(".tmp.") {
-                                    hits += 1;
-                                }
+                            Some(s) if s.contains(".tmp.") => {
+                                hits += 1;
                             }
+                            Some(_) => {}
                         }
                     }
                 }
             }
         }
     }
-    return hits;
+    hits
 }
 
 /// Read every stored value of a field file (scalar path, independent of the
@@ -66,7 +65,7 @@ fn count_tmp_in(dir: &str) -> usize {
 fn all_values(path: &str) -> Vec<f32> {
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { return [].to_vec(); }
+        Err(_) => { [].to_vec() }
         Ok(mf2) => {
             let mut out: Vec<f32> = Vec::<f32>::new();
             for li in 0 .. mf2.header.levels.len() {
@@ -76,7 +75,7 @@ fn all_values(path: &str) -> Vec<f32> {
                     }
                 }
             }
-            return out;
+            out
         }
     }
 }
@@ -167,7 +166,7 @@ fn failed_writes_leave_no_temp_litter_and_keep_the_original() {
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -195,5 +194,5 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }

@@ -25,23 +25,23 @@ use std::fs::read_dir;
 use std::sync::atomic::Ordering;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -49,25 +49,22 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn join2(a: &str, b: &str) -> String {
-    return format!("{0}/{1}", a, b);
+    format!("{0}/{1}", a, b)
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -88,7 +85,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn count_in(v: &Vec<String>, marker: &str) -> usize {
@@ -98,7 +95,7 @@ fn count_in(v: &Vec<String>, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 fn tiny_cfg(data: &str, ing: &str) -> String {
@@ -106,7 +103,7 @@ fn tiny_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\ndecode_batch_files = 4\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    return t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
+    t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -117,7 +114,7 @@ fn stable_file_ingests_once_and_prints_once() {
     let data = join2(&root, "data");
     let _c = create_dir_all(&ing);
     let src = read_bytes(&fixture("gfs_small.grib2"));
-    assert!(src.len() > 0);
+    assert!(!src.is_empty());
     let target = join2(&ing, "a.grib2");
     write_bytes(&target, &src[..]);
 
@@ -125,7 +122,7 @@ fn stable_file_ingests_once_and_prints_once() {
     write_bytes(&cfg_path, tiny_cfg(&data, &ing).as_bytes());
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -149,7 +146,7 @@ fn stable_file_ingests_once_and_prints_once() {
     assert!(nrec == 1);
     assert!(p.state.recs.len() == 1);
     match p.state.find("gfs", target.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
     assert!(p.counters.errors == 0);
@@ -164,18 +161,18 @@ fn stable_file_ingests_once_and_prints_once() {
     assert!(first.len() == 1);
     assert!(count_in(&first, "a.grib2") == 1);
     let second = p.live.drain_progress();
-    assert!(second.len() == 0);
+    assert!(second.is_empty());
     // three more rounds on the same bytes add NOTHING to either channel
     assert!(p.scan_round() == 0);
     assert!(p.scan_round() == 0);
     assert!(p.live.progress_seq.load(Ordering::Relaxed) == 1);
-    assert!(p.live.drain_progress().len() == 0);
+    assert!(p.live.drain_progress().is_empty());
     assert!(p.counters.ingested_files == 1);
 
     // ---- a CONTENT CHANGE re-arms EXACTLY ONE ingest + ONE progress line --
     // (same path, different packing of the same field set: gfs_small_c2 is DRT 5.2)
     let changed = read_bytes(&fixture("gfs_small_c2.grib2"));
-    assert!(changed.len() > 0);
+    assert!(!changed.is_empty());
     write_bytes(&target, &changed[..]);
     // a changed identity RESETS the stability window, so the re-consume lands in
     // whichever round first sees it STABLE again: exactly ONE across the pair.
@@ -186,7 +183,7 @@ fn stable_file_ingests_once_and_prints_once() {
     assert!(count_in(&p.progress_log, "ingested ") == 2);
     let third = p.live.drain_progress();
     assert!(third.len() == 1);
-    assert!(p.live.drain_progress().len() == 0);
+    assert!(p.live.drain_progress().is_empty());
 
     let _f = remove_file(&cfg_path);
     rm_tree(&root);

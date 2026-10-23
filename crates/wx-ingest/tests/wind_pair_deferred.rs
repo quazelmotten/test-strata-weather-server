@@ -33,7 +33,7 @@ use std::io::Write;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -54,18 +54,18 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { assert!(false); return Vec::<u8>::new(); }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return Vec::<u8>::new(); }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
@@ -80,15 +80,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -127,12 +124,12 @@ fn wd_cfg(data: &str, ing: &str, extra: &str) -> String {
 #[test]
 fn empty_at_boot_defers_then_decoded_evidence_flags_the_violation() {
     let root = "/tmp/opencode/wxpoint-winddefer";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     let cfg_text = wd_cfg(&data, &ing, "");
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, cfg_text.as_bytes());
 
     // BOOT HALF: with an empty ingest dir the preflight cannot decide — it
@@ -140,13 +137,13 @@ fn empty_at_boot_defers_then_decoded_evidence_flags_the_violation() {
     // END of the story (nothing ever revisited it); post-E3b it is provisional.
     let models_r = validate_text(&cfg_text);
     let models = match models_r {
-        Err(e) => { println!("validate failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("validate failed: {e}"); panic!(); }
         Ok(mm) => { mm }
     };
     let now_ns = 1_760_000_000i64 * 1_000_000_000; // ~2025-10 epoch ns
     let pf = startup_wind_preflight(models, 0, now_ns);
     match pf {
-        Err(msg) => { println!("preflight unexpectedly fatal: {msg}"); assert!(false); return; }
+        Err(msg) => { println!("preflight unexpectedly fatal: {msg}"); panic!(); }
         Ok(notes) => {
             let joined = notes.join("\n");
             assert!(joined.contains("deferring"));
@@ -157,7 +154,7 @@ fn empty_at_boot_defers_then_decoded_evidence_flags_the_violation() {
     // The pipeline itself boots fine on the deferred verdict...
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(!p.wind_violation);
@@ -185,7 +182,7 @@ fn empty_at_boot_defers_then_decoded_evidence_flags_the_violation() {
     // NOT repeat per round (sticky suppression).
     assert!(p.scan_round() == 0);
     assert!(count_notes(&p, "wind pair rule violated") == 1);
-    rm_tree(&root);
+    rm_tree(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,18 +192,18 @@ fn empty_at_boot_defers_then_decoded_evidence_flags_the_violation() {
 #[test]
 fn wind_pair_enforce_key_defaults_true_and_honors_false() {
     let root = "/tmp/opencode/wxpoint-windenforce";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
 
     // default (key absent): TRUE
     let cfg1 = wd_cfg(&data, &ing, "");
-    let c1 = join_path(&root, "c1.toml");
+    let c1 = join_path(root, "c1.toml");
     write_bytes(&c1, cfg1.as_bytes());
     let pr1 = Pipeline::open(&c1);
     let p1 = match pr1 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p1.wind_pair_enforce);
@@ -214,13 +211,13 @@ fn wind_pair_enforce_key_defaults_true_and_honors_false() {
 
     // explicit false: honored
     let cfg2 = wd_cfg(&data, &ing, "wind_pair_enforce = false\n");
-    let c2 = join_path(&root, "c2.toml");
+    let c2 = join_path(root, "c2.toml");
     write_bytes(&c2, cfg2.as_bytes());
     let pr2 = Pipeline::open(&c2);
     let p2 = match pr2 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(!p2.wind_pair_enforce);
-    rm_tree(&root);
+    rm_tree(root);
 }

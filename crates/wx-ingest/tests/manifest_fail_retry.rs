@@ -36,7 +36,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -57,12 +57,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -83,15 +83,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -160,8 +157,8 @@ fn stat_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"stat\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"stat_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"stat_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -179,7 +176,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     // ---- life 1: healthy ingest ------------------------------------------
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -200,7 +197,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     write_bytes(&src, &read_bytes("../../tests/fixtures/stat_small_jpeg.grib2"));
     let cur_hash_r = content_hash_file(&src);
     let cur_hash = match cur_hash_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(hv) => { hv }
     };
 
@@ -227,7 +224,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     // 1): pre-fix this upserted the NEW hash and the retry could never happen.
     let rec_r = p1.state.find("stat", src.as_str());
     match rec_r {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(rc) => {
             assert!(rc.kind == REC_OK);          // the stale life-1 record
             assert!(rc.hash != cur_hash);        // NOT re-marked with new hash
@@ -236,7 +233,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
 
     // The trap is still in place: no readable manifest bytes at that path.
     let trapped = read_bytes(&man);
-    assert!(trapped.len() == 0);
+    assert!(trapped.is_empty());
 
     // Meanwhile the DATA side stayed truthful and queryable: the groups were
     // durably rewritten and published even though the state record lagged.
@@ -244,11 +241,11 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     let sref = &*snap;
     let ce = build_context(sref, "stat", None, "APCP", 1, 0.0, 0.0, TimeInterpMode::Linear);
     match ce {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(c) => {
             let v = evaluate_point(&c, 20.0, 240.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(pv) => {
                     assert!(pv.value == 10.0);
                     assert!(pv.info.horizontal == HorizMethod::Exact);
@@ -272,7 +269,7 @@ fn manifest_write_failure_blocks_state_record_and_retries_next_round() {
     // State now records the CURRENT hash as ingested.
     let rec2_r = p1.state.find("stat", src.as_str());
     match rec2_r {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(rc2) => {
             assert!(rc2.kind == REC_OK);
             assert!(rc2.hash == cur_hash);

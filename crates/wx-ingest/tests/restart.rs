@@ -20,23 +20,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -44,15 +44,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -73,11 +70,11 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -98,7 +95,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn e2e_cfg(data: &str, ing: &str) -> String {
@@ -110,8 +107,8 @@ fn e2e_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"stat_*.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"hrrr_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"hrrr_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n"
 }
 
 #[test]
@@ -132,7 +129,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
     // ---- first life ----------------------------------------------------
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _ = p1.scan_round();
@@ -154,7 +151,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
     // ---- simulated restart ---------------------------------------------
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // Index rebuilt from disk BEFORE any scan: gfs run present with mmapped
@@ -163,22 +160,22 @@ fn restart_no_reingest_and_content_change_redelivers() {
     let sref = &*snap;
     let gm = sref.find_model("gfs");
     match gm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 6);
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso) => {
                     let c_r = build_context(sref, "gfs", None, "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
-                            assert!(c.units == "K".to_string());
+                            assert!(c.units == "K");
                             let v = evaluate_point(&c, 10.0, 350.0);
                             match v {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => {
                                     assert!(pv.value == 250.0);
                                     assert!(pv.info.horizontal == HorizMethod::Exact);
@@ -192,7 +189,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
     }
     let sm = sref.find_model("stat");
     match sm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             let mut found = false;
             let mut apcp_r0 = (false, 0, 0);
@@ -203,7 +200,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
                     found = true;
                     // manifest.json round-trip restored the accumulation guard.
                     assert!(fe.fd.stat_processed);
-                    assert!(fe.fd.stat_kind == "accumulation".to_string());
+                    assert!(fe.fd.stat_kind == "accumulation");
                     // ...and the PER-fh statistical ranges survived the restart
                     // (offsets from the run time, exactly as written).
                     assert!(fe.fd.fhs.len() == 2);
@@ -238,7 +235,7 @@ fn restart_no_reingest_and_content_change_redelivers() {
     // exact-node probe at La1/Lo1.
     let hm = sref.find_model("hrrr");
     match hm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 3);
@@ -247,20 +244,20 @@ fn restart_no_reingest_and_content_change_redelivers() {
                     assert!(g.nx == 61);
                     assert!(g.ny == 41);
                 }
-                GridDef::Regular(_) => { assert!(false); }
-                GridDef::Gaussian(_) => { assert!(false); }
+                GridDef::Regular(_) => { panic!(); }
+                GridDef::Gaussian(_) => { panic!(); }
             }
             match lookup_level_type("height_above_ground") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(hgt) => {
                     let c_r = build_context(sref, "hrrr", None, "TMP", hgt,
                                          2.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 21.11389, 233.44);
                             match v {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => {
                                     assert!(pv.info.horizontal == HorizMethod::Exact);
                                 }
@@ -294,19 +291,19 @@ fn restart_no_reingest_and_content_change_redelivers() {
     let s2 = &*snap2;
     let gm2 = s2.find_model("gfs");
     match gm2 {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(_m) => {
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso) => {
                     let c_r = build_context(s2, "gfs", None, "TMP", iso,
                                          850.0, 21600.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 421.0); }
                             }
                         }

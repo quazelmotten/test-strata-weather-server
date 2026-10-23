@@ -20,23 +20,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -44,21 +44,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -79,7 +76,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
@@ -100,8 +97,8 @@ fn one_run_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 1\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -119,7 +116,7 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0);
@@ -131,11 +128,8 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
     // refuse it. The peek's Err must NOT become a skip verdict.
     let whole = read_bytes(&fixture("gfs_small.grib2"));
     assert!(whole[0] == 0x47 && whole[1] == 0x52 && whole[2] == 0x49 && whole[3] == 0x42);
-    let mut broken: Vec<u8> = Vec::<u8>::new();
-    for k in 0 .. whole.len() {
-        let b = if k == 7 { 5 } else { whole[k] };
-        broken.push(b);
-    }
+    let mut broken: Vec<u8> = whole.to_vec();
+    broken[7] = 5;
     let bad = join_path(&ing, "gfs_broken.grib2");
     write_bytes(&bad, &broken[..]);
 
@@ -147,7 +141,7 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
     assert!(p.counters.errors == 1);
     assert!(p.counters.quarantined_files == 1);
     match p.state.find("gfs", bad.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_FAILED); }
     }
     // (c) the fall-through is explained ONCE, not once per round
@@ -159,7 +153,7 @@ fn unpeekable_header_falls_through_to_the_normal_quarantine_path() {
 
     // ---- the good run is still queryable and unaffected ------------------
     match p.state.find("gfs", join_path(&ing, "gfs_small.grib2").as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
     rm_tree(&root);

@@ -22,7 +22,7 @@ const NY: u32 = 3;
 
 /// Remove a leftover scratch tree so the test is REPEATABLE across runs.
 fn wipe(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -50,7 +50,7 @@ fn wipe(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn plane(base: f32) -> Vec<f32> {
@@ -58,14 +58,14 @@ fn plane(base: f32) -> Vec<f32> {
     for k in 0 .. 12 {
         v.push(base + k as f32);
     }
-    return v;
+    v
 }
 
 /// Read every value of one level plane through the SCALAR accessor.
 fn scalar_plane(path: &str, li: usize) -> Vec<f32> {
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { return [].to_vec(); }
+        Err(_) => { [].to_vec()}
         Ok(field) => {
             let mut out: Vec<f32> = Vec::<f32>::new();
             for j in 0 .. field.header.ny as usize {
@@ -73,7 +73,7 @@ fn scalar_plane(path: &str, li: usize) -> Vec<f32> {
                     out.push(field.value(li, j, i));
                 }
             }
-            return out;
+            out
         }
     }
 }
@@ -96,7 +96,7 @@ fn reingesting_a_level_replaces_it_instead_of_duplicating() {
     assert!(r2.is_ok());
     let mf1 = open_field(path.to_string());
     match mf1 {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(f) => {
             assert!(f.header.levels.len() == 1);
             let mut replaced = true;
@@ -113,18 +113,17 @@ fn reingesting_a_level_replaces_it_instead_of_duplicating() {
     // coordinate AS THE FILE STORES IT (f32 widened to f64). Exact f64 equality
     // fails here (837.55 != 837.5498046875), f32-rounded equality holds.
     let stored = open_field(path.to_string());
-    let mut stored_lv: f64 = 0.0;
-    match stored {
-        Err(_) => { assert!(false); }
-        Ok(f) => { stored_lv = f.header.levels[0] as f64; }
-    }
+    let stored_lv = match stored {
+        Err(_) => { panic!(); }
+        Ok(f) => { f.header.levels[0] as f64 }
+    };
     assert!(stored_lv != 837.55); // proves the f64 values really differ
     let r3 = merge_write_field(path.to_string(), 100, NX, NY, true, false, StatMeta::instantaneous(),
                                [(stored_lv, plane(30.0))].to_vec());
     assert!(r3.is_ok());
     let mf3 = open_field(path.to_string());
     match mf3 {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(f) => {
             assert!(f.header.levels.len() == 1); // NOT duplicated
             let mut replaced = true;
@@ -166,7 +165,7 @@ fn duplicates_inside_one_batch_resolve_first_entry_wins() {
     assert!(r.is_ok());
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(f) => {
             assert!(f.header.levels.len() == 1);
             let mut first_won = true;
@@ -200,19 +199,19 @@ fn slice_readback_matches_scalar_readback_and_order_survives_merges() {
     let mg = merge_field(path.to_string(), 103, [].to_vec());
     assert!(mg.is_ok());
     match mg {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(pairs) => {
             assert!(pairs.len() == 3);
             // ASCENDING for a non-isobaric level type
             assert!(pairs[0].0 == 2.0 && pairs[1].0 == 8.0 && pairs[2].0 == 10.0);
             let mut all_same = true;
-            for li in 0 .. 3 {
+            for (li, pr) in pairs.iter().enumerate() {
                 let sc = scalar_plane(&path, li);
                 if sc.len() != 12 {
                     all_same = false;
                 } else {
-                    for k in 0 .. 12 {
-                        if pairs[li].1[k] != sc[k] {
+                    for (a, b) in pr.1.iter().zip(sc.iter()) {
+                        if a != b {
                             all_same = false;
                         }
                     }
@@ -229,7 +228,7 @@ fn slice_readback_matches_scalar_readback_and_order_survives_merges() {
     assert!(r2.is_ok());
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(f) => {
             assert!(f.header.levels.len() == 4);
             assert!(f.header.levels[0] == 2.0);
@@ -264,5 +263,5 @@ fn plane_base(li: usize) -> f32 {
     if li == 2 {
         return 3.0;
     }
-    return 1.0;
+    1.0
 }

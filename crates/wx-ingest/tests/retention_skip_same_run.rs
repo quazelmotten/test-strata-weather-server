@@ -20,23 +20,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -44,21 +44,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -79,7 +76,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 // retention_runs = 1 so ONE ingested run already FILLS the registry: every later
@@ -89,8 +86,8 @@ fn one_run_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 1\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -108,7 +105,7 @@ fn same_run_second_file_is_never_skipped_and_merges_into_the_kept_run() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0);
@@ -125,7 +122,7 @@ fn same_run_second_file_is_never_skipped_and_merges_into_the_kept_run() {
     assert!(p.counters.errors == 0);
     assert!(p.counters.ingested_files == 2);
     match p.state.find("gfs", twin.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
 

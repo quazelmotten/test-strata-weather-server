@@ -43,7 +43,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -64,12 +64,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -90,22 +90,19 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn exists_any(path: &str) -> bool {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return false; }
         Ok(_) => { return true; }
@@ -163,7 +160,7 @@ fn settle(p: &mut Pipeline, want: usize) -> usize {
 fn le_i64_at(b: &[u8], off: usize) -> i64 {
     let mut v: u64 = 0;
     for k in 0 .. 8 {
-        v = v | (((b[off + k] as u64)) << (k * 8));
+        v |= (b[off + k] as u64) << (k * 8);
     }
     return v as i64;
 }
@@ -173,8 +170,8 @@ fn col_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"col\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"collide_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"collide_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -191,7 +188,7 @@ fn two_accumulation_windows_one_valid_time_first_wins_loudly() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // the file is still REC_OK material (a collision is a SKIP, not a
@@ -226,11 +223,11 @@ fn two_accumulation_windows_one_valid_time_first_wins_loudly() {
     let sref = &*snap;
     let c = build_context(sref, "col", None, "APCP", 1, 0.0, 0.0, TimeInterpMode::Linear);
     match c {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(ctx) => {
             let v = evaluate_point(&ctx, 20.0, 240.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(qr) => {
                     assert!(qr.value == 10.0);
                     assert!(qr.info.horizontal == HorizMethod::Exact);
@@ -251,16 +248,16 @@ fn two_accumulation_windows_one_valid_time_first_wins_loudly() {
     // ---- OTHER PARAMS IN THE SAME FILE UNAFFECTED -------------------------
     let agl = lookup_level_type("height_above_ground");
     match agl {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(code) => {
             let t = build_context(sref, "col", None, "TMP", code, 2.0, 0.0,
                                   TimeInterpMode::Linear);
             match t {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(ctx) => {
                     let v = evaluate_point(&ctx, 20.0, 240.0);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!();}
                         Ok(qr) => { assert!(qr.value == 250.0); }
                     }
                 }

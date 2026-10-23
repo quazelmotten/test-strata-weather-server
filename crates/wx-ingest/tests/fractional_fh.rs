@@ -29,11 +29,11 @@ use std::fs::remove_dir;
 const EP_A: i64 = 1792411200;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -54,27 +54,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!();}
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -84,15 +81,12 @@ fn copy_file(src: String, dst: String) {
 }
 
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -100,17 +94,17 @@ fn write_text(path: &str, text: String) {
 fn read_bytes(path: String) -> Vec<u8> {
     let f = File::open(&path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -133,14 +127,14 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }
 
 fn file_exists(path: String) -> bool {
     let f = File::open(&path);
     match f {
-        Err(_) => { return false; }
-        Ok(_) => { return true; }
+        Err(_) => { false}
+        Ok(_) => { true}
     }
 }
 
@@ -151,27 +145,27 @@ fn file_exists(path: String) -> bool {
 #[test]
 fn fh_filename_scheme_roundtrip_and_backcompat() {
     // integral hours keep the milestone-3 names EXACTLY (backward compatible)
-    assert!(fh_file_name(0) == "f000.bin".to_string());
-    assert!(fh_file_name(6 * 3600) == "f006.bin".to_string());
-    assert!(fh_file_name(125 * 3600) == "f125.bin".to_string());
+    assert!(fh_file_name(0) == "f000.bin");
+    assert!(fh_file_name(6 * 3600) == "f006.bin");
+    assert!(fh_file_name(125 * 3600) == "f125.bin");
     // >= 1000 hours widen the hour field rather than break the pattern
-    assert!(fh_file_name(1000 * 3600) == "f1000.bin".to_string());
+    assert!(fh_file_name(1000 * 3600) == "f1000.bin");
     // fractional whole minutes get m<MM>; sub-minute whole seconds add s<SS>
-    assert!(fh_file_name(1800) == "f000m30.bin".to_string());
-    assert!(fh_file_name(5400) == "f001m30.bin".to_string());
-    assert!(fh_file_name(3661) == "f001m01s01.bin".to_string());
+    assert!(fh_file_name(1800) == "f000m30.bin");
+    assert!(fh_file_name(5400) == "f001m30.bin");
+    assert!(fh_file_name(3661) == "f001m01s01.bin");
     // round trip every form
     let vals: [i64; 9] = [0, 1800, 3600, 5400, 21600, 3661, 360000, 7325, 1000 * 3600];
     for v in &vals {
         let name = fh_file_name(*v);
         match parse_fh_name(name.as_str()) {
-            None => { println!("round-trip lost {0}", name); assert!(false); }
+            None => { println!("round-trip lost {0}", name); panic!(); }
             Some(back) => { assert!(back == *v); }
         }
     }
     // legacy names still parse exactly as before
     match parse_fh_name("f006.bin") {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == 21600); }
     }
     // strictness: non-canonical forms are IGNORED, never reinterpreted
@@ -183,7 +177,7 @@ fn fh_filename_scheme_roundtrip_and_backcompat() {
     // reader tolerates it as an alias for the same offset instead of dropping
     // data a hand-assembled store might contain.
     match parse_fh_name("f006m00.bin") {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == 21600); }
     }
     assert!(parse_fh_name("grid.bin").is_none());
@@ -198,29 +192,29 @@ fn run_dir_names_carry_minutes_without_collisions() {
     let na = run_dir_name(a);
     let nb = run_dir_name(b);
     let nc = run_dir_name(c);
-    assert!(na == "2026101912".to_string());
-    assert!(nb == "202610191230".to_string());
-    assert!(nc == "20261019123015".to_string());
+    assert!(na == "2026101912");
+    assert!(nb == "202610191230");
+    assert!(nc == "20261019123015");
     // the two same-day runs no longer collide, and every name round-trips to
     // the exact epoch seconds
     let e0 = epoch_secs(2026, 10, 19, 12, 0, 0);
     let e30 = epoch_secs(2026, 10, 19, 12, 30, 0);
     let e3015 = epoch_secs(2026, 10, 19, 12, 30, 15);
     match parse_run_dir(na.as_str()) {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == e0); }
     }
     match parse_run_dir(nb.as_str()) {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == e30); }
     }
     match parse_run_dir(nc.as_str()) {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == e3015); }
     }
     // pre-existing 10-char directories keep parsing (minute/second default 0)
     match parse_run_dir("2026101912") {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(v) => { assert!(v == e0); }
     }
     // garbage is still rejected
@@ -239,8 +233,7 @@ fn frac_fixture_decodes_minute_units_as_seconds() {
     match r {
         Err(e) => {
             println!("decode failed {:?}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok((msgs, st)) => {
             assert!(msgs.len() == 6);
@@ -262,7 +255,7 @@ fn frac_fixture_decodes_minute_units_as_seconds() {
             let m5 = &msgs[5];
             match m5.param_name {
                 Some(s) => { assert!(s == "APCP"); }
-                None => { assert!(false); }
+                None => { panic!(); }
             }
             assert!(m5.stat.kind == StatKind::Accumulation);
             assert!(m5.stat.begin_secs == 1800);
@@ -282,14 +275,14 @@ fn frac_fixture_decodes_minute_units_as_seconds() {
 // ---------------------------------------------------------------------------
 
 fn frac_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"frac\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"frac_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"frac_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n"
 }
 
 // Fresh tree + config + fixture file. stable_window_secs = 0 means eligibility
@@ -311,8 +304,7 @@ fn fractional_hours_storage_and_manifest() {
     let mut p = match po {
         Err(e) => {
             println!("pipeline open failed: {0}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok(pp) => { pp }
     };
@@ -356,12 +348,12 @@ fn fractional_hours_storage_and_manifest() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     match sref.find_model("frac") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 2);
             assert!(m.runs[0].epoch_secs + 1800 == m.runs[1].epoch_secs);
-            assert!(m.runs[0].dir_name == "2026101912".to_string());
-            assert!(m.runs[1].dir_name == "202610191230".to_string());
+            assert!(m.runs[0].dir_name == "2026101912");
+            assert!(m.runs[1].dir_name == "202610191230");
             let mut tmp_slots = 0;
             let mut apcp_range = (false, 0, 0);
             for fe in &m.runs[0].fields {
@@ -396,8 +388,7 @@ fn fractional_hours_queries_and_run_selection() {
     let mut p = match po {
         Err(e) => {
             println!("pipeline open failed: {0}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok(pp) => { pp }
     };
@@ -413,10 +404,10 @@ fn fractional_hours_queries_and_run_selection() {
     let sref = &*snap;
 
     match sref.find_model("frac") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso_code) => {
                     // exact fractional forecast hour: run A + 30 min at node
                     // (lat 9.0, lon 351.5) -> 250 + 45 + 30 = 325 exactly, no
@@ -427,22 +418,20 @@ fn fractional_hours_queries_and_run_selection() {
                     match cx {
                         Err(se) => {
                             println!("build failed {:?}", se);
-                            assert!(false);
+                            panic!();
                         }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Err(pe) => {
                                     println!("eval failed {:?}", pe);
-                                    assert!(false);
+                                    panic!();
                                 }
                                 Ok(pv) => {
                                     assert!(pv.value == 325.0);
                                     assert!(pv.info.horizontal == HorizMethod::Exact);
-                                    match pv.info.time {
-                                        Some(_tm) => { assert!(false); } // no time blend
-                                        None => {}
-                                    }
+                                    // no time blend expected:
+                                    if pv.info.time.is_some() { panic!(); }
                                 }
                             }
                         }
@@ -454,14 +443,14 @@ fn fractional_hours_queries_and_run_selection() {
                         Some(m.runs[0].epoch_secs), "TMP", iso_code, 850.0, 2700.0,
                         TimeInterpMode::Linear);
                     match cb {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Ok(pv) => {
                                     assert!(pv.value == 340.0);
                                     match pv.info.time {
-                                        None => { assert!(false); }
+                                        None => { panic!(); }
                                         Some(tm) => {
                                             assert!(tm.forecast_hours.0 == 0.5);
                                             assert!(tm.forecast_hours.1 == 1.0);
@@ -470,7 +459,7 @@ fn fractional_hours_queries_and_run_selection() {
                                 }
                                 Err(pe) => {
                                     println!("eval failed {:?}", pe);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
@@ -485,11 +474,11 @@ fn fractional_hours_queries_and_run_selection() {
                                 SelectError::TimeExactOnly => {}
                                 _ => {
                                     println!("unexpected select error {:?}", ne);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                     }
                     // accumulation guard still fires for a FRACTIONAL range: APCP
                     // at fc 45 min must be refused, at fc 30 min answered 80.
@@ -497,13 +486,13 @@ fn fractional_hours_queries_and_run_selection() {
                         Some(m.runs[0].epoch_secs), "APCP", 1, 0.0, 2700.0,
                         TimeInterpMode::Linear);
                     match cg {
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                         Err(g) => {
                             match g {
                                 SelectError::StatTimeGuard(..) => {}
                                 _ => {
                                     println!("unexpected select error {:?}", g);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
@@ -512,14 +501,14 @@ fn fractional_hours_queries_and_run_selection() {
                         Some(m.runs[0].epoch_secs), "APCP", 1, 0.0, 1800.0,
                         TimeInterpMode::Linear);
                     match ce {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Ok(pv) => { assert!(pv.value == 80.0); }
                                 Err(pe) => {
                                     println!("eval failed {:?}", pe);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
@@ -537,13 +526,13 @@ fn fractional_hours_queries_and_run_selection() {
                         Some(m.runs[1].epoch_secs), "TMP", iso_code, 850.0, 1800.0,
                         TimeInterpMode::Linear);
                     match cb_now {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             assert!(c.run_epoch_secs == ep_b);
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Ok(pv) => { assert!(pv.value == 575.0); }
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                             }
                         }
                     }
@@ -551,13 +540,13 @@ fn fractional_hours_queries_and_run_selection() {
                     let cp = build_context(sref, "frac",
                         Some(ep_a), "TMP", iso_code, 850.0, 3600.0, TimeInterpMode::Linear);
                     match cp {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             assert!(c.run_epoch_secs == ep_a);
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Ok(pv) => { assert!(pv.value == 355.0); }
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                             }
                         }
                     }
@@ -571,11 +560,11 @@ fn fractional_hours_queries_and_run_selection() {
                                 SelectError::NoRunCovers => {}
                                 _ => {
                                     println!("unexpected select error {:?}", ne);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                     }
                 }
             }

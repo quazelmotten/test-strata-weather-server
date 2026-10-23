@@ -26,23 +26,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -50,21 +50,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -85,7 +82,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn count_notes(p: &Pipeline, marker: &str) -> usize {
@@ -95,7 +92,7 @@ fn count_notes(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 /// TMP + BOTH wind components configured: legal for a grid-relative grid.
@@ -106,8 +103,8 @@ fn pair_ok_block(name: &str, ing: &str, glob: &str) -> String {
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"";
     let t = format!("{0}{1}", t, glob);
-    let t = t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n";
-    return t;
+    
+    t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n"
 }
 
 /// TMP + UGRD only: ILLEGAL for a grid-relative grid (pair rule).
@@ -118,8 +115,8 @@ fn pair_bad_block(name: &str, ing: &str, glob: &str) -> String {
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"";
     let t = format!("{0}{1}", t, glob);
-    let t = t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n";
-    return t;
+    
+    t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n"
 }
 
 #[test]
@@ -150,14 +147,14 @@ fn orphan_wind_components_are_drained_per_file() {
     let head = format!("{0}{1}", head, data);
     let head = head + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n";
     let mut cfg = head.to_string();
-    cfg = cfg + pair_ok_block("hrrr", &a_dir, "o1.grib2").as_str();
-    cfg = cfg + pair_ok_block("hrrrb", &b_dir, "o2.grib2").as_str();
-    cfg = cfg + pair_bad_block("hrrrc", &c_dir, "v*.grib2").as_str();
+    cfg += pair_ok_block("hrrr", &a_dir, "o1.grib2").as_str();
+    cfg += pair_ok_block("hrrrb", &b_dir, "o2.grib2").as_str();
+    cfg += pair_bad_block("hrrrc", &c_dir, "v*.grib2").as_str();
     write_bytes(&cfg_path, cfg.as_bytes());
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0);   // observation round
@@ -178,28 +175,18 @@ fn orphan_wind_components_are_drained_per_file() {
     let run = "2026101912";
     let a_run = join_path(&join_path(&data, "hrrr"), run);
     let tmp_agl = join_path(&join_path(&a_run, "TMP"), "height_above_ground");
-    match stat_size_mtime(&join_path(&tmp_agl, "f000.bin")) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime(&join_path(&tmp_agl, "f000.bin")).is_err() { panic!(); }
     let ugd_dir = join_path(&join_path(&a_run, "UGRD"), "height_above_ground");
-    match stat_size_mtime(&join_path(&ugd_dir, "f000.bin")) {
-        Ok(_) => { assert!(false); return; }   // NEVER stored half-rotated
-        Err(_) => {}
+    if stat_size_mtime(&join_path(&ugd_dir, "f000.bin")).is_ok() {
+        panic!();   // NEVER stored half-rotated
     }
 
     // ---- model B paired normally: nothing leaked from A's orphan map -----
     let b_run = join_path(&join_path(&data, "hrrrb"), run);
     let bu = join_path(&join_path(&b_run, "UGRD"), "height_above_ground");
-    match stat_size_mtime(&join_path(&bu, "f000.bin")) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime(&join_path(&bu, "f000.bin")).is_err() { panic!(); }
     let bv = join_path(&join_path(&b_run, "VGRD"), "height_above_ground");
-    match stat_size_mtime(&join_path(&bv, "f000.bin")) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime(&join_path(&bv, "f000.bin")).is_err() { panic!(); }
     // earth-relative storage (spec §4.4): the .bin header flag bit 1 (winds_grid)
     // must be CLEAR. Flags byte sits at offset 22 (magic 8 + version 4 + nx 4
     // + ny 4 + level-count 2), and the level count (u16 LE at offset 20) must be
@@ -213,13 +200,9 @@ fn orphan_wind_components_are_drained_per_file() {
     // configured wind pair does NOT ------------------------------------------
     let c_run = join_path(&join_path(&data, "hrrrc"), run);
     let ctmp = join_path(&join_path(&c_run, "TMP"), "height_above_ground");
-    match stat_size_mtime(&join_path(&ctmp, "f000.bin")) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
-    match stat_size_mtime(&join_path(&join_path(&c_run, "UGRD"), "height_above_ground")) {
-        Ok(_) => { assert!(false); return; }   // NEVER stored half-rotated
-        Err(_) => {}
+    if stat_size_mtime(&join_path(&ctmp, "f000.bin")).is_err() { panic!(); }
+    if stat_size_mtime(&join_path(&join_path(&c_run, "UGRD"), "height_above_ground")).is_ok() {
+        panic!();   // NEVER stored half-rotated
     }
 
     // idempotent afterwards: another round changes NOTHING

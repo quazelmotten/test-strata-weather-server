@@ -1172,7 +1172,7 @@ listed below.
   unit `Mops/s` while computing ops/s (it rendered "993260 Mops/s"). Label corrected
   to `ops/s`; measurement code and numbers untouched.
 
-## Publish granularity: decision kept, follow-up named (audit item)
+## Publish granularity: decision kept, follow-up named (audit item) [SUPERSEDED by V1.2 phase B: the follow-up WAS taken — publish is now ONE SOURCE FILE and the transient window is closed at file granularity]
 
 DECISION: keep publish-after-every-field-store. WHY: spec §4.5 requires a run to
 become visible forecast-hour by forecast hour as each completes, and per-field
@@ -2019,15 +2019,49 @@ limitation, not a silent gap.
   `scripts/fetch_real_sample.sh` (range-limited curl from the public aws-nws bucket,
   then replay the same probes) to close the gap by hand.
 * **Clippy gate scope stated with numbers, not vibes.** The gate is
-  `cargo clippy --workspace -- -D warnings` (**rc=0, zero diagnostics**). `--all-targets`
-  is NOT clean: in the phase-D sweep it reports **153 diagnostics across 10 files, ALL
-  of them in `crates/wx-core/tests/*` and `crates/wx-core/benches/*`** (dominated by
-  `assert(false)`-style `always_false` ×53, `needless_return` ×41, `manual_op` ×12,
-  doc-list-indentation, `vec_without_push`, single-pattern `match`, index-loop idioms).
-  Six of those had been in `wx-ingest/src/store.rs` doc comments and WERE fixed when
-  phase D touched that file; the test-code debt is deliberately left alone (fixing 150
-  lint sites in test bodies would churn the very tests that pin correctness) and is
-  recorded here instead of being described vaguely as "pre-existing debt".
+  `cargo clippy --workspace -- -D warnings` (**rc=0, zero diagnostics**).
+  `--all-targets` is NOT clean and never has been; the test/bench lint debt
+  is recorded rather than hidden.
+* **DATED CORRECTION (2026-10-23, phase E6) of the claim above**, which read
+  "reports 153 diagnostics across 10 files, ALL of them in
+  crates/wx-core/tests/* and crates/wx-core/benches/*". Measured truth, same
+  method label throughout (lines matching ^error in
+  `cargo clippy --workspace --all-targets -- -D warnings` output): the
+  V1.2-phase-D-era actual figure was **998**, the V1.2 audit re-measured
+  ~**908**, and the fresh orchestrator measurement at c683ae2 (V1.3 E6)
+  found **229 errors across 11 files** — but note that number was itself
+  TRUNCATED by cargo's fail-fast behaviour (wx-core errors aborted the run
+  before wx-ingest/wx-server test targets were ever checked, so the old
+  "ZERO in any src/ or in wx-ingest" file-set claim was an artifact of the
+  abort point, not a measured fact). The "153 across 10 files" number was
+  simply WRONG when written (it looks like a partially-consumed log count):
+  right-ish file-set story, wrong magnitude, unverified arithmetic. Honesty
+  retrospective: a number stated "with numbers, not vibes" still escaped
+  verification because it was copied from memory of the sweep transcript
+  instead of a preserved log; since E6 every all-targets figure in this
+  document carries its command label AND a preserved log path.
+* **Phase E6 then ELIMINATED the debt, not merely reduced it** (stronger
+  than the phase asked for, because the mechanical tools made zero cheap):
+  three cascading `cargo clippy --workspace --all-targets --fix --allow-dirty`
+  passes (machine-applicable = semantics-preserving by contract; product
+  src/ received ZERO --fix edits — verified via git diff), plus targeted
+  deterministic manual conversions where fixes are not auto-applicable:
+  `assert!(false)` -> `panic!()` tree-wide (950 sites; pure message change)
+  with the dead `return`s it exposed removed, `x != x` -> `x.is_nan()`,
+  `!(a < b)` -> NaN-safe `partial_cmp(..) != Some(Less)` / explicit
+  `is_nan() ||` forms, index-range loops -> iterators, init+push builders
+  -> `vec![..]`, LE-constant shift/mask byte pushes -> `extend_from_slice`,
+  `if let Ok(_)` -> `.is_ok()`, guard collapses, late-init cleanups, one
+  snake_case rename, two deliberate-dead items annotated. Full-surface
+  accounting under `--keep-going` (no truncation): ~**623** mid-flight
+  (including self-inflicted `unreachable_code` fallout from the panic
+  conversion, which was resolved rather than papered over) -> **0**.
+  FINAL STATE, both command forms on the committed tree: plain gate form
+  `cargo clippy --workspace -- -D warnings` rc=0, and the fuller
+  `cargo clippy --workspace --all-targets --keep-going -- -D warnings`
+  rc=0 with ZERO ^error lines (logs /tmp/opencode/e6_all_kg5.log; sweep
+  re-measurement recorded in §19). Every affected test binary was rerun
+  green after the mechanical edits (§19 table).
 * Stale instrumentation note removed: the storage counters ARE exported by `/metrics`
   as `wxpoint_storage_renames_total` / `_bytes_written_total` / `_fsyncs_total`.
 
@@ -3467,3 +3501,235 @@ the harness itself is invoked by nothing automated (spec §13).
   future-incompat warnings are pre-existing dependency noise).
 * `bash scripts/smoke.sh`: **SMOKE PASS**, release avg point-query latency
   28.9 us over 422 queries.
+
+## 19. V1.3 phase E6 — clippy-debt elimination, metric-semantics fix, targeted %-decode, exit-code ledger, final acceptance (2026-10-23)
+
+### 19.0 What V1.3 was (scope statement, one line per phase)
+
+* **E0** statistical-process durability moved INTO every `.bin` header (v2):
+  guard + window travel with the forecast hour; `manifest.json` demoted to a
+  human inventory (warm start reads headers back; missing manifest loud but
+  non-fatal).
+* **E1** per-forecast-hour stat guards + first-in-message-order collision
+  resolution, rejects counted (`wxpoint_stat_collisions_total`).
+* **E2** per-result `"run"` provenance (top-level echo only when unanimous,
+  else `null`); `/v1/models` `winds_grid` -> `source_winds_grid`; optional
+  raw `units = "..."` param override.
+* **E3a** retryable-I/O split (manifest-update retry closes the
+  durable-data/no-manifest amplifier), batched `state/files.json` saves,
+  pread-based content hashing, dedicated state-write counters.
+* **E3b** five audit-confirmed robustness defects: symlinked ingest trees,
+  missing-`grid.bin` loud-but-non-destructive, atomic retention-directory
+  sweep, per-model state keys, PROVISIONAL wind-pair enforcement (exit 7
+  post-boot + `[ingest].wind_pair_enforce`; boot preflight probes stable
+  files on wall-clock stability and exits 4 immediately when it can decide).
+* **E4a** skip observability BY KIND (three flat counters + template numbers
+  in the note) + degenerate-section-7 tolerance + live-GFS product-line
+  diagnosis.
+* **E4b/E4c** grid template 3.40 (quasi-regular gaussian, `GRID_VERSION` 3,
+  no polar nodes) and HYBRID level type 105 (RAW dimensionless coordinates)
+  end to end — operational GFS `sfluxgrbf` fully queryable, surface AND
+  upper-air.
+* **E5** consolidated `scripts/realdata_acceptance.sh` (MANUAL/NETWORK):
+  fetch -> release server -> 20 independent wgrib2/pyproj pins -> SUMMARY.
+* **E6** (this section) clippy-debt elimination, gauge semantics correction
+  (rename + true publish-latency pair), targeted `%3A`/`%2C` decoding,
+  exit-code ledger closure, stale-text reconciliation, release documentation.
+* USER DECISIONS embedded in V1.3: hybrid levels IMPLEMENTED (not
+  log-pressure vertical, not deferred); production-data verification stays
+  MANUAL/NETWORK (CI offline); `wind_pair_enforce` defaults TRUE with opt
+  out; vertical interpolation stays LINEAR by default (log-p remains a
+  future option, not taken).
+
+### 19.1 Clippy debt — honest before/after, every number method-labelled
+
+Method label unless stated otherwise: count of lines matching `^error` in
+`cargo clippy --workspace --all-targets -- -D warnings` output. NOTE this
+form is FAIL-FAST-TRUNCATED (first failing crate aborts the run), which is
+why historical magnitudes disagree — all figures below say what they are.
+
+| measurement | value | source |
+|---|---|---|
+| old README/DECISIONS claim ("153 across 10 files, ALL wx-core") | WRONG, retired | dated correction above this section |
+| V1.2-phase-D-era actual | 998 ^error lines | preserved from phase-D sweep transcript |
+| V1.2 audit re-measure | ~908 | audit record |
+| fresh BEFORE at c683ae2 (pre-E6 tree, orchestrator run) | **229** ^error lines (abort-truncated; true full surface larger) | /tmp/opencode/v13_clippy_all_e6.log |
+| E6 mid-flight FULL SURFACE (`--keep-going`) | 623 (incl. self-inflicted `unreachable_code` fallout from the panic conversion — resolved, not papered over) | /tmp/opencode/e6_all_kg.log |
+| after 3× cascading `--fix --allow-dirty` + manual deterministic conversions | **0** errors, rc=0 | /tmp/opencode/e6_all_kg5.log |
+| FINAL post-E6 gate form `cargo clippy --workspace -- -D warnings` | rc=0, zero diagnostics | /tmp/opencode/sweep_clippy_gate.log (GATE_RC=0, 11:13, tag tree post-`partialeq_to_none` fix) |
+| FINAL all-targets keep-going | rc=0, **0** ^error lines | /tmp/opencode/sweep_clippy_all_kg.log (ALLKG_RC=0, count line `0`) |
+| FINAL all-targets legacy form (same label as BEFORE row) | rc=0, **0** ^error lines | /tmp/opencode/sweep_clippy_all_legacy.log (LEGACY_RC=0, count line `0`) |
+
+**Honest iteration caught BY THE SWEEP ITSELF:** the final-sweep clippy
+stage first returned rc=101 / 3 ^error lines — ONE new lint
+(`partialeq_to_none`: `qs.find('%') == None` in the E6-added
+`normalize_qs`), reported across three compile units because the same lib
+builds as lib, lib-test and downstream targets. It existed ONLY because the
+zero-diagnostic kg5 log predates the %-decode/gauge src additions — those
+lines were never clippy-checked between landing and the sweep's final
+stage. Fixed deterministically (`.is_none()`, behaviour unchanged),
+`point_http` rerun green, then all three forms REMEASURED on the exact tag
+tree -> rc=0 / 0 lines (final rows above are the post-fix measurements).
+Recorded lesson: "zero diagnostics" must always be asserted against the
+COMMIT tree, never a mid-phase log — the sweep's final-stage design exists
+precisely for this and did its job.
+
+Fix inventory (semantics-preserving throughout; product `src/` received ZERO
+`--fix` writes — verified via git diff — the only src changes were the
+deliberate E6 gauge/decode/doc edits): three cascading `cargo clippy
+--workspace --all-targets --fix --allow-dirty` passes for machine-applicable
+lints; then manual deterministic classes: `assert!(false)` -> `panic!()`
+(950 sites, message-only change) with the dead `return`s it exposed removed
+(423 inline + 8 multi-line + ~20 pure-expression tails, all verified
+side-effect-free before deletion); `x != x` -> `x.is_nan()` ×4;
+`!(a < b)` -> NaN-safe forms ×4 (partial_cmp != Some(Less); is_nan() || >=);
+erasing-op index math simplified with stride comments; range-index loops ->
+iterators/zip/`to_vec()`; init+push builders -> `vec![..]`;
+`if let Ok(_)` -> `.is_ok()`; guard collapses; late-init, ptr_arg,
+snake-case (`epA`->`ep_a`), absurd-extreme (`<=0` -> `==0` on usize), one
+`#[allow(dead_code)]` where holding-the-value-alive IS the purpose
+(`provenance_http Ctx.p`).
+
+Verification that nothing broke: every affected test binary rerun —
+wx-core 10 binaries (kernels, storage_roundtrip, writer_golden/failures/-
+counters, gaussian_grid, tables_checks, slot_independence, lcc_projection,
+alloc_free_kernels): 39 tests ok; wx-ingest 24 binaries incl pipeline_e2e,
+hybrid_decode, packing_twins, store_dedup, grid_upgrade, rotation_vs_pyproj:
+RC=0; wx-server point_http/concurrency_http/provenance_http/hotpath_*/frac_/
+meta_json/strict_dates/point_json_brackets: RC=0; exit_codes 8/8. Full
+workspace suite ×2 back-to-back in the final sweep: 56 m 56 s then 56 m 31 s,
+both **92 targets / 231 passed / 0 failed / RC=0** (§19.6 rows).
+
+### 19.2 Metrics semantics: data age vs TRUE publish latency
+
+The spec asked for "ingest lag (file mtime -> queryable)". What
+`wxpoint_ingest_lag_seconds` actually computed was NOW − newest-mtime — i.e.
+how STALE the freshest data is — never a duration of any pipeline step. Two
+honest options existed: rename, or redefine-in-place with breakage. Chosen:
+RENAME to `wxpoint_data_age_seconds` (formula byte-identical, meaning finally
+matches the name) and ADD the genuinely new pair
+`wxpoint_ingest_publish_latency_seconds` (+ `_max`, lifetime maximum): per
+successfully published source file, wall-clock now minus that file's mtime,
+measured at the consume site immediately after `ingest_file` returns — which
+IS publish completion since per-file publish happens inside it. Both sides
+read the same REALTIME clock (mtimes arrive CLOCK_REALTIME-based), so no
+monotonic/wall joining is attempted — the simplest form is monotonic-safe by
+construction, and an NTP step can only hit the ≥0 clamp. LAST + MAX kept as
+relaxed atomics on `LiveCounters` (single writer = ingest thread). A Stats
+instance with NO attached pipeline legitimately renders 0 for the pair
+(documented in stats.rs + README §5). Tests: `pipeline_e2e` pins
+last > 0 && < 3600 s, max ≥ last, data-age input > 0 after a real round;
+`point_http` pins all three series present in `/metrics`.
+
+### 19.3 Targeted %-decode — decision + deviation note
+
+Rule accepted: decode EXACTLY `%3A`/`%3a` -> ':' and `%2C`/`%2c` -> ',' and
+ONLY inside `level`/`param` VALUES; everything else byte-for-byte literal
+(`+` never space — choosing literal keeps existing 404-class behaviour and
+avoids form-encoding ambiguity; unknown/malformed `%` sequences ride
+through; other keys' values untouched, including ISO timestamps: an
+URL-encoded `valid=` answers 400 `bad_time`, documented §9).
+IMPLEMENTATION DEVIATION from this section's earlier design note (which
+sketched Cow-ing `ParsedArgs.params`): the decode instead runs as
+`queryapi::normalize_qs(qs)` at the httpapi boundary, BEFORE parse_query.
+Reason: Cow-ing the token storage would ripple through the `FailInfo<'q>` /
+`PointEntries<'r>` borrow chain on the zero-alloc hot path for a cold-path
+convenience; normalizing the QUERY STRING keeps the entire parser and its
+lifetimes untouched, returns the original borrow whenever no targeted escape
+appears (canonical curl requests pay one byte-scan, ZERO allocations —
+hot-path rule §5 intact), and is observationally identical: encoded vs bare
+requests produce byte-identical responses because the renderer echoes
+CANONICAL levels anyway. Pinned end-to-end by five equivalence probes +
+four passthrough probes in `point_http.rs`.
+
+### 19.4 Exit-code ledger closure
+
+Added the two missing black-box assertions:
+`stable_wind_half_pair_exits_four_at_boot` (fixture stable at boot via
+`stable_window_secs = 0` -> preflight DECIDES -> rc 4, rejection message
+pinned, data dir provably untouched because preflight precedes
+`Pipeline::open`) and `an_unbindable_address_exits_six` (UNPARSEABLE bind
+address rather than privileged port: deterministic regardless of uid/machine
+state; rc 6 + "failed to bind" line pinned). Codes 3/5/8 stay wired-but-
+untested (forcing them needs environment surgery that would make the suite
+machine-dependent). main.rs's header claim "asserts rc != 0 for each class"
+was OVERSTATED and now lists exactly what is asserted; README §9 carries the
+matching honest ledger.
+
+### 19.5 Stale-text reconciliation (what was found and where)
+
+Per-file publish reality (since V1.2 phase B) had drifted into several texts
+as if still per-field/per-message: README §7.2 loadtest note (past-tensed +
+points at the closed window), README §9 table row 9 (now cites the pinned
+`fin[5] == 0`), README §10 publish-granularity bullet (HISTORY paragraph
+added), README §10 "follow-up, not taken" bullet (marked HISTORICAL — the
+follow-up WAS taken), DECISIONS "Publish granularity: decision kept" heading
+(SUPERSEDED banner), DECISIONS loadtest minimal-fix item (window CLOSED
+pointer), `scripts/loadtest.sh` sanity comment (rewritten to per-file
+reality with the multi-file residual spelled out), `concurrency_http.rs`
+header + transient-branch comments (per-file wording + fin[5]==0 pin),
+README metrics list (rename + pair documented distinctly), exit-codes bullet
+(full rewrite), main.rs exit-code header. Manifest-authority post-E0 wording
+in README §4 was CHECKED against the code and found already correct (guards
+live in `.bin` headers; warm start reads them back) — no edit needed.
+
+### 19.6 Final acceptance sweep — measured numbers (this machine, 2026-10-23)
+
+All stages run sequentially on an otherwise idle machine; logs under
+/tmp/opencode/sweep_*.log. Benches use the plain bench profile (NO
+`--release`, matching the historical baselines), target-cpu=native NOT set
+(portable build stays shipped).
+
+| stage | result |
+|---|---|
+| `gen_fixtures.sh` idempotency | regenerated fixtures BYTE-IDENTICAL (md5 over all `.grib2`), `expected.json` key-set unchanged | /tmp/opencode/e6_genfix.log, md5 diff empty |
+| `validate_rotation.py` | rc=0, 42 rows written; Rust cross-check gate `rotation_vs_pyproj` green (assert bound 1e-6 deg; recorded worst 4.80469e-11 at §5-era measurement) | /tmp/opencode/e6_rotation.log |
+| criterion `wx-core` | regular_ll **27.58 ns**, LCC **107.98 ns**, gaussian **99.53 ns**, bilinear heap **37.87 ns**, mmap h_at **50.39 ns** — all RC=0, drift narrative in README §7.1 "E6 re-run" paragraph | /tmp/opencode/sweep_bench_core.log |
+| criterion `wx-ingest` | full vertical+time point query **185.49 ns** (RC=0) | /tmp/opencode/sweep_bench_ing.log |
+| criterion `wx-server` | `/v1/point` handler **668.10 ns** = −0.4% vs pre-E6 baseline → %-decode fast path free within noise (RC=0) | /tmp/opencode/sweep_bench_srv.log |
+| `smoke.sh` | **SMOKE PASS**, 17/17 probes 0 failures, release avg point-query **30.2 µs** over 422 queries (prev 28.9 µs) | /tmp/opencode/sweep_smoke.log |
+| `loadtest.sh` | **282,265 req/s** client, 100% success (62 deadline aborts), server-side mean **11.4 µs**, buckets **≤20 µs / ≤50 µs** (n=5,649,715) → §8 targets MET ×5.6 throughput | /tmp/opencode/sweep_load.log |
+| `ingestbench.sh` | realistic L=37 six-file delivery: first-queryable **5.01 s**, all-visible **13.92 s**, peak RSS **3066 MB**, CPU **21.98 s**; state counters `state_saves=2 state_bytes=2014` | /tmp/opencode/sweep_ingestbench.log |
+| `realdata_acceptance.sh` (PORT=18099, MANUAL/NETWORK run THIS sweep) | **SUMMARY: 20/20 pins passed**, RC=0 (slices cached from E5; provenance shas printed) | /tmp/opencode/sweep_realdata.log |
+| workspace suite run 1 | **92 targets, 231 passed / 0 failed, RC=0** (229 historical + the 2 new E6 exit-code assertions); wall 56 m 56 s (09:16:18 -> 10:13:14, debug profile incl. realdata gates) | /tmp/opencode/sweep_suite1.log |
+| workspace suite run 2 | **92 targets, 231 passed / 0 failed, RC=0** (back-to-back second run on the same tree); wall 56 m 31 s (10:13:14 -> 11:09:45) | /tmp/opencode/sweep_suite2.log |
+| clippy gates (final, post-`partialeq_to_none`-fix on the exact tag tree) | gate form **GATE_RC=0**; all-targets keep-going **ALLKG_RC=0 / 0 ^error lines**; all-targets legacy form **LEGACY_RC=0 / 0 ^error lines**. Note: workspace suites ran BEFORE the one-line fix landed (which is behaviour-identical: `find('%') == None` -> `Option::is_none()`); the ONLY target it touches (`point_http`, via handler-level probes) was rerun green afterwards (RC=0) per the rerun-affected-binaries rule | /tmp/opencode/sweep_clippy_{gate,all_kg,all_legacy}.log + e6_tests_pointhttp_after_lintfix.log |
+
+Bench drift vs the pre-E6 baselines this sweep re-measures (bilinear heap
+30.85 ns, mmap h_at 32.90 ns, projections regular 28.7 / LCC 105.9 /
+gaussian 88.6 ns, full point query 147.55 ns, handler 671.08 ns):
+regular **−3.9%**, LCC **+2.0%**, gaussian **+12.3%** (criterion's own verdict
+line against its stored baseline says "Performance has regressed" — reported
+verbatim, not explained away),
+bilinear heap **+22.8%**, mmap h_at **+53.2%**, full point query **+25.7%**,
+handler **−0.4%** (unchanged). The split is systematic, not random: every
+MICRO arm reads higher while both MACRO arms (which include I/O and render
+work that dominates wall time) stand still — the identical session-
+sensitivity signature already documented for the E4b re-run (README §7.1),
+compounded by lint `--fix` having rewritten the bench harness sources
+mechanically (codegen placement moves; semantics do not). End-to-end
+corroboration above (handler bench, smoke average, load-test buckets) shows
+no practical regression; deployment-class re-measurement remains the stated
+way to resolve micro-arms definitively. The E6 hot-path additions are ONE branch-scan over the query
+bytes (`normalize_qs` fast path) and one relaxed store per FILE publish
+(ingest side); any movement within noise is reported as-is above.
+
+### 19.7 Cumulative V1.3 deviations register
+
+* HYBRID level type 105 supported end to end with RAW dimensionless
+  coordinates (spec sketched isobaric/log-p worlds; production upper-air
+  lives on hybrid) — §17.
+* Stat windows stored as begin/end/step SECONDS past the RUN inside `.bin`
+  v2 headers; guard slots are FORECAST-HOUR scoped; time-interpolation of
+  stat fields stays rejected (instantaneous semantics only) — §11/§12.
+* Raw GRIB triples usable in config (`discipline/category/number`), incl.
+  the ACOND-style d2c0n228 mapping documented in §13-era config notes.
+* Wind-pair enforcement PROVISIONAL post-boot (exit 7) when the boot
+  preflight must defer; default true, opt-out key — deliberate deviation
+  from a strict fail-at-boot reading of spec §4.4 — §14.
+* Real-data date pinning lesson: live slices default to a pinned `GFS_YMD`;
+  silent rollover once bit between sessions — refetch explicitly (§18).
+* Metric RENAME (`ingest_lag_seconds` -> `data_age_seconds`) + new latency
+  pair instead of silently redefining an existing gauge's formula (§19.2).
+* %-decode narrow by design; encoded timestamps remain 400 (§19.3, README
+  §9).

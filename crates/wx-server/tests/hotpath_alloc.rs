@@ -31,14 +31,14 @@ use std::fs::remove_file;
 use std::fs::remove_dir;
 use std::fs::read_dir;
 
-static n_alloc: AtomicU64 = AtomicU64::new(0);
-static n_free: AtomicU64 = AtomicU64::new(0);
+static N_ALLOC: AtomicU64 = AtomicU64::new(0);
+static N_FREE: AtomicU64 = AtomicU64::new(0);
 
 struct CountingAlloc {
 }
 
 unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(self: &Self, req: Layout) -> *mut u8 {
+    unsafe fn alloc(&self, req: Layout) -> *mut u8 {
         let align = req.align();
         let size = req.size();
         // ask for one extra word to stash the raw pointer below the aligned
@@ -51,14 +51,14 @@ unsafe impl GlobalAlloc for CountingAlloc {
         aligned = aligned - (aligned % align);
         let header = (aligned - 8) as *mut usize;
         *(header) = addr;
-        let _a = n_alloc.fetch_add(1, Ordering::Relaxed);
-        return aligned as *mut u8;
+        let _a = N_ALLOC.fetch_add(1, Ordering::Relaxed);
+        aligned as *mut u8
     }
 
-    unsafe fn dealloc(self: &Self, ptr: *mut u8, _req: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, _req: Layout) {
         let header = (ptr as usize - 8) as *mut usize;
         let raw = *(header);
-        let _f = n_free.fetch_add(1, Ordering::Relaxed);
+        let _f = N_FREE.fetch_add(1, Ordering::Relaxed);
         free(raw as *mut c_void);
     }
 }
@@ -68,7 +68,7 @@ static CA: CountingAlloc = CountingAlloc { };
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -89,28 +89,25 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -121,15 +118,12 @@ fn copy_file(src: String, dst: String) {
 
 #[allow(clippy::needless_return)]
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -139,10 +133,7 @@ fn hot_path_allocation_count_and_latency() {
     // conditional skip like perf_fixture when the big fixture is absent
     let perf = "../../tests/perfdata/gfs_perf_f000.grib2".to_string();
     let pr0 = File::open(&perf);
-    match pr0 {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if pr0.is_err() { return; }
     let root = "/tmp/opencode/wxpoint-hotpath".to_string();
     rm_tree(&root);
     let ing = join_path(&root, "ing");
@@ -159,7 +150,7 @@ fn hot_path_allocation_count_and_latency() {
 
     let pr = Pipeline::open(&cfgp);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _r1 = p.scan_round();
@@ -170,10 +161,10 @@ fn hot_path_allocation_count_and_latency() {
     let sref = &*snap;
     let gm = sref.find_model("gfs");
     match gm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(_mm) => {
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso) => {
                     // mid-cell query: bilinear + seam wrap at lon 359.9
                     let nq = 20000;
@@ -181,18 +172,18 @@ fn hot_path_allocation_count_and_latency() {
                     // ---- build+evaluate per-query allocation count (V1.1 phase 5:
                     // MUST BE ZERO; the old units-String/scratch-Vec allocations are
                     // gone, contexts borrow everything from the snapshot) -------
-                    let a0 = n_alloc.load(Ordering::Relaxed);
-                    let f0 = n_free.load(Ordering::Relaxed);
+                    let a0 = N_ALLOC.load(Ordering::Relaxed);
+                    let f0 = N_FREE.load(Ordering::Relaxed);
                     let t0 = mono_ns();
                     for _k in 0 .. nq {
                         let cr = build_context(sref, "gfs", None, "TMP", iso,
                                            1000.0, 0.0, TimeInterpMode::Linear);
                         match cr {
-                            Err(_e) => { assert!(false); return; }
+                            Err(_e) => { panic!(); }
                             Ok(c) => {
                                 let v = evaluate_point(&c, 0.125, 359.9);
                                 match v {
-                                    Err(_e) => { assert!(false); return; }
+                                    Err(_e) => { panic!(); }
                                     Ok(pv) => {
                                         assert!(pv.value == 609.0);
                                     }
@@ -201,8 +192,8 @@ fn hot_path_allocation_count_and_latency() {
                         }
                     }
                     let t1 = mono_ns();
-                    let a1 = n_alloc.load(Ordering::Relaxed);
-                    let f1 = n_free.load(Ordering::Relaxed);
+                    let a1 = N_ALLOC.load(Ordering::Relaxed);
+                    let f1 = N_FREE.load(Ordering::Relaxed);
                     let alloc_total = a1 - a0;
                     let dealloc_total = f1 - f0;
                     // V1.1 phase 5 hard gate: selection+assembly allocate NOTHING.
@@ -214,21 +205,18 @@ fn hot_path_allocation_count_and_latency() {
                     let cr2 = build_context(sref, "gfs", None, "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match cr2 {
-                        Err(_e) => { assert!(false); return; }
+                        Err(_e) => { panic!(); }
                         Ok(c2) => {
-                            let a2 = n_alloc.load(Ordering::Relaxed);
-                            let f2 = n_free.load(Ordering::Relaxed);
+                            let a2 = N_ALLOC.load(Ordering::Relaxed);
+                            let f2 = N_FREE.load(Ordering::Relaxed);
                             let t2 = mono_ns();
                             for _k in 0 .. nq {
                                 let v2 = evaluate_point(&c2, 0.125, 359.9);
-                                match v2 {
-                                    Err(_e) => { assert!(false); return; }
-                                    Ok(_) => {}
-                                }
+                                if let Err(_e) = v2 { panic!(); }
                             }
                             let t3 = mono_ns();
-                            let a3 = n_alloc.load(Ordering::Relaxed);
-                            let f3 = n_free.load(Ordering::Relaxed);
+                            let a3 = N_ALLOC.load(Ordering::Relaxed);
+                            let f3 = N_FREE.load(Ordering::Relaxed);
                             // the hot lookup path must not touch the allocator
                             assert!(a3 == a2);
                             assert!(f3 == f2);

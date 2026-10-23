@@ -35,7 +35,7 @@ use std::fs::read_to_string;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -56,18 +56,18 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { assert!(false); return Vec::<u8>::new(); }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return Vec::<u8>::new(); }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
@@ -82,15 +82,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -130,18 +127,18 @@ fn twin_cfg(data: &str, ing: &str, ga: &str, gb: &str) -> String {
 #[test]
 fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
     let root = "/tmp/opencode/wxpoint-twinmodels";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     let src = join_path(&ing, "gfs_small.grib2");
     write_bytes(&src, &read_bytes("../../tests/fixtures/gfs_small.grib2"));
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, twin_cfg(&data, &ing, "*.grib2", "*.grib2").as_bytes());
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(count_notes(&p, "config warning") == 1);
@@ -177,20 +174,20 @@ fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
     let ra = p.state.find("ma", src.as_str());
     let rb = p.state.find("mb", src.as_str());
     match ra {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
     match rb {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
     let jpath = join_path(&join_path(&data, "state"), "files.json");
     let txt = read_to_string(&jpath);
     let doc = match txt {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t0) => {
             match deserialize_text(&t0) {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(d) => { d }
             }
         }
@@ -199,8 +196,8 @@ fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
     let mut saw_ma = false;
     let mut saw_mb = false;
     for r in &doc.recs {
-        if r.model == "ma".to_string() { saw_ma = true; }
-        if r.model == "mb".to_string() { saw_mb = true; }
+        if r.model == "ma" { saw_ma = true; }
+        if r.model == "mb" { saw_mb = true; }
     }
     assert!(saw_ma && saw_mb);
 
@@ -208,7 +205,7 @@ fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
     assert!(p.registry.len() == 2);
     let mut both_runs = 0;
     for rm in &p.registry {
-        if rm.runs.len() == 1 && rm.runs[0].dir_name == "2026101912".to_string() {
+        if rm.runs.len() == 1 && rm.runs[0].dir_name == "2026101912" {
             both_runs += 1;
         }
     }
@@ -216,7 +213,7 @@ fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
 
     // Idempotence: a third round changes nothing for either model.
     assert!(p.scan_round() == 0);
-    rm_tree(&root);
+    rm_tree(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -226,13 +223,13 @@ fn overlapping_models_on_one_dir_both_ingest_with_distinct_records() {
 #[test]
 fn legacy_v1_state_is_discarded_loudly_and_everything_reingests_once() {
     let root = "/tmp/opencode/wxpoint-legacystate";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     let src = join_path(&ing, "gfs_small.grib2");
     write_bytes(&src, &read_bytes("../../tests/fixtures/gfs_small.grib2"));
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, twin_cfg(&data, &ing, "*.grib2", "*.grib2").as_bytes());
 
     // Pre-seed a VERSION-1 files.json claiming everything is already ingested
@@ -247,7 +244,7 @@ fn legacy_v1_state_is_discarded_loudly_and_everything_reingests_once() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // exactly one loud upgrade note naming the discard...
@@ -256,7 +253,7 @@ fn legacy_v1_state_is_discarded_loudly_and_everything_reingests_once() {
     // ...NOT counted as an error (expected upgrade event)...
     assert!(p.counters.errors == 0);
     // ...and the store really starts EMPTY.
-    assert!(p.state.recs.len() == 0);
+    assert!(p.state.recs.is_empty());
 
     // The documented cost: ONE full re-ingest despite identical content (the
     // shared-path stability tracker splits the two models across rounds the
@@ -271,7 +268,7 @@ fn legacy_v1_state_is_discarded_loudly_and_everything_reingests_once() {
     assert!(rounds <= 3);
     // After that, warm start resumes normally (further rounds: zero work).
     assert!(p.scan_round() == 0);
-    rm_tree(&root);
+    rm_tree(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,18 +278,18 @@ fn legacy_v1_state_is_discarded_loudly_and_everything_reingests_once() {
 #[test]
 fn disjoint_globs_on_one_dir_produce_no_warning_but_overlap_does() {
     let root = "/tmp/opencode/wxpoint-twinglobs";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
 
     // gfs.t*z.pgrb2* vs hrrr.t*z.wrf*: fixed prefixes "gfs.t" / "hrrr.t"
     // differ immediately -> PROVABLY disjoint -> no warning expected.
     write_bytes(&cfg_path, twin_cfg(&data, &ing, "gfs.t*z.pgrb2*", "hrrr.t*z.wrf*").as_bytes());
     let pr = Pipeline::open(&cfg_path);
     let p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(count_notes(&p, "config warning") == 0);
@@ -306,9 +303,9 @@ fn disjoint_globs_on_one_dir_produce_no_warning_but_overlap_does() {
     write_bytes(&cfg_path, twin_cfg(&data, &ing, "*.grib2", "gfs*.grib2").as_bytes());
     let pr2 = Pipeline::open(&cfg_path);
     let p2 = match pr2 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(count_notes(&p2, "config warning") == 1);
-    rm_tree(&root);
+    rm_tree(root);
 }

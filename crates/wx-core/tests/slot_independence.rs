@@ -17,7 +17,7 @@
 // so bilinear at the cell centre (i,j) = (0.5,0.5) returns li*1000 + ti*100 + 5.5.
 
 use wx_core::grid::{GridDef, GridRegular};
-use wx_core::interp::{FieldSamples, PointError, TimeInterpMode, query_point};
+use wx_core::interp::{FieldSamples, TimeInterpMode, query_point};
 
 const NX: usize = 2;
 const NY: usize = 2;
@@ -33,7 +33,7 @@ pub fn make_grid() -> GridDef {
         scan_mode: 0x40, // rows go north: dj = (lat - lat1) / dlat
         winds_grid: false,
     };
-    return GridDef::Regular(g);
+    GridDef::Regular(g)
 }
 
 /// Slab (li,ti) filled with the analytic convention above.
@@ -49,12 +49,12 @@ pub fn fill_slabs(levels_n: usize, fhs_n: usize, poison_ti: i64) -> Vec<f64> {
                         // rewrite the whole forecast hour with a DIFFERENT field
                         v = 7.0 * v + 0.5;
                     }
-                    let _p = out.push(v);
+                    out.push(v);
                 }
             }
         }
     }
-    return out;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -82,11 +82,11 @@ fn per_pair_planes_compose_horizontally_then_vertically_then_in_time() {
     };
     let r = query_point(&grid, &fd, 0.5, 0.5, 850.0, 3.0, TimeInterpMode::Linear);
     match r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok(pv) => {
             assert!(pv.value == 1555.5);
             match pv.info.vertical {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(vm) => {
                     assert!(vm.levels == (900.0, 800.0));
                     // wx-core models ONE level stack shared by every forecast
@@ -97,7 +97,7 @@ fn per_pair_planes_compose_horizontally_then_vertically_then_in_time() {
                 }
             }
             match pv.info.time {
-                None => { assert!(false); return; }
+                None => { panic!();}
                 Some(tm) => { assert!(tm.forecast_hours == (0.0, 6.0)); }
             }
         }
@@ -125,10 +125,10 @@ fn exact_forecast_hour_reads_only_its_own_slabs() {
     };
     let r0 = query_point(&grid, &fd_base, 0.5, 0.5, 850.0, 0.0, TimeInterpMode::Linear);
     match r0 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pv) => {
             assert!(pv.value == 1505.5);
-            assert!(pv.info.time == None);
+            assert!(pv.info.time.is_none());
         }
     }
 
@@ -143,7 +143,7 @@ fn exact_forecast_hour_reads_only_its_own_slabs() {
     };
     let r1 = query_point(&grid, &fd_poison, 0.5, 0.5, 850.0, 0.0, TimeInterpMode::Linear);
     match r1 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pv) => {
             assert!(pv.value == 1505.5); // BIT-IDENTICAL to the baseline answer
             // sanity: the poisoned planes really are different numbers, otherwise
@@ -171,7 +171,7 @@ fn exact_forecast_hour_reads_only_its_own_slabs() {
     };
     let r2 = query_point(&grid, &fd_p0, 0.5, 0.5, 850.0, 0.0, TimeInterpMode::Linear);
     match r2 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pv) => { assert!(pv.value == 10539.0); }
     }
 
@@ -180,11 +180,11 @@ fn exact_forecast_hour_reads_only_its_own_slabs() {
     //   v(0,1) = 0*1000 + 100 + 5.5 = 105.5 with NO vertical step
     let r3 = query_point(&grid, &fd_base, 0.5, 0.5, 1000.0, 6.0, TimeInterpMode::Linear);
     match r3 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(pv) => {
             assert!(pv.value == 105.5);
-            assert!(pv.info.vertical == None);
-            assert!(pv.info.time == None);
+            assert!(pv.info.vertical.is_none());
+            assert!(pv.info.time.is_none());
         }
     }
 }

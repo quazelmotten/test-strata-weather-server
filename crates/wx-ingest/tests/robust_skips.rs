@@ -30,11 +30,11 @@ use std::fs::remove_file;
 use std::fs::remove_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -55,27 +55,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!();}
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -85,15 +82,12 @@ fn copy_file(src: String, dst: String) {
 }
 
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -101,20 +95,20 @@ fn write_text(path: &str, text: String) {
 fn file_exists(path: String) -> bool {
     let f = File::open(&path);
     match f {
-        Err(_) => { return false; }
-        Ok(_) => { return true; }
+        Err(_) => { false}
+        Ok(_) => { true}
     }
 }
 
 fn robust_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"robust\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"robust_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"robust_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -127,8 +121,7 @@ fn coord_list_message_is_skipped_and_the_walk_resumes() {
     match r {
         Err(e) => {
             println!("decode failed {:?}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok((msgs, st)) => {
             // FOUR messages in the file; ONE is structurally unusable, so THREE
@@ -142,7 +135,7 @@ fn coord_list_message_is_skipped_and_the_walk_resumes() {
             assert!(msgs[2].levels.len() == 1 && msgs[2].levels[0].0 == 103);
             // The skip reason is typed and human-readable (surfaced in notes).
             let sr = SkipReason::CoordLists;
-            assert!(skip_reason_text(&sr) == "coordinate list after the product-definition template".to_string());
+            assert!(skip_reason_text(&sr) == "coordinate list after the product-definition template");
             // Byte-perfect resume: BOTH good messages carry the analytic field
             // 300 + j*21 + i at every node, including the probe node j=2,i=3.
             let k = 2 * 21 + 3;
@@ -171,8 +164,7 @@ fn pipeline_skips_are_noted_not_errors() {
     let mut p = match po {
         Err(e) => {
             println!("pipeline open failed: {0}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok(pp) => { pp }
     };
@@ -205,8 +197,8 @@ fn pipeline_skips_are_noted_not_errors() {
     // under TMP are exactly the two canonical level directories.
     let mut dirs_seen = 0;
     let mut saw_layer_dir = false;
-    match read_dir(&join_path(&run, "TMP")) {
-        Err(_) => { assert!(false); }
+    match read_dir(join_path(&run, "TMP")) {
+        Err(_) => { panic!(); }
         Ok(it) => {
             for e in it {
                 match e {
@@ -232,17 +224,17 @@ fn pipeline_skips_are_noted_not_errors() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     match sref.find_model("robust") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 2);
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso_code) => {
                     let c8 = build_context(sref, "robust", None, "TMP", iso_code,
                                         850.0, 0.0, TimeInterpMode::Linear);
                     match c8 {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
@@ -250,7 +242,7 @@ fn pipeline_skips_are_noted_not_errors() {
                                     assert!(pv.value == 345.0);
                                     assert!(pv.info.horizontal == HorizMethod::Exact);
                                 }
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                             }
                         }
                     }
@@ -264,26 +256,26 @@ fn pipeline_skips_are_noted_not_errors() {
                                 SelectError::LevelOutOfRange => {}
                                 _ => {
                                     println!("unexpected select error {:?}", ne);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                     }
                 }
             }
             match lookup_level_type("height_above_ground") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(hag_code) => {
                     let c2 = build_context(sref, "robust", None, "TMP", hag_code,
                                         2.0, 0.0, TimeInterpMode::Linear);
                     match c2 {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 9.0, 351.5);
                             match v {
                                 Ok(pv) => { assert!(pv.value == 345.0); }
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                             }
                         }
                     }

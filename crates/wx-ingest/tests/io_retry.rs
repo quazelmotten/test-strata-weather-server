@@ -40,7 +40,7 @@ use std::os::unix::fs::PermissionsExt;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -61,12 +61,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -87,15 +87,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -136,26 +133,17 @@ fn permission_denied_decodes_as_io_not_content() {
     write_bytes(&xp.to_string(), &src);
 
     // readable: decodes fine (sanity).
-    match decode_file(xp.to_string(), ParamFilter::All) {
-        Err(e) => { println!("clean decode failed: {e:?}"); assert!(false); return; }
-        Ok(_) => {}
-    }
+    if let Err(e) = decode_file(xp.to_string(), ParamFilter::All) { println!("clean decode failed: {e:?}"); panic!(); }
     let pm = set_permissions(&xp, PermissionsExt::from_mode(0o000));
-    match pm {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pm.is_err() { panic!(); }
     // unreadable: MUST be the Io class — never BadField/BadMagic/etc.
     match decode_file(xp.to_string(), ParamFilter::All) {
-        Ok(_) => { println!("chmod-000 file decoded?!"); assert!(false); return; }
+        Ok(_) => { println!("chmod-000 file decoded?!"); panic!(); }
         Err(GribErr::Io) => {}
-        Err(other) => { println!("wrong error class: {other:?}"); assert!(false); return; }
+        Err(other) => { println!("wrong error class: {other:?}"); panic!(); }
     }
     let pr = set_permissions(&xp, PermissionsExt::from_mode(0o644));
-    match pr {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pr.is_err() { panic!(); }
     rm_tree(&root);
 }
 
@@ -178,7 +166,7 @@ fn transient_io_retries_then_escalates_then_self_clears() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     // round 1: OBSERVATION only (window 0 still needs one re-observation).
@@ -186,19 +174,13 @@ fn transient_io_retries_then_escalates_then_self_clears() {
 
     // The producer-side hiccup: unreadable from here on.
     let pm = set_permissions(&xp, PermissionsExt::from_mode(0o000));
-    match pm {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pm.is_err() { panic!(); }
 
     // Rounds 2..5: FOUR consecutive I/O failures — NO record, NO counters,
     // exactly ONE note total (the first occurrence).
     for r in 2 .. 6usize {
         assert!(p.scan_round() == 0, "round {r} unexpectedly consumed the file");
-        match p.state.find("gfs", xp.as_str()) {
-            Some(rec) => { println!("round {r} wrote record kind {} for an I/O failure", rec.kind); assert!(false); return; }
-            None => {}
-        }
+        if let Some(rec) = p.state.find("gfs", xp.as_str()) { println!("round {r} wrote record kind {} for an I/O failure", rec.kind); panic!(); }
         assert!(count_notes(&p, "retrying next round") == 1);
         assert!(count_notes(&p, "repeated I/O failure") == 0);
         assert!(p.counters.errors == 0);
@@ -214,11 +196,11 @@ fn transient_io_retries_then_escalates_then_self_clears() {
     // batched save.
     assert!(p.scan_round() == 0);
     let rec = match p.state.find("gfs", xp.as_str()) {
-        None => { println!("escalation wrote no record"); assert!(false); return; }
+        None => { println!("escalation wrote no record"); panic!(); }
         Some(rr) => { rr }
     };
     assert!(rec.kind == REC_FAILED);
-    assert!(rec.hash == "".to_string());
+    assert!(rec.hash.is_empty());
     assert!(count_notes(&p, "repeated I/O failure") == 1);
     assert!(p.counters.errors == 1);
     assert!(p.counters.quarantined_files == 1);
@@ -230,18 +212,15 @@ fn transient_io_retries_then_escalates_then_self_clears() {
     // cannot equal a real digest, so the file re-enters the normal path and
     // ingests — the pre-E3a design would have sat on it forever.
     let pr2 = set_permissions(&xp, PermissionsExt::from_mode(0o644));
-    match pr2 {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pr2.is_err() { panic!(); }
     assert!(p.scan_round() == 1);
     assert!(p.counters.ingested_files == 1);
     let rec2 = match p.state.find("gfs", xp.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(rr) => { rr }
     };
     assert!(rec2.kind == REC_OK);
-    assert!(rec2.hash != "".to_string());
+    assert!(!rec2.hash.is_empty());
     // success cleared the streak; counters stay at the single escalation.
     assert!(p.io_streaks.is_empty());
     assert!(p.counters.errors == 1);

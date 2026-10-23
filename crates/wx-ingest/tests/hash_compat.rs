@@ -30,7 +30,7 @@ use std::fs::OpenOptions;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -51,27 +51,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn read_full(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -112,7 +109,7 @@ fn ramp_bytes(n: usize) -> Vec<u8> {
 }
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +142,7 @@ fn pread_hash_equals_the_old_buffer_digest_and_python_goldens() {
         write_bytes(&p, &cs.1);
         let hf = content_hash_file(&p);
         let got = match hf {
-            Err(e) => { println!("{0}: hash failed: {e}", cs.0); assert!(false); return; }
+            Err(e) => { println!("{0}: hash failed: {e}", cs.0); panic!(); }
             Ok(v) => { v }
         };
         // (1) identical to the UNCHANGED whole-buffer algorithm...
@@ -161,11 +158,7 @@ fn pread_hash_equals_the_old_buffer_digest_and_python_goldens() {
 
 #[allow(clippy::needless_return)]
 fn bytes_of(b: &[u8]) -> Vec<u8> {
-    let mut v: Vec<u8> = Vec::<u8>::new();
-    for k in 0 .. b.len() {
-        v.push(b[k]);
-    }
-    return v;
+    b.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -181,27 +174,21 @@ fn shrinking_file_between_stat_and_read_is_graceful() {
     let big = lcg_bytes(300000, 999);
     write_bytes(&p, &big);
     let h_big = content_hash_file(&p);
-    match h_big {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if h_big.is_err() { panic!(); }
 
     // Producer truncates IN PLACE (the SIGBUS surface under the mmap reader):
     // the plain reader must simply observe the shorter file.
     let fo = OpenOptions::new().write(true).open(&p);
     match fo {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let t = h.set_len(10);
-            match t {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if t.is_err() { panic!(); }
         }
     }
     let h_small = content_hash_file(&p);
     let hs = match h_small {
-        Err(e) => { println!("truncated hash failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("truncated hash failed: {e}"); panic!(); }
         Ok(v) => { v }
     };
     assert!(hs != "0000000000000000");
@@ -213,21 +200,18 @@ fn shrinking_file_between_stat_and_read_is_graceful() {
     // — a documented, benign improvement, pinned here.
     let fo2 = OpenOptions::new().write(true).open(&p);
     match fo2 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let t = h.set_len(0);
-            match t {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if t.is_err() { panic!(); }
         }
     }
     let h_zero = content_hash_file(&p);
     match h_zero {
-        Err(e) => { println!("empty hash failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("empty hash failed: {e}"); panic!(); }
         Ok(v) => {
-            assert!(v == "ecba3df2c3383c52".to_string());
-            assert!(v == content_hash_bytes(&[].to_vec()));
+            assert!(v == "ecba3df2c3383c52");
+            assert!(v == content_hash_bytes([].as_ref()));
         }
     }
     rm_tree(&root);
@@ -245,29 +229,26 @@ fn head_is_grib_short_empty_missing_are_graceful() {
 
     // missing file: retryable I/O Err (the pipeline streaks it since E3a).
     let miss = head_is_grib(&format!("{0}/nope.grib2", root));
-    match miss {
-        Ok(v) => { println!("missing file gave Ok({v})"); assert!(false); return; }
-        Err(_) => {}
-    }
+    if let Ok(v) = miss { println!("missing file gave Ok({v})"); panic!(); }
     // empty and 2-byte files: definitive Ok(false), NOT an error, no panic.
-    write_bytes(&format!("{0}/e.grib2", root), &[].to_vec());
+    write_bytes(&format!("{0}/e.grib2", root), [].as_ref());
     match head_is_grib(&format!("{0}/e.grib2", root)) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(!v); }
     }
     write_bytes(&format!("{0}/gr.grib2", root), &bytes_of(b"GR"));
     match head_is_grib(&format!("{0}/gr.grib2", root)) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(!v); }
     }
     write_bytes(&format!("{0}/ok.grib2", root), &bytes_of(b"GRIBx"));
     match head_is_grib(&format!("{0}/ok.grib2", root)) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v); }
     }
     // a real fixture still reads true through the plain reader.
     match head_is_grib(fixture("gfs_small.grib2").as_str()) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v); }
     }
     rm_tree(&root);

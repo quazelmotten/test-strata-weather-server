@@ -43,23 +43,23 @@ const NPTS: usize = 231; // 33 runs x 7
 const RL_CKSUM: u32 = 3596891385;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_all_bytes(path: String) -> Vec<u8> {
     let f = File::open(&path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -71,10 +71,10 @@ fn runlength_5200_matches_simple_packing_and_wgrib2_checksum() {
     let ra = decode_file(fixture_path("runlength_small.grib2"), ParamFilter::All);
     let pa = decode_file(fixture_path("runlength_plain.grib2"), ParamFilter::All);
     match ra {
-        Err(e) => { println!("rle decode failed: {0:?}", e); assert!(false); }
+        Err(e) => { println!("rle decode failed: {0:?}", e); panic!(); }
         Ok((rl, _sr)) => {
             match pa {
-                Err(e) => { println!("plain decode failed: {0:?}", e); assert!(false); }
+                Err(e) => { println!("plain decode failed: {0:?}", e); panic!(); }
                 Ok((pl, _sp)) => {
                     assert!(rl.len() == 1);
                     assert!(pl.len() == 1);
@@ -117,13 +117,13 @@ fn runlength_runs_land_on_the_right_grid_positions() {
     // values sideways instead of failing loudly.
     let r = decode_file(fixture_path("runlength_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); }
+        Err(_e) => { panic!(); }
         Ok((msgs, _st)) => {
             let d = msgs[0].data.clone();
             assert!(d.len() == NPTS);
             let lv: [f32; 3] = [250.0, 256.0, 260.0];
             for k in 0 .. NPTS {
-                let expect = lv[((k / 7) % 3) as usize];
+                let expect = lv[(k / 7) % 3];
                 assert!(d[k] == expect);
             }
             // explicit transition probes + last node (the final run ends exactly
@@ -169,15 +169,15 @@ fn corrupt_runlength_stream_is_a_typed_error_not_garbage() {
     match r {
         Ok((_m, _s)) => {
             println!("corrupt run-length stream was ACCEPTED (should be refused)");
-            assert!(false);
+            panic!();
         }
         Err(e) => {
             match e {
-                GribErr::BadField(_why) => { return; }
-                GribErr::Truncated => { return; }
+                GribErr::BadField(_why) => {}
+                GribErr::Truncated => {}
                 _ => {
                     println!("unexpected error kind: {0:?}", e);
-                    assert!(false);
+                    panic!();
                 }
             }
         }

@@ -8,7 +8,7 @@ use wx_core::grid::{GridDef, GridGaussian};
 use wx_server::httpapi::render_grid_json;
 
 fn has(hay: &str, needle: &str) -> bool {
-    return hay.find(needle).is_some();
+    hay.find(needle).is_some()
 }
 
 #[test]

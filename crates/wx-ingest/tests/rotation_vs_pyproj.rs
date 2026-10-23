@@ -16,7 +16,7 @@ use wx_core::tables::parse_f64;
 use std::fs::read_to_string;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn abs_diff(a: f64, b: f64) -> f64 {
@@ -24,7 +24,7 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 /// Wrap into (-180, 180].
@@ -36,7 +36,7 @@ fn wrap_deg(d: f64) -> f64 {
     if w < -180.0 {
         return w + 360.0;
     }
-    return w;
+    w
 }
 
 #[derive(Clone, Debug)]
@@ -50,18 +50,17 @@ pub struct Row {
 }
 
 fn load_rows() -> Vec<Row> {
-    let t = read_to_string(&fixture_path("rotation_expected.csv"));
+    let t = read_to_string(fixture_path("rotation_expected.csv"));
     match t {
         Err(_e) => {
-            assert!(false);
-            return [].to_vec();
+            panic!();
         }
         Ok(txt) => {
             let mut out: Vec<Row> = Vec::<Row>::new();
             let lines: Vec<&str> = txt.split('\n').collect();
             for ln0 in lines {
                 // tolerate CRLF if the table is ever regenerated on Windows
-                let ln: &str = if ln0.len() > 0 &&
+                let ln: &str = if !ln0.is_empty() &&
                                  ln0[ln0.len() - 1 .. ln0.len()] == *"\r" {
                     &ln0[0 .. ln0.len() - 1]
                 } else {
@@ -76,21 +75,18 @@ fn load_rows() -> Vec<Row> {
                 let fl = parse_f64(parts[3]);
                 let fo = parse_f64(parts[4]);
                 let fb = parse_f64(parts[5]);
-                match (fi, fj, fl, fo, fb) {
-                    (Some(a), Some(b), Some(la), Some(lo), Some(bb)) => {
-                        out.push(Row {
-                            fixture: parts[0].to_string(),
-                            i: a,
-                            j: b,
-                            lat: la,
-                            lon: lo,
-                            beta: bb,
-                        });
-                    }
-                    _ => {}
+                if let (Some(a), Some(b), Some(la), Some(lo), Some(bb)) = (fi, fj, fl, fo, fb) {
+                    out.push(Row {
+                        fixture: parts[0].to_string(),
+                        i: a,
+                        j: b,
+                        lat: la,
+                        lon: lo,
+                        beta: bb,
+                    });
                 }
             }
-            return out;
+            out
         }
     }
 }
@@ -100,23 +96,19 @@ fn wind_grid_of(fixture: &str) -> GridLambert {
     let r = decode_file(fixture_path(fixture), ParamFilter::All);
     match r {
         Err(_e) => {
-            assert!(false);
-            return GridLambert::new(1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                    1.0, 1.0, 1, 0, 6, false);
+            panic!();
         }
         Ok((msgs, _st)) => {
             for m in &msgs {
                 if grid_winds(&m.grid) {
                     match m.grid {
                         GridDef::Lambert(ref gl) => { return gl.clone(); }
-                        GridDef::Regular(ref _rg) => { assert!(false); }
-                        GridDef::Gaussian(ref _gg) => { assert!(false); }
+                        GridDef::Regular(ref _rg) => { panic!(); }
+                        GridDef::Gaussian(ref _gg) => { panic!(); }
                     }
                 }
             }
-            assert!(false);
-            return GridLambert::new(1, 1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                    1.0, 1.0, 1, 0, 6, false);
+            panic!();
         }
     }
 }

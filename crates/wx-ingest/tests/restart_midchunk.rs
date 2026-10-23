@@ -32,23 +32,23 @@ use std::fs::read_to_string;
 use std::sync::atomic::Ordering;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -56,21 +56,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -91,7 +88,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 // V1.2 phase D: per-FILE progress lines moved OUT of `log` into `progress_log`
@@ -104,7 +101,7 @@ fn count_progress(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 fn count_notes(p: &Pipeline, marker: &str) -> usize {
@@ -114,7 +111,7 @@ fn count_notes(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 fn midchunk_cfg(data: &str, ing: &str, batch: &str) -> String {
@@ -124,8 +121,8 @@ fn midchunk_cfg(data: &str, ing: &str, batch: &str) -> String {
     let t = format!("{0}{1}", t, batch);
     let t = t + "\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -144,7 +141,7 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
     let bad_cfg = join_path(&root, "bad.toml");
     write_bytes(&bad_cfg, midchunk_cfg(&data, &ing, "0").as_bytes());
     match Pipeline::open(&bad_cfg) {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!(); }
         Err(e) => {
             let m = e.to_string();
             assert!(m.contains("decode_batch_files"));
@@ -156,7 +153,7 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
     write_bytes(&cfg_path, midchunk_cfg(&data, &ing, "2").as_bytes());
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.decode_batch_files == 2);
@@ -173,28 +170,26 @@ fn per_file_saves_make_a_midchunk_restart_partial() {
     let jpath = join_path(&join_path(&data, "state"), "files.json");
     let txt_r = read_to_string(&jpath);
     let txt = match txt_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t0) => { t0.to_string() }
     };
     let doc_r = deserialize_text(&txt);
     let doc = match doc_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(d0) => { d0 }
     };
     assert!(doc.recs.len() == 3);
 
     // ---- simulated crash mid-chunk-2: only the FIRST chunk's batched save
     // (records for two files) reached the disk; chunk 2's save never ran -----
-    let mut keep: Vec<FileRec> = Vec::<FileRec>::new();
-    keep.push(doc.recs[0].clone());
-    keep.push(doc.recs[1].clone());
+    let keep: Vec<FileRec> = vec![doc.recs[0].clone(), doc.recs[1].clone()];
     let nd = StateDoc { version: doc.version, recs: keep };
     write_bytes(&jpath, serialize_text(&nd).as_bytes());
 
     // ---- restart: ONLY the unsaved file is re-ingested ------------------
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // Fresh StabilityTracker: the first round after a restart only OBSERVES.

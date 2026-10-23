@@ -38,7 +38,7 @@ const EPOCH: i64 = 1760889600; // 2026-10-19T12:00:00Z (value irrelevant here)
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -59,7 +59,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 /// Write one field .bin whose planes follow the analytic formula. `nan_level`
@@ -73,22 +73,22 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64,
         for j in 0 .. (NY as usize) {
             for i in 0 .. (NX as usize) {
                 if *lv == nan_level {
-                    let _q = plane.push(bits_to_f32(0x7fc00000));
+                    plane.push(bits_to_f32(0x7fc00000));
                     continue;
                 }
                 let v = lv * 100.0 + fh_hours * 10.0 + ((j as f64) * 10.0 + (i as f64));
-                let _p = plane.push(v as f32);
+                plane.push(v as f32);
             }
         }
-        let _m = planes.push(plane);
+        planes.push(plane);
     }
     let mut refs: Vec<&[f32]> = Vec::<&[f32]>::new();
     for pl in &planes {
-        let _r = refs.push(&pl[..]);
+        refs.push(&pl[..]);
     }
     let mut lv32: Vec<f32> = Vec::<f32>::new();
     for lv in levels {
-        let _z = lv32.push(*lv as f32);
+        lv32.push(*lv as f32);
     }
     let hdr = BinHeader {
         nx: NX,
@@ -100,16 +100,13 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64,
     };
     let path = format!("{0}/{1}", dir, name);
     let wr = write_bin_atomic(path, &hdr, &refs);
-    match wr {
-        Err(_e) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if let Err(_e) = wr { panic!(); }
 }
 
 pub fn iso_code() -> u8 {
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return 0; }
-        Some(c) => { return c; }
+        None => { panic!(); }
+        Some(c) => { c}
     }
 }
 
@@ -124,12 +121,12 @@ pub fn make_grid() -> GridDef {
         scan_mode: 0x40, // rows go north: dj = (lat - lat1) / dlat
         winds_grid: false,
     };
-    return GridDef::Regular(g);
+    GridDef::Regular(g)
 }
 
 pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
-    return IdxFh {
-        fh_secs: fh_secs,
+    IdxFh {
+        fh_secs,
         field: mf.clone(),
         stat_processed: false,
         stat_kind_code: 0,
@@ -137,11 +134,11 @@ pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
         stat_begin_secs: 0,
         stat_end_secs: 0,
         stat_step_secs: 0,
-    };
+    }
 }
 
 pub fn mk_entry(fa: Arc<MmapField>, fb: Arc<MmapField>) -> IdxFieldEntry {
-    return IdxFieldEntry {
+    IdxFieldEntry {
         param_key: "TMP".to_string(),
         level_code: iso_code(),
         fd: IdxField {
@@ -150,18 +147,18 @@ pub fn mk_entry(fa: Arc<MmapField>, fb: Arc<MmapField>) -> IdxFieldEntry {
             stat_kind: "instantaneous".to_string(),
             fhs: [mk_fh(fa, 0), mk_fh(fb, 21600)].to_vec(),
         },
-    };
+    }
 }
 
 pub fn open_two(dir: String, n1: String, n2: String) -> Option<(Arc<MmapField>, Arc<MmapField>)> {
     let a = open_field(format!("{0}/{1}", dir, n1));
     let b = open_field(format!("{0}/{1}", dir, n2));
     match a {
-        Err(_) => { return None; }
+        Err(_) => { None}
         Ok(ma) => {
             match b {
-                Err(_) => { return None; }
-                Ok(mb) => { return Some((Arc::new(ma), Arc::new(mb))); }
+                Err(_) => { None}
+                Ok(mb) => { Some((Arc::new(ma), Arc::new(mb)))}
             }
         }
     }
@@ -174,9 +171,9 @@ pub fn make_snapshot(entry: IdxFieldEntry) -> IndexSnapshot {
         grid: Arc::new(make_grid()),
         fields: [entry].to_vec(),
     };
-    return IndexSnapshot {
+    IndexSnapshot {
         models: [IdxModel { name: "gfs".to_string(), runs: [run].to_vec() }].to_vec(),
-    };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -197,30 +194,30 @@ pub fn make_snapshot(entry: IdxFieldEntry) -> IndexSnapshot {
 #[test]
 fn differing_level_stacks_across_time_bracket_interpolate_per_slot() {
     let dir = "/tmp/opencode/wxpoint-slotlevels-diff";
-    rm_tree(&dir);
-    let _c = create_dir_all(&dir);
+    rm_tree(dir);
+    let _c = create_dir_all(dir);
     let a_levels: [f64; 4] = [1000.0, 900.0, 800.0, 700.0];
     let b_levels: [f64; 4] = [950.0, 850.0, 800.0, 700.0];
     write_field_file(dir.to_string(), "f000.bin".to_string(), &a_levels[..], 0.0, -1.0);
     write_field_file(dir.to_string(), "f006.bin".to_string(), &b_levels[..], 6.0, -1.0);
     let pair = open_two(dir.to_string(), "f000.bin".to_string(), "f006.bin".to_string());
     match pair {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(pr) => {
             let snap = make_snapshot(mk_entry(pr.0, pr.1));
             let c_r = build_context(&snap, "gfs", None, "TMP", iso_code(), 875.0, 10800.0, TimeInterpMode::Linear);
             match c_r {
-                Err(_e) => { assert!(false); return; }
+                Err(_e) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 0.5, 0.5);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => {
                             assert!(pv.value == 87535.5);
                             assert!(pv.value != 85660.5); // the pre-fix answer
                             assert!(pv.info.horizontal == HorizMethod::Bilinear);
                             match pv.info.vertical {
-                                None => { assert!(false); return; }
+                                None => { panic!(); }
                                 Some(vm) => {
                                     assert!(vm.method == LevelInterpMethod::Linear);
                                     assert!(vm.levels == (900.0, 800.0)); // earlier slot
@@ -229,7 +226,7 @@ fn differing_level_stacks_across_time_bracket_interpolate_per_slot() {
                                 }
                             }
                             match pv.info.time {
-                                None => { assert!(false); return; }
+                                None => { panic!(); }
                                 Some(tm) => {
                                     assert!(tm.method == TimeInterpMode::Linear);
                                     assert!(tm.forecast_hours == (0.0, 6.0));
@@ -241,7 +238,7 @@ fn differing_level_stacks_across_time_bracket_interpolate_per_slot() {
             }
         }
     }
-    rm_tree(&dir);
+    rm_tree(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -252,27 +249,27 @@ fn differing_level_stacks_across_time_bracket_interpolate_per_slot() {
 #[test]
 fn identical_stacks_keep_single_vertical_bracket_metadata() {
     let dir = "/tmp/opencode/wxpoint-slotlevels-same";
-    rm_tree(&dir);
-    let _c = create_dir_all(&dir);
+    rm_tree(dir);
+    let _c = create_dir_all(dir);
     let lv: [f64; 4] = [1000.0, 900.0, 800.0, 700.0];
     write_field_file(dir.to_string(), "f000.bin".to_string(), &lv[..], 0.0, -1.0);
     write_field_file(dir.to_string(), "f006.bin".to_string(), &lv[..], 6.0, -1.0);
     let pair = open_two(dir.to_string(), "f000.bin".to_string(), "f006.bin".to_string());
     match pair {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(pr) => {
             let snap = make_snapshot(mk_entry(pr.0, pr.1));
             let c_r = build_context(&snap, "gfs", None, "TMP", iso_code(), 875.0, 10800.0, TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 0.5, 0.5);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => {
                             assert!(pv.value == 87535.5);
                             match pv.info.vertical {
-                                None => { assert!(false); return; }
+                                None => { panic!(); }
                                 Some(vm) => {
                                     assert!(vm.levels == (900.0, 800.0));
                                     assert!(vm.levels_later == (900.0, 800.0));
@@ -285,7 +282,7 @@ fn identical_stacks_keep_single_vertical_bracket_metadata() {
             }
         }
     }
-    rm_tree(&dir);
+    rm_tree(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -299,28 +296,28 @@ fn identical_stacks_keep_single_vertical_bracket_metadata() {
 #[test]
 fn exact_level_in_one_slot_bracket_in_the_other() {
     let dir = "/tmp/opencode/wxpoint-slotlevels-mix";
-    rm_tree(&dir);
-    let _c = create_dir_all(&dir);
+    rm_tree(dir);
+    let _c = create_dir_all(dir);
     let a_levels: [f64; 4] = [1000.0, 900.0, 800.0, 700.0];
     let b_levels: [f64; 4] = [950.0, 850.0, 800.0, 700.0];
     write_field_file(dir.to_string(), "f000.bin".to_string(), &a_levels[..], 0.0, -1.0);
     write_field_file(dir.to_string(), "f006.bin".to_string(), &b_levels[..], 6.0, -1.0);
     let pair = open_two(dir.to_string(), "f000.bin".to_string(), "f006.bin".to_string());
     match pair {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(pr) => {
             let snap = make_snapshot(mk_entry(pr.0, pr.1));
             let c_r = build_context(&snap, "gfs", None, "TMP", iso_code(), 850.0, 10800.0, TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 0.5, 0.5);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => {
                             assert!(pv.value == 85035.5);
                             match pv.info.vertical {
-                                None => { assert!(false); return; }
+                                None => { panic!(); }
                                 Some(vm) => {
                                     assert!(vm.levels == (900.0, 800.0));
                                     assert!(vm.levels_later == (850.0, 850.0));
@@ -335,16 +332,16 @@ fn exact_level_in_one_slot_bracket_in_the_other() {
             // metadata and the LATER stack's OWN pair is reported (request 875 at fh 6).
             let c2_r = build_context(&snap, "gfs", None, "TMP", iso_code(), 875.0, 21600.0, TimeInterpMode::Linear);
             match c2_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c2) => {
                     let v2 = evaluate_point(&c2, 0.5, 0.5);
                     match v2 {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv2) => {
                             assert!(pv2.value == 87565.5);
-                            assert!(pv2.info.time == None);
+                            assert!(pv2.info.time.is_none());
                             match pv2.info.vertical {
-                                None => { assert!(false); return; }
+                                None => { panic!(); }
                                 Some(vm2) => {
                                     assert!(vm2.levels == (950.0, 850.0));
                                     assert!(!vm2.per_time);
@@ -356,7 +353,7 @@ fn exact_level_in_one_slot_bracket_in_the_other() {
             }
         }
     }
-    rm_tree(&dir);
+    rm_tree(dir);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,26 +365,26 @@ fn masked_plane_in_either_slot_still_returns_missing_data() {
     let a_levels: [f64; 4] = [1000.0, 900.0, 800.0, 700.0];
     let b_levels: [f64; 4] = [950.0, 850.0, 800.0, 700.0];
 
-    rm_tree(&dir);
-    let _c = create_dir_all(&dir);
+    rm_tree(dir);
+    let _c = create_dir_all(dir);
     write_field_file(dir.to_string(), "f000.bin".to_string(), &a_levels[..], 0.0, 900.0);
     write_field_file(dir.to_string(), "f006.bin".to_string(), &b_levels[..], 6.0, -1.0);
     let pair = open_two(dir.to_string(), "f000.bin".to_string(), "f006.bin".to_string());
     match pair {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(pr) => {
             let snap = make_snapshot(mk_entry(pr.0, pr.1));
             let c_r = build_context(&snap, "gfs", None, "TMP", iso_code(), 875.0, 10800.0, TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 0.5, 0.5);
                     match v {
-                        Ok(_) => { assert!(false); return; }
+                        Ok(_) => { panic!(); }
                         Err(e) => {
                             match e {
                                 PointError::MissingData => {}
-                                _ => { assert!(false); return; }
+                                _ => { panic!(); }
                             }
                         }
                     }
@@ -397,26 +394,26 @@ fn masked_plane_in_either_slot_still_returns_missing_data() {
     }
 
     // same, poisoned in the LATER slot instead
-    rm_tree(&dir);
-    let _c2 = create_dir_all(&dir);
+    rm_tree(dir);
+    let _c2 = create_dir_all(dir);
     write_field_file(dir.to_string(), "f000.bin".to_string(), &a_levels[..], 0.0, -1.0);
     write_field_file(dir.to_string(), "f006.bin".to_string(), &b_levels[..], 6.0, 850.0);
     let pair2 = open_two(dir.to_string(), "f000.bin".to_string(), "f006.bin".to_string());
     match pair2 {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(pr2) => {
             let snap2 = make_snapshot(mk_entry(pr2.0, pr2.1));
             let c3_r = build_context(&snap2, "gfs", None, "TMP", iso_code(), 875.0, 10800.0, TimeInterpMode::Linear);
             match c3_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c3) => {
                     let v3 = evaluate_point(&c3, 0.5, 0.5);
                     match v3 {
-                        Ok(_) => { assert!(false); return; }
+                        Ok(_) => { panic!(); }
                         Err(e3) => {
                             match e3 {
                                 PointError::MissingData => {}
-                                _ => { assert!(false); return; }
+                                _ => { panic!(); }
                             }
                         }
                     }
@@ -424,5 +421,5 @@ fn masked_plane_in_either_slot_still_returns_missing_data() {
             }
         }
     }
-    rm_tree(&dir);
+    rm_tree(dir);
 }

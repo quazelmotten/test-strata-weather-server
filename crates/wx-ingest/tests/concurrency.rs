@@ -23,7 +23,7 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -44,27 +44,27 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -72,15 +72,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -90,8 +87,8 @@ fn cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -107,7 +104,7 @@ fn concurrent_publishers_and_readers_never_tear() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(e) => { println!("{0}", e); assert!(false); return; }
+        Err(e) => { println!("{0}", e); panic!(); }
         Ok(pp) => { pp }
     };
     let _ = p.scan_round();
@@ -137,7 +134,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                             Err(_) => {}
                             Ok(v) => {
                                 let mut w = v;
-                                w[1] = w[1] + 1;
+                                w[1] += 1;
                             }
                         }
                     }
@@ -154,7 +151,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                                             Err(_) => {}
                                             Ok(v) => {
                                                 let mut w = v;
-                                                w[1] = w[1] + 1;
+                                                w[1] += 1;
                                             }
                                         }
                                     }
@@ -167,7 +164,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                                                     Err(_) => {}
                                                     Ok(vv) => {
                                                         let mut w = vv;
-                                                        w[1] = w[1] + 1;
+                                                        w[1] += 1;
                                                     }
                                                 }
                                             }
@@ -179,7 +176,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                                                         Err(_) => {}
                                                         Ok(vb) => {
                                                             let mut w = vb;
-                                                            w[0] = w[0] + 1;
+                                                            w[0] += 1;
                                                         }
                                                     }
                                                 } else {
@@ -188,7 +185,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                                                         Err(_) => {}
                                                         Ok(vt) => {
                                                             let mut w = vt;
-                                                            w[1] = w[1] + 1;
+                                                            w[1] += 1;
                                                         }
                                                     }
                                                 }
@@ -208,7 +205,7 @@ fn concurrent_publishers_and_readers_never_tear() {
                     Ok(vw) => {
                         if vw[2] == 1 && it >= 500 {
                             let mut w = vw;
-                            w[3] = w[3] + 1;
+                            w[3] += 1;
                             break;
                         }
                     }
@@ -224,7 +221,7 @@ fn concurrent_publishers_and_readers_never_tear() {
     }
     let md = cnt.lock();
     match md {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => {
             let mut w = v;
             w[2] = 1;
@@ -248,7 +245,7 @@ fn concurrent_publishers_and_readers_never_tear() {
 
     let mf = cnt.lock();
     match mf {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(v) => {
             assert!(v[1] == 0);          // no query ever failed
             assert!(v[0] >= 4 * 500);    // every reader did its share of queries

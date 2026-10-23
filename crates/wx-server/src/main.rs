@@ -30,8 +30,14 @@
 //!
 //! Distinct codes are deliberate (the task allowed "at least 1"): an operator can
 //! fix a bad config without reading logs, and `scripts/smoke.sh` style harnesses
-//! can gate on it. Covered by `crates/wx-server/tests/exit_codes.rs`, which SPAWNS
-//! the built binary with broken configs and asserts rc != 0 for each class.
+//! can gate on it. `crates/wx-server/tests/exit_codes.rs` SPAWNS the built binary
+//! with deliberately broken startup conditions and asserts the EXACT code for
+//! every class forceable black-box: 2 (usage), 1 (bad config ×3), 4 (boot-time
+//! stable half-pair grid-relative wind config), 6 (address cannot be bound), 7
+//! (provisional post-boot enforcement, both halves incl. the rc-124 opt-out
+//! control). Codes 3, 5 and 8 stay WIRED BUT UNTESTED — forcing them black-box
+//! needs privileged-environment surgery that would make the suite machine-
+//! dependent; the honest ledger lives in README §9.
 
 use std::env::args;
 use std::env::var;

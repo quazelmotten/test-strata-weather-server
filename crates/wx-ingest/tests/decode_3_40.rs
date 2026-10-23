@@ -32,15 +32,14 @@ fn live_payload() -> Vec<u8> {
         out.push(hi * 16 + lo);
         k += 2;
     }
-    return out;
+    out
 }
 
 fn radix16(c: char) -> u8 {
-    if c >= '0' && c <= '9' { return (c as u8) - ('0' as u8); }
-    if c >= 'a' && c <= 'f' { return 10 + (c as u8) - ('a' as u8); }
-    if c >= 'A' && c <= 'F' { return 10 + (c as u8) - ('A' as u8); }
-    assert!(false);
-    return 0;
+    if c.is_ascii_digit() { return (c as u8) - b'0'; }
+    if ('a'..='f').contains(&c) { return 10 + (c as u8) - b'a'; }
+    if ('A'..='F').contains(&c) { return 10 + (c as u8) - b'A'; }
+    panic!();
 }
 
 fn abs_diff(a: f64, b: f64) -> f64 {
@@ -52,11 +51,10 @@ fn sec3_live_gaussian_payload_parses_to_wgrib2_values() {
     let p = live_payload();
     if p.len() != 67 {
         println!("embedded payload length {0} (expected 67)", p.len());
-        assert!(false);
-        return;
+        panic!();
     }
     let g = match parse_sec3(&p) {
-        Err(e) => { println!("parse failed: {0:?}", e); assert!(false); return; }
+        Err(e) => { println!("parse failed: {0:?}", e); panic!(); }
         Ok(gd) => { gd }
     };
     match g {
@@ -87,32 +85,31 @@ fn sec3_live_gaussian_payload_parses_to_wgrib2_values() {
             }
             if !hit_row {
                 println!("no row within 5e-7 of 40.006506");
-                assert!(false);
-                return;
+                panic!();
             }
             let pr = match gg.project(ts[k], -95.0390625) {
                 Some(v) => v,
-                None => { assert!(false); return; }
+                None => { panic!(); }
             };
             if pr.0 != 2261.0 || pr.1 != k as f64 {
                 println!("probe node projected to {0:?}, want (2261,{1})", pr, k);
-                assert!(false);
+                panic!();
             }
             // far-edge column: exact-node projection at 359.8828125 (the
             // unrounded last longitude) proves the dlon reconstruction kept
             // node exactness across all 3072 columns
             let pf = match gg.project(ts[0], 3071.0 * (360.0 / 3072.0)) {
                 Some(v) => v,
-                None => { assert!(false); return; }
+                None => { panic!(); }
             };
             if pf.0 != 3071.0 || pf.1 != 0.0 {
                 println!("far edge projected to {0:?}", pf);
-                assert!(false);
+                panic!();
             }
         }
         other => {
             println!("not a gaussian grid: {0:?}", other);
-            assert!(false);
+            panic!();
         }
     }
 }
@@ -127,27 +124,27 @@ fn sec3_gaussian_rejections_skip_as_grid_40() {
     p[65] = 0xbc; // nlat = 700, ny stays 1536
     match parse_sec3(&p) {
         Err(GribErr::UnsupportedGrid(40)) => {}
-        other => { println!("nlat mismatch accepted: {0:?}", other); assert!(false); }
+        other => { println!("nlat mismatch accepted: {0:?}", other); panic!(); }
     }
     // row ends disagreeing with the P_ny table beyond tolerance -> skip
     let mut q = live_payload();
     q[41] = 0x0a; // La1 magnitude 10.6e6-ish nonsense (was 0x05)
     match parse_sec3(&q) {
         Err(GribErr::UnsupportedGrid(40)) => {}
-        other => { println!("row-end mismatch accepted: {0:?}", other); assert!(false); }
+        other => { println!("row-end mismatch accepted: {0:?}", other); panic!(); }
     }
     // truncated section
     let r = live_payload();
     match parse_sec3(&r[..60]) {
         Err(GribErr::Truncated) => {}
-        other => { println!("truncated accepted: {0:?}", other); assert!(false); }
+        other => { println!("truncated accepted: {0:?}", other); panic!(); }
     }
     // zero nlat
     let mut z = live_payload();
     z[62] = 0; z[63] = 0; z[64] = 0; z[65] = 0;
     match parse_sec3(&z) {
         Err(GribErr::UnsupportedGrid(40)) => {}
-        other => { println!("zero nlat accepted: {0:?}", other); assert!(false); }
+        other => { println!("zero nlat accepted: {0:?}", other); panic!(); }
     }
 }
 
@@ -162,7 +159,7 @@ fn sec3_gaussian_south_north_orientation_accepted() {
     // La2 slot <- +89910324: 05 5b ec 34 (it already starts with 85 there)
     p[50] = 0x05; p[51] = 0x5b; p[52] = 0xec; p[53] = 0x34;
     let g = match parse_sec3(&p) {
-        Err(e) => { println!("SN variant rejected: {0:?}", e); assert!(false); return; }
+        Err(e) => { println!("SN variant rejected: {0:?}", e); panic!(); }
         Ok(gd) => { gd }
     };
     match g {
@@ -178,22 +175,22 @@ fn sec3_gaussian_south_north_orientation_accepted() {
             // documented no-snap-beyond-eps behavior)
             let pr = match gg.project(ts[1535], 0.0) {
                 Some(v) => v,
-                None => { assert!(false); return; }
+                None => { panic!(); }
             };
             if pr.1 != 1535.0 || pr.0 != 0.0 {
                 println!("SN dj {0}, want 1535", pr.1);
-                assert!(false);
+                panic!();
             }
             // and the rounded La1 from section 3 answers just south of it
             let pr2 = match gg.project(89.910324, 0.0) {
                 Some(v) => v,
-                None => { assert!(false); return; }
+                None => { panic!(); }
             };
             if !(pr2.1 > 1534.9 && pr2.1 < 1535.0) {
                 println!("SN rounded-end dj {0}", pr2.1);
-                assert!(false);
+                panic!();
             }
         }
-        _ => { assert!(false); }
+        _ => { panic!(); }
     }
 }

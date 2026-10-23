@@ -21,23 +21,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -45,21 +45,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -80,7 +77,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
@@ -88,7 +85,7 @@ fn has_grid(data: &str, model: &str, run_dir: &str) -> bool {
     let md = join_path(data, model);
     let rd = join_path(&md, run_dir);
     let probe = join_path(&rd, "grid.bin");
-    return read_bytes(&probe).len() > 0;
+    return !read_bytes(&probe).is_empty();
 }
 
 // TWO models: gfs FIRST, hrrr SECOND (the one that used to be starved).
@@ -97,7 +94,7 @@ fn enqueue(q: WatchQueue, paths: Vec<String>) {
     // scoped so the mutex is RELEASED before the scan round drains the queue
     let lk = q.lock();
     match lk {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut g) => {
             for s in &paths {
                 g.push(s.to_string());
@@ -142,14 +139,13 @@ fn queued_events_reach_every_model_in_the_same_round_not_just_the_first_one() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
     // simulate what a notify watcher would deliver for BOTH products
-    let mut evs: Vec<String> = Vec::<String>::new();
-    evs.push(join_path(&ing_gfs, "gfs_small.grib2").to_string());
-    evs.push(hrr_path.to_string());
+    let evs: Vec<String> = vec![join_path(&ing_gfs, "gfs_small.grib2").to_string(),
+                                hrr_path.to_string()];
     enqueue(p.queue.clone(), evs.clone());
 
     // round 1: both paths observed (stability window opens), nothing ingested yet

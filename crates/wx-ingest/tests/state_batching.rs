@@ -33,7 +33,7 @@ use std::fs::read_to_string;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -54,12 +54,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -80,15 +80,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -136,7 +133,7 @@ fn state_saves_are_per_chunk_not_per_file_and_failures_retry() {
     // ---- boot: rebuild_from_disk offers saves but NOTHING is dirty ---------
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(e) => { println!("open failed: {e}"); assert!(false); return; }
+        Err(e) => { println!("open failed: {e}"); panic!(); }
         Ok(pp) => { pp }
     };
     assert!(state_counters_snapshot().0 - w0 == 0);
@@ -164,11 +161,11 @@ fn state_saves_are_per_chunk_not_per_file_and_failures_retry() {
     let jpath = join_path(&join_path(&data, "state"), "files.json");
     let txt = read_to_string(&jpath);
     match txt {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t0) => {
             let dr = deserialize_text(&t0);
             match dr {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(doc) => { assert!(doc.recs.len() == 4); }
             }
         }
@@ -178,10 +175,7 @@ fn state_saves_are_per_chunk_not_per_file_and_failures_retry() {
     write_bytes(&join_path(&ing, "e.grib2"), &src[..]);
     let st_dir = join_path(&data, "state");
     let pm = set_permissions(&st_dir, PermissionsExt::from_mode(0o000));
-    match pm {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pm.is_err() { panic!(); }
     // observe e (no upsert yet: still zero saves), then consume it: the
     // chunk-end AND round-end attempts both fail loudly, ingestion proceeds.
     assert!(p.scan_round() == 0);
@@ -196,19 +190,16 @@ fn state_saves_are_per_chunk_not_per_file_and_failures_retry() {
     // writable again: the NEXT round-end save flushes the same records —
     // nothing was lost, the store simply stayed dirty meanwhile.
     let pr2 = set_permissions(&st_dir, PermissionsExt::from_mode(0o755));
-    match pr2 {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if pr2.is_err() { panic!(); }
     assert!(p.scan_round() == 0);
     assert!(!p.state.dirty);
     let txt2 = read_to_string(&jpath);
     match txt2 {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t1) => {
             let dr2 = deserialize_text(&t1);
             match dr2 {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(doc2) => { assert!(doc2.recs.len() == 5); }
             }
         }

@@ -19,7 +19,7 @@ use wx_core::tables::{fmt_num};
 use wx_core::storage::{stat_kind_name};
 use wx_core::grid::{GridDef};
 use crate::stats::{mono_ns, QueryStats};
-use crate::queryapi::{parse_query, lookup_entries, new_entries, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
+use crate::queryapi::{parse_query, normalize_qs, lookup_entries, new_entries, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
 use crate::timeparse::{format_iso_z};
 
 // ---------------------------------------------------------------------------
@@ -72,7 +72,14 @@ pub async fn point_handler(st: State<ServerState>, req: Request) -> Response {
             return json_error(400, "missing_required".to_string(), "no query parameters".to_string());
         }
         Some(qs) => {
-            let pa_r = parse_query(qs);
+            // V1.3 phase E6: targeted %-decode of `%3A`/`%2C` inside ONLY the
+            // level/param values before parsing (queryapi header documents the
+            // full rule; canonical colon-form requests take the zero-copy
+            // Borrowed path and pay nothing but one cheap scan). nq MUST
+            // outlive pa — both live to the end of this arm, and the response
+            // body is fully built here, so the borrows are sound.
+            let nq = normalize_qs(qs);
+            let pa_r = parse_query(nq.as_ref());
             match pa_r {
                 Err(pf) => {
                     st.stats.record_status(400);

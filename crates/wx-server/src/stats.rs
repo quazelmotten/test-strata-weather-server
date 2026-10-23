@@ -1,6 +1,10 @@
 //! /metrics counters (spec §7): query latency histogram (manual µs buckets +
-//! atomics, no heavy dependency), per-status-class query counts, ingest lag
-//! and ingest error count. Latency is measured from request entry to response
+//! atomics, no heavy dependency), per-status-class query counts, DATA AGE
+//! (`wxpoint_data_age_seconds`, renamed from `wxpoint_ingest_lag_seconds` in
+//! V1.3 phase E6 — it is NOW minus newest mtime, not a latency), the TRUE
+//! publish-latency pair (`wxpoint_ingest_publish_latency_seconds` / `_max`,
+//! fed by the attached pipeline at each per-file publish) and the ingest
+//! error count. Latency is measured from request entry to response
 //! start using CLOCK_MONOTONIC via libc (this toolchain's `Instant` has no
 //! absolute-time form, so epoch-ns mtimes need CLOCK_REALTIME). Since V1.2
 //! phase B the exposition also carries `wxpoint_ignored_files_total`,
@@ -288,7 +292,11 @@ impl QueryStats {
         out = format!("{0}{1}", out, stc.0);
         out = format!("{0}{1}", out, "\nwxpoint_state_bytes_written ");
         out = format!("{0}{1}", out, stc.1);
-        // ingest lag: file mtime -> now, seconds (mtime is epoch ns).
+        // DATA AGE (renamed from wxpoint_ingest_lag_seconds in V1.3 phase E6):
+        // now - newest ingested file mtime, seconds (mtime is epoch ns). This
+        // answers "how stale is my freshest data", NOT "how long did publishing
+        // take" - the latter is the latency pair rendered right below. The old
+        // name misled operators (audit P3); the formula itself is unchanged.
         let mtime = self.last_mtime_ns.load(Ordering::Relaxed);
         let mt2 = lv.last_mtime_ns.load(Ordering::Relaxed);
         let mut mtime_f = mtime;
@@ -303,8 +311,19 @@ impl QueryStats {
                 lag = 0.0;
             }
         }
-        out = format!("{0}{1}", out, "\nwxpoint_ingest_lag_seconds ");
+        out = format!("{0}{1}", out, "\nwxpoint_data_age_seconds ");
         out = format!("{0}{1}", out, lag);
+        // TRUE ingest/publish latency (spec §7 "file mtime -> queryable"):
+        // written by the pipeline at each per-file publish completion
+        // (LiveCounters::note_publish_latency). LAST file + lifetime MAX.
+        // A Stats instance with NO attached pipeline legitimately renders 0
+        // here (no publishes happened in-process); document in README §5.
+        let pl_last = lv.publish_latency_last_ns.load(Ordering::Relaxed);
+        let pl_max = lv.publish_latency_max_ns.load(Ordering::Relaxed);
+        out = format!("{0}{1}", out, "\nwxpoint_ingest_publish_latency_seconds ");
+        out = format!("{0}{1}", out, (pl_last as f64) / 1000000000.0);
+        out = format!("{0}{1}", out, "\nwxpoint_ingest_publish_latency_seconds_max ");
+        out = format!("{0}{1}", out, (pl_max as f64) / 1000000000.0);
         // cumulative histogram
         let cnt = self.qcount.load(Ordering::Relaxed);
         let mut cum = 0;

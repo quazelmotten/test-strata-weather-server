@@ -26,7 +26,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -47,12 +47,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -73,15 +73,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -114,18 +111,18 @@ fn mg_cfg(data: &str, ing: &str) -> String {
 #[test]
 fn deleting_grid_bin_makes_the_run_loudly_invisible_not_silent() {
     let root = "/tmp/opencode/wxpoint-missgrid";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     write_bytes(&join_path(&ing, "gfs_small.grib2"), &read_bytes("../../tests/fixtures/gfs_small.grib2"));
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, mg_cfg(&data, &ing).as_bytes());
 
     // ingest fully with a healthy pipeline...
     let p0_r = Pipeline::open(&cfg_path);
     let mut p0 = match p0_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p0.scan_round() == 0);
@@ -137,31 +134,25 @@ fn deleting_grid_bin_makes_the_run_loudly_invisible_not_silent() {
     // ...then simulate the orphan: delete ONLY grid.bin.
     let gp = format!("{0}/gfs/2026101912/grid.bin", data);
     let rf = remove_file(&gp);
-    match rf {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if rf.is_err() { panic!(); }
 
     // RESTART: the rebuild must be LOUD and COUNTED, and the run must not
     // index (pre-E3b: silent note-free nothing, errors stayed 0).
     let p1_r = Pipeline::open(&cfg_path);
     let p1 = match p1_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(count_notes(&p1, "MISSING GRID") == 1);
     assert!(p1.counters.errors == 1);
     // the orphan is NOT deleted on purpose (source may re-deliver)...
-    let dir_still_there = read_dir(&format!("{0}/gfs/2026101912", data));
-    match dir_still_there {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    let dir_still_there = read_dir(format!("{0}/gfs/2026101912", data));
+    if dir_still_there.is_err() { panic!(); }
     // ...and it stays OUT of the registry/inventory while grid.bin is absent
     // (a model earns its registry entry only by having an INDEXED run, so the
     // orphaned model drops out entirely once its sole run goes invisible).
-    assert!(p1.registry.len() == 0);
-    rm_tree(&root);
+    assert!(p1.registry.is_empty());
+    rm_tree(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -171,17 +162,17 @@ fn deleting_grid_bin_makes_the_run_loudly_invisible_not_silent() {
 #[test]
 fn skeleton_run_is_noted_once_and_sibling_run_indexes_fine() {
     let root = "/tmp/opencode/wxpoint-missgrid2";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     write_bytes(&join_path(&ing, "gfs_small.grib2"), &read_bytes("../../tests/fixtures/gfs_small.grib2"));
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, mg_cfg(&data, &ing).as_bytes());
 
     let p0_r = Pipeline::open(&cfg_path);
     let mut p0 = match p0_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p0.scan_round() == 0);
@@ -194,26 +185,25 @@ fn skeleton_run_is_noted_once_and_sibling_run_indexes_fine() {
 
     let p1_r = Pipeline::open(&cfg_path);
     let p1 = match p1_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // exactly ONE MISSING GRID note, naming the SKELETON only...
     assert!(count_notes(&p1, "MISSING GRID") == 1);
-    let named_skel = match &p1.log {
-        l => {
-            let mut found = false;
-            for line in l {
-                if line.contains("MISSING GRID") && line.contains("2026101913") {
-                    found = true;
-                }
+    let named_skel = {
+        let l = &p1.log;
+        let mut found = false;
+        for line in l {
+            if line.contains("MISSING GRID") && line.contains("2026101913") {
+                found = true;
             }
-            found
         }
+        found
     };
     assert!(named_skel);
     assert!(p1.counters.errors == 1);
     // ...while the HEALTHY sibling run rebuilds and indexes as always.
     assert!(p1.registry[0].runs.len() == 1);
-    assert!(p1.registry[0].runs[0].dir_name == "2026101912".to_string());
-    rm_tree(&root);
+    assert!(p1.registry[0].runs[0].dir_name == "2026101912");
+    rm_tree(root);
 }

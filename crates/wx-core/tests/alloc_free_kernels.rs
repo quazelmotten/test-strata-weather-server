@@ -10,7 +10,7 @@ use wx_core::interp::{resolve_levels, resolve_levels_f32, LEVEL_MATCH_EPS};
 
 /// Deterministic LCG so the sweep is reproducible.
 fn lcg(state: usize) -> usize {
-    return state.wrapping_mul(6364136223846793005usize).wrapping_add(1442695072203450757usize);
+    state.wrapping_mul(6364136223846793005usize).wrapping_add(1442695072203450757usize)
 }
 
 #[test]
@@ -37,8 +37,8 @@ fn f32_level_resolution_is_bit_identical_to_f64_twin() {
         let mut vec64: Vec<f64> = Vec::<f64>::new();
         let mut kk = 0;
         while kk < nl {
-            let _a = vec32.push(lv32[kk]);
-            let _b = vec64.push(lv32[kk] as f64);
+            vec32.push(lv32[kk]);
+            vec64.push(lv32[kk] as f64);
             kk += 1;
         }
         // wants: stored levels, midpoints, eps-offsets, far outside, dup handling

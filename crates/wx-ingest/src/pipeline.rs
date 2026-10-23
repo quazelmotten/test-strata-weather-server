@@ -328,6 +328,18 @@ pub struct LiveCounters {
     pub skip_grid: AtomicU64,
     pub skip_pdt: AtomicU64,
     pub last_mtime_ns: AtomicI64,
+    /// V1.3 phase E6 TRUE publish-latency gauge INPUT (spec §7 "ingest lag
+    /// (file mtime -> queryable)"): nanoseconds from a source file's mtime to
+    /// the instant its data became queryable (per-file publish completed),
+    /// LAST successfully published file. Wall clock on BOTH sides
+    /// (`epoch_now_ns` minus the stat mtime), so no monotonic/wall joining is
+    /// involved and an NTP step can only ever make the clamp (>= 0) fire.
+    /// The old `wxpoint_ingest_lag_seconds` (now `wxpoint_data_age_seconds`)
+    /// never measured this span — see docs/DECISIONS.md phase E6.
+    pub publish_latency_last_ns: AtomicI64,
+    /// Lifetime MAXIMUM of the same quantity (`note_publish_latency` keeps
+    /// both last and max; rendered as `..._seconds_max`).
+    pub publish_latency_max_ns: AtomicI64,
     /// Bumped once per consumed file; the printer side compares it against the
     /// last value it saw to decide whether a fresh progress line exists.
     pub progress_seq: AtomicU64,
@@ -363,6 +375,8 @@ impl LiveCounters {
             skip_grid: AtomicU64::new(0),
             skip_pdt: AtomicU64::new(0),
             last_mtime_ns: AtomicI64::new(0),
+            publish_latency_last_ns: AtomicI64::new(0),
+            publish_latency_max_ns: AtomicI64::new(0),
             progress_seq: AtomicU64::new(0),
             last_msg: Mutex::<String>::new("".to_string()),
             progress_queue: Mutex::<Vec<String>>::new(Vec::<String>::new()),
@@ -401,6 +415,28 @@ impl LiveCounters {
         let cur = self.last_mtime_ns.load(Ordering::Relaxed);
         if ns > cur {
             self.last_mtime_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// V1.3 phase E6: record the TRUE publish latency of one successfully
+    /// published file — wall-clock now MINUS the file's own mtime, both read
+    /// from the same realtime clock (mtime arrives via `stat_size_mtime`, also
+    /// CLOCK_REALTIME-based), which is why no monotonic-clock joining is
+    /// attempted: the simplest form IS monotonic-safe here, and a backwards
+    /// NTP step can only drive the value to the 0 clamp, never negative.
+    /// Called by the consume loop immediately after `ingest_file` returns with
+    /// zero failed groups — i.e. right after that file's per-file `publish()`
+    /// made its bytes queryable. Keeps LAST and lifetime MAX (relaxed: single
+    /// writer, readers are telemetry only).
+    pub fn note_publish_latency(self: &Self, mtime_ns: i64) {
+        let now = epoch_now_ns();
+        let mut d = now - mtime_ns;
+        if d < 0 {
+            d = 0;
+        }
+        self.publish_latency_last_ns.store(d, Ordering::Relaxed);
+        if d > self.publish_latency_max_ns.load(Ordering::Relaxed) {
+            self.publish_latency_max_ns.store(d, Ordering::Relaxed);
         }
     }
 
@@ -685,6 +721,19 @@ fn hint_epoch_at(bn: &str, start: usize) -> Option<i64> {
                 }
             }
         }
+    }
+}
+
+/// Wall-clock nanoseconds since the Unix epoch (CLOCK_REALTIME), the SAME time
+/// base `state::stat_size_mtime` reports file mtimes in. Kept next to the
+/// pipeline because `LiveCounters::note_publish_latency` is its only product
+/// consumer (V1.3 phase E6 gauge work); std::time avoids pulling another raw
+/// libc binding into this module.
+pub fn epoch_now_ns() -> i64 {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    match d {
+        Err(_e) => { return 0; }
+        Ok(v) => { return v.as_nanos() as i64; }
     }
 }
 
@@ -1829,6 +1878,9 @@ impl Pipeline {
                                     ingested += 1;
                                     self.live.add(0, 1, 0, 0, 0, out.groups as u64);
                                     self.live.note_mtime(rd.2);
+                                    // V1.3 phase E6: publish completed inside
+                                    // ingest_file; measure mtime -> queryable NOW.
+                                    self.live.note_publish_latency(rd.2);
                                     self.progress(format!("ingested {0}: {1} groups, {2} bytes, {3} ms",
                                         rd.0, out.groups, out.bytes_written, out.ms));
                                 }

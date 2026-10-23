@@ -15,25 +15,22 @@ use std::env::current_dir;
 
 #[allow(clippy::needless_return)]
 fn one_model_cfg(data: String, ing: String) -> PointConfig {
-    let mut lv = Vec::<String>::new();
-    lv.push("isobaric:*".to_string());
-    let mut ps = Vec::<ParamCfg>::new();
-    ps.push(ParamCfg {
+    let lv = vec!["isobaric:*".to_string()];
+    let ps = vec![ParamCfg {
         name: Some("TMP".to_string()),
         discipline: None,
         category: None,
         number: None,
         levels: lv,
         units: None,
-    });
-    let mut ms = Vec::<ModelCfg>::new();
-    ms.push(ModelCfg {
+    }];
+    let ms = vec![ModelCfg {
         name: "gfs".to_string(),
         ingest_dir: ing.to_string(),
         file_glob: "gfs_*.grib2".to_string(),
         sidecar_suffix: None,
         params: ps,
-    });
+    }];
     return PointConfig {
         server: ServerCfg { bind: "127.0.0.1:8080".to_string(), data_dir: data.to_string() },
         ingest: IngestCfg {
@@ -59,7 +56,7 @@ fn identical_data_dir_and_ingest_dir_is_rejected_naming_both_paths() {
             assert!(e.contains("/tmp/opencode/wxpoint-cfg-over/same"));
             assert!(e.contains("gfs"));
         }
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!();}
     }
 }
 
@@ -76,7 +73,7 @@ fn data_dir_nested_inside_an_ingest_dir_is_rejected() {
             assert!(e.contains(&data));
             assert!(e.contains(&ing));
         }
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!();}
     }
 }
 
@@ -90,7 +87,7 @@ fn ingest_dir_nested_inside_the_data_dir_is_rejected() {
             assert!(e.contains("OVERLAP"));
             assert!(e.contains("contains"));
         }
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!();}
     }
 }
 
@@ -100,20 +97,20 @@ fn relative_and_absolute_spellings_of_one_directory_still_collide() {
     // CWD: `./x/data` and `<cwd>/x/data` are the SAME directory and must be caught.
     let cwd_r = current_dir();
     match cwd_r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(cwd) => {
             let abs = format!("{0}/wxpoint-cfg-rel/data", cwd.to_string_lossy());
             let cfg = one_model_cfg("./wxpoint-cfg-rel/data".to_string(), abs.to_string());
             match validate_config(&cfg) {
                 Err(e) => { assert!(e.contains("OVERLAP")); }
-                Ok(_) => { assert!(false); return; }
+                Ok(_) => { panic!(); }
             }
             // and a `..` component that walks back into the other tree collides too
             let up = format!("{0}/wxpoint-cfg-rel/x/../data", cwd.to_string_lossy());
             let cfg2 = one_model_cfg("./wxpoint-cfg-rel/data".to_string(), up.to_string());
             match validate_config(&cfg2) {
                 Err(e) => { assert!(e.contains("OVERLAP")); }
-                Ok(_) => { assert!(false); return; }
+                Ok(_) => { panic!();}
             }
         }
     }
@@ -128,8 +125,7 @@ fn sibling_directories_that_merely_share_a_name_prefix_are_accepted() {
     match validate_config(&cfg) {
         Err(e) => {
             assert!(!e.contains("OVERLAP"));
-            assert!(false);
-            return;
+            panic!();
         }
         Ok(ms) => {
             assert!(ms.len() == 1);

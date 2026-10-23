@@ -39,24 +39,18 @@ const HNX: usize = 61;
 const HNY: usize = 41;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn f_is_nan(x: f32) -> bool {
-    return x != x;
+    x.is_nan()
 }
 
 /// Twin suffixes exercised on both model fixtures.
 fn tags() -> Vec<String> {
-    let mut v: Vec<String> = Vec::<String>::new();
-    v.push("c2".to_string());
-    v.push("c3".to_string());
-    v.push("jpeg".to_string());
-    v.push("png".to_string());
-    v.push("png_f".to_string());
-    v.push("aec".to_string());
-    v.push("ieee".to_string());
-    return v;
+    vec!["c2".to_string(), "c3".to_string(), "jpeg".to_string(),
+         "png".to_string(), "png_f".to_string(), "aec".to_string(),
+         "ieee".to_string()]
 }
 
 // ---------------------------------------------------------------------------
@@ -68,11 +62,10 @@ fn msgs_or_fail(name: &str) -> Vec<DecodedMessage> {
     match r {
         Err(e) => {
             println!("decode failed for {0}: {1:?}", name, e);
-            assert!(false);
-            return Vec::<DecodedMessage>::new();
+            panic!();
         }
         Ok((msgs, _st)) => {
-            return msgs;
+            msgs
         }
     }
 }
@@ -118,19 +111,19 @@ fn compare_vs_base(base: &[DecodedMessage], twin: &[DecodedMessage]) {
 
 /// Slurp a fixture into memory (mmap + copy, the pattern used across this suite).
 fn read_all(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_e) => { return Vec::<u8>::new(); }
+        Err(_e) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_e) => { return Vec::<u8>::new(); }
+                Err(_e) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -170,12 +163,12 @@ fn sec_pairs(bytes: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
             }
             q += ln;
         }
-        if s5.len() >= 6 && s7.len() > 0 {
+        if s5.len() >= 6 && !s7.is_empty() {
             out.push((s5, s7));
         }
         p += msglen;
     }
-    return out;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -225,12 +218,12 @@ fn masked_points_are_nan_for_every_codec() {
 
 fn missing_idx(d: &[f32]) -> Vec<usize> {
     let mut v: Vec<usize> = Vec::<usize>::new();
-    for k in 0 .. d.len() {
-        if f_is_nan(d[k]) {
+    for (k, dv) in d.iter().enumerate() {
+        if f_is_nan(*dv) {
             v.push(k);
         }
     }
-    return v;
+    v
 }
 
 #[test]
@@ -287,7 +280,7 @@ fn point_probes_reproduce_on_every_hrrr_twin() {
         for c in &CHECKS {
             let p = g.project(c[1], c[0]);
             match p {
-                None => { assert!(false); }
+                None => { panic!(); }
                 Some((di, dj)) => {
                     assert!(abs_diff(di + 1.0, c[2]) <= 1e-4);
                     assert!(abs_diff((HNY as f64) - dj, c[3]) <= 1e-4);
@@ -305,7 +298,7 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +310,7 @@ fn abs_diff(a: f64, b: f64) -> f64 {
 fn skip_unpack_counters_hold_for_compressed_twins() {
     let idx = lookup_param_index("TMP");
     match idx {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(ti) => {
             let e = &PARAM_TABLE[ti];
             let mut one: Vec<(u8, u8, u8)> = Vec::<(u8, u8, u8)>::new();
@@ -328,7 +321,7 @@ fn skip_unpack_counters_hold_for_compressed_twins() {
                 match r {
                     Err(_er) => {
                         println!("filtered decode failed for twin {0}", t);
-                        assert!(false);
+                        panic!();
                     }
                     Ok((_msgs, st)) => {
                         assert!(st.messages_total == 39);
@@ -351,14 +344,14 @@ fn skip_unpack_counters_hold_for_compressed_twins() {
 #[test]
 fn png_twin_filter_coverage() {
     let plain = read_all(&fixture_path("gfs_small_png.grib2"));
-    assert!(plain.len() > 0);
+    assert!(!plain.is_empty());
     let pairs = sec_pairs(&plain[..]);
     assert!(pairs.len() == 39);
     for pr in &pairs {
         assert!(be_u16(&pr.0[..], 4) == 41);
         let fr = png_filter_types(&pr.1[..]);
         match fr {
-            Err(_e) => { assert!(false); }
+            Err(_e) => { panic!(); }
             Ok(fs) => {
                 assert!(fs.len() >= 2);
                 for f in &fs {
@@ -369,7 +362,7 @@ fn png_twin_filter_coverage() {
     }
 
     let cyc = read_all(&fixture_path("gfs_small_png_f.grib2"));
-    assert!(cyc.len() > 0);
+    assert!(!cyc.is_empty());
     let pairs2 = sec_pairs(&cyc[..]);
     assert!(pairs2.len() == 39);
     let mut seen: [bool; 5] = [false, false, false, false, false];
@@ -377,21 +370,21 @@ fn png_twin_filter_coverage() {
         assert!(be_u16(&pr.0[..], 4) == 41);
         let fr = png_filter_types(&pr.1[..]);
         match fr {
-            Err(_e) => { assert!(false); }
+            Err(_e) => { panic!(); }
             Ok(fs) => {
                 assert!(fs.len() >= 2);
                 for f in &fs {
                     if *f < 5 {
                         seen[*f as usize] = true;
                     } else {
-                        assert!(false);
+                        panic!();
                     }
                 }
             }
         }
     }
-    for k in 0 .. 5 {
-        assert!(seen[k]);
+    for s in seen.iter() {
+        assert!(*s);
     }
 }
 
@@ -404,13 +397,13 @@ fn png_twin_filter_coverage() {
 fn dictionary_packing_rejected_with_typed_error() {
     let r = decode_file(fixture_path("unsupported_drt.grib2"), ParamFilter::All);
     match r {
-        Ok((_m, _s)) => { assert!(false); }
+        Ok((_m, _s)) => { panic!(); }
         Err(e) => {
             match e {
                 GribErr::UnsupportedData(tmpl) => { assert!(tmpl == 1); }
                 _ => {
                     println!("unexpected error kind for dictionary packing");
-                    assert!(false);
+                    panic!();
                 }
             }
         }

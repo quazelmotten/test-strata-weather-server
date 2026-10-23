@@ -9,14 +9,14 @@ use wx_core::tables::lookup_param_index;
 use wx_core::tables::PARAM_TABLE;
 
 fn f_is_nan(x: f32) -> bool {
-    return x != x;
+    x.is_nan()
 }
 
 const NX: usize = 41;
 const NY: usize = 21;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 // Analytic field formula from scripts/gen_grib2.py:
@@ -28,14 +28,14 @@ fn expect_val(p: usize, level: f64, fh_hours: i64, j: usize, i: usize) -> f32 {
         else if level == 700.0 { 200 }
         else if level == 2.0 { 300 }
         else { 400 };
-    return (250.0 + (base_i + lv_i + fh_hours * 10 + (j * 4) as i64 + (i as i64)) as f64) as f32;
+    (250.0 + (base_i + lv_i + fh_hours * 10 + (j * 4) as i64 + (i as i64)) as f64) as f32
 }
 
 #[test]
 fn gfs_inventory_order() {
     let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, st)) => {
             assert!(msgs.len() == 39);
             assert!(st.messages_total == 39);
@@ -50,7 +50,7 @@ fn gfs_inventory_order() {
                     for f in 0 .. 3 {
                         let m = &msgs[k];
                         match m.param_name {
-                            None => { assert!(false); }
+                            None => { panic!(); }
                             Some(s) => {
                                 if p == 0 {
                                     assert!(s == "TMP");
@@ -82,7 +82,7 @@ fn gfs_inventory_order() {
 fn gfs_analytic_values() {
     let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             let mut idx = 0;
             for p in 0 .. 3 {
@@ -96,7 +96,7 @@ fn gfs_analytic_values() {
                         for j in 0 .. NY {
                             for i in 0 .. NX {
                                 let k = j * NX + i;
-                                let masked = (k % 97) == 0 && p == 0 && level == 850.0 && fh == 6;
+                                let masked = k.is_multiple_of(97) && p == 0 && level == 850.0 && fh == 6;
                                 if masked {
                                     assert!(f_is_nan(m.data[k]));
                                 } else {
@@ -119,7 +119,7 @@ fn gfs_wgrib2_point_checks() {
     // straight from expected.json point_checks for gfs_small.grib2.
     let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             // lon/lat -> grid node: i = ((lon-350+360)%360)/0.5, j=(10-lat)/0.5
             let checks: [[f64; 4]; 12] = [
@@ -171,10 +171,10 @@ fn gfs_c3_twin_matches_simple() {
     let a = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     let b = decode_file(fixture_path("gfs_small_c3.grib2"), ParamFilter::All);
     match a {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((ma, _sa)) => {
             match b {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok((mb, _sb)) => {
                     assert!(ma.len() == mb.len());
                     for x in 0 .. ma.len() {
@@ -203,14 +203,13 @@ fn skip_unpack_counters() {
     // WITHOUT section-7 decoding. Filter = TMP only.
     let idx = lookup_param_index("TMP");
     match idx {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(ti) => {
             let e = &PARAM_TABLE[ti];
-            let mut one: Vec<(u8, u8, u8)> = Vec::<(u8, u8, u8)>::new();
-            one.push((e.discipline, e.category, e.number));
+            let one: Vec<(u8, u8, u8)> = vec![(e.discipline, e.category, e.number)];
             let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::Only(one));
             match r {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok((_msgs, st)) => {
                     assert!(st.messages_total == 39);
                     assert!(st.messages_decoded == 15);

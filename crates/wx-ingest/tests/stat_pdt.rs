@@ -14,14 +14,14 @@ const SNX: usize = 11;
 const SNY: usize = 7;
 
 fn spath(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 #[test]
 fn stat_small_messages() {
     let r = decode_file(spath("stat_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, st)) => {
             assert!(msgs.len() == 3);
             assert!(st.messages_total == 3);
@@ -29,7 +29,7 @@ fn stat_small_messages() {
             let m0 = &msgs[0];
             match m0.param_name {
                 Some(s) => { assert!(s == "APCP"); }
-                None => { assert!(false); }
+                None => { panic!(); }
             }
             assert!(m0.levels.len() == 1);
             assert!(m0.levels[0].0 == 1);
@@ -43,7 +43,7 @@ fn stat_small_messages() {
             let m1 = &msgs[1];
             match m1.param_name {
                 Some(s) => { assert!(s == "APCP"); }
-                None => { assert!(false); }
+                None => { panic!(); }
             }
             assert!(m1.stat.kind == StatKind::Accumulation);
             assert!(m1.fc_secs == 6 * 3600);
@@ -53,7 +53,7 @@ fn stat_small_messages() {
             let m2 = &msgs[2];
             match m2.param_name {
                 Some(s) => { assert!(s == "TMP"); }
-                None => { assert!(false); }
+                None => { panic!(); }
             }
             assert!(m2.levels[0].0 == 103);
             assert!(m2.levels[0].1 == 2.0);
@@ -65,7 +65,7 @@ fn stat_small_messages() {
             // instantaneous guard: gfs messages must be Instantaneous
             let g = decode_file(spath("gfs_small.grib2"), ParamFilter::All);
             match g {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok((gm, _gs)) => {
                     for m in &gm {
                         assert!(m.stat.kind == StatKind::Instantaneous);
@@ -82,7 +82,7 @@ fn stat_point_checks() {
     // values: APCP base 10 + j*SNX + i; TMP base 250 + j*SNX + i (expected.json).
     let r = decode_file(spath("stat_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             assert!(msgs[0].data.len() == SNX * SNY);
             let checks: [[f64; 4]; 9] = [
@@ -114,11 +114,11 @@ fn jpeg_twin_keeps_pdt48_metadata_and_values() {
     // jpeg (DRT 5.40); decoded metadata and values must be unchanged.
     let a = decode_file(spath("stat_small.grib2"), ParamFilter::All);
     match a {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((ma, _sa)) => {
             let b = decode_file(spath("stat_small_jpeg.grib2"), ParamFilter::All);
             match b {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok((mb, sb)) => {
                     assert!(mb.len() == 3);
                     assert!(sb.messages_total == 3);

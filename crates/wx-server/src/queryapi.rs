@@ -14,10 +14,124 @@
 //! Response body construction (render_point_json/render_entry/make_response)
 //! allocates freely, which the spec allows and the measurement boundary excludes.
 
+use std::borrow::Cow;
 use crate::timeparse::{parse_iso_z};
 use wx_ingest::index::{IndexSnapshot, build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode, HorizMethod, PointError, InterpInfo, LevelInterpMethod};
 use wx_core::tables::{parse_level_str, format_level_str, parse_f64, fmt_num};
+
+// ---------------------------------------------------------------------------
+// V1.3 phase E6 TARGETED PERCENT-DECODE (follow-up to docs/DECISIONS.md §18.6,
+// which recorded that the server historically read the RAW query string and
+// therefore saw `%3A` as three literal bytes). The contract stays raw-first —
+// the canonical wire form remains BARE colons/commas (curl style) — but the
+// two escapes clients most often emit ARE now accepted, and ONLY these, and
+// ONLY inside the VALUES of `param` and `level`:
+//   %3A / %3a -> ':'      %2C / %2c -> ','
+// Everything else passes through BYTE-FOR-BYTE: '+' never becomes a space
+// (no plus-decoding rule anywhere), unknown or malformed `%` sequences (%zz,
+// trailing %, stray %) stay verbatim, and every other key's value (model,
+// valid, run, lat, lon, time_interp) is never touched. Because decode runs
+// BEFORE parse_query, `%2C` splits param tokens EXACTLY like a bare comma and
+// `%3A` feeds parse_level_str exactly like a real colon: encoded and bare
+// requests produce byte-identical responses (pinned by tests/point_http.rs).
+// HOT-PATH RULE (§5): when the query contains no '%' AT ALL — every curl-
+// style request — the original borrow is returned and NOTHING allocates; an
+// owned rewrite happens only when a targeted escape actually appears inside
+// one of those two values. This lives here rather than as ParsedArgs storage
+// surgery because Cow-ing the whole borrow chain would ripple through
+// FailInfo/'r lifetimes on the zero-alloc hot path for a cold-path nicety.
+// ---------------------------------------------------------------------------
+
+/// True if a targeted escape starts at byte index `i` (bounds-safe).
+fn is_target_escape(b: &[u8], i: usize) -> bool {
+    if b[i] != b'%' || i + 2 >= b.len() {
+        return false;
+    }
+    let h1 = b[i + 1];
+    let h2 = b[i + 2];
+    return (h1 == b'3' && (h2 == b'A' || h2 == b'a'))
+        || (h1 == b'2' && (h2 == b'C' || h2 == b'c'));
+}
+
+/// Does a targeted escape occur anywhere in this value?
+fn has_target(val: &str) -> bool {
+    let b = val.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if is_target_escape(b, i) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Decode ONE value: replace exactly %3A/%3a -> ':' and %2C/%2c -> ',',
+/// copying every other byte verbatim (unknown/malformed %-sequences ride
+/// along untouched). Returns Borrowed when nothing matched.
+fn decode_targeted(val: &str) -> Cow<'_, str> {
+    if !has_target(val) {
+        return Cow::Borrowed(val);
+    }
+    let b = val.as_bytes();
+    let mut out: Vec<u8> = Vec::<u8>::with_capacity(val.len());
+    let mut i = 0;
+    while i < b.len() {
+        if is_target_escape(b, i) {
+            let h1 = b[i + 1];
+            out.push(if h1 == b'3' { b':' } else { b',' });
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    // Input was UTF-8 and we inserted ASCII after deleting exact %XX triples,
+    // so the result is UTF-8; from_utf8 can only fail theoretically.
+    match String::from_utf8(out) {
+        Ok(s) => { return Cow::Owned(s); }
+        Err(_e) => { return Cow::Borrowed(val); }
+    }
+}
+
+/// Rewrite `level=` and `param=` VALUES with the targeted decode, leaving all
+/// other bytes (keys, separators, other values) identical. Fast path returns
+/// the original borrow whenever no targeted escape sits in either value.
+pub fn normalize_qs<'q>(qs: &'q str) -> Cow<'q, str> {
+    if qs.find('%').is_none() {
+        return Cow::Borrowed(qs);
+    }
+    let mut changed = false;
+    let mut parts: Vec<String> = Vec::<String>::new();
+    for seg in qs.split('&') {
+        let kv = seg.split_once('=');
+        let dv_opt = match kv {
+            None => { None }
+            Some((k, v)) => {
+                if *k == *"param" || *k == *"level" {
+                    if has_target(v) { Some(decode_targeted(v)) } else { None }
+                } else {
+                    None
+                }
+            }
+        };
+        match dv_opt {
+            Some(dv) => {
+                changed = true;
+                match kv {
+                    Some((k, _v)) => { parts.push(format!("{0}={1}", k, dv)); }
+                    None => {}
+                }
+            }
+            None => { parts.push(seg.to_string()); }
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(qs);
+    }
+    return Cow::Owned(parts.join("&"));
+}
 
 /// Inline capacity for parsed parameter tokens AND per-request result entries
 /// (V1.1 phase 5). 8 covers every realistic multi-param query (spec §7 shows

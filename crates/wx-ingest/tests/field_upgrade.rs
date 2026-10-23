@@ -57,7 +57,7 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -78,27 +78,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -119,7 +116,7 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn exists_any(path: &str) -> bool {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return false; }
         Ok(_) => { return true; }
@@ -131,8 +128,8 @@ fn cfg_text(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 // Bounded settle loop: never pin WHICH round ingests (V1.2 phase B0 rule).
@@ -166,7 +163,7 @@ fn v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source() {
     // ---- life 1: normal ingest ---------------------------------------------
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -187,7 +184,7 @@ fn v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source() {
     // ---- life 2: restart with the CURRENT binary over the OLD data dir ----
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // (a) LOUD log naming the recovery AND the versions found vs current.
@@ -230,16 +227,16 @@ fn v1_field_bin_triggers_loud_recovery_and_the_run_rebuilds_from_source() {
     let snap1 = p2.shared.get_index();
     let sref = &*snap1;
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(iso) => {
             let c_r = build_context(sref, "gfs", None, "TMP", iso,
                                     1000.0, 0.0, TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 10.0, 350.0);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => {
                             assert!(pv.value == 250.0);
                             assert!(pv.info.horizontal == HorizMethod::Exact);

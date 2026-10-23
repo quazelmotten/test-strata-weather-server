@@ -11,7 +11,7 @@
 
 use wx_ingest::store::{merge_write_field, merge_field};
 use wx_core::storage::{open_field, expected_size, counters_snapshot, counters_reset,
-                       StatMeta, STAT_ACCUMULATION};
+                       StatMeta};
 use std::fs::read_dir;
 use std::fs::remove_file;
 use std::fs::remove_dir;
@@ -23,7 +23,7 @@ const PLANE_BYTES: usize = 4 * 3 * 4; // nx*ny f32
 /// Remove a leftover scratch tree so the test is REPEATABLE (the assertions
 /// count renames/levels relative to an EMPTY field file).
 fn wipe(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -51,7 +51,7 @@ fn wipe(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn plane(base: f32) -> Vec<f32> {
@@ -59,7 +59,7 @@ fn plane(base: f32) -> Vec<f32> {
     for k in 0 .. 12 {
         v.push(base + k as f32);
     }
-    return v;
+    v
 }
 
 #[test]
@@ -112,7 +112,7 @@ fn batch_merge_of_k_levels_onto_l_existing_costs_one_write() {
     // exactness: the delta equals the resulting file size, byte for byte
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(field) => {
             assert!(field.header.levels.len() == 4);
             assert!(grew == expected_size(&field.header) as u64);
@@ -121,7 +121,7 @@ fn batch_merge_of_k_levels_onto_l_existing_costs_one_write() {
             assert!(field.header.levels[1] == 925.0);
             assert!(field.header.levels[2] == 850.0);
             // 837.55 stored as f32 rounds to 837.5498...; compare as f32
-            assert!(field.header.levels[3] == 837.55 as f32);
+            assert!(field.header.levels[3] == 837.55_f32);
             // the colliding level was REPLACED (new value wins), not duplicated
             let mut same_new = true;
             let mut same_old = false;

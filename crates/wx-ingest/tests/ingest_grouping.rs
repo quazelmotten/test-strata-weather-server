@@ -33,23 +33,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -57,21 +57,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -92,7 +89,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 /// Accumulator for the store walk.
@@ -107,7 +104,7 @@ pub struct WalkAcc {
 fn walk_store(dir: &str, acc: &mut WalkAcc) {
     let mut subdirs: Vec<String> = Vec::<String>::new();
     let mut local_bins: usize = 0;
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => { return; }
         Ok(it) => {
             for e in it {
@@ -120,7 +117,7 @@ fn walk_store(dir: &str, acc: &mut WalkAcc) {
                                 // a FILE: classify by name, add its size
                                 let nm = base_name(p.to_string());
                                 let sz = match stat_size_mtime(&p) {
-                                    Err(_) => { 0 as u64 }
+                                    Err(_) => { 0_u64 }
                                     Ok(v0) => { v0.0 }
                                 };
                                 acc.bytes += sz;
@@ -153,8 +150,8 @@ fn grouping_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"isobaric:*\", \"height_above_ground:10\"]\n"
 }
 
 #[test]
@@ -174,7 +171,7 @@ fn one_file_writes_groups_once_not_messages() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // stable_window_secs = 0: round 1 OBSERVES, round 2 INGESTS.
@@ -195,12 +192,12 @@ fn one_file_writes_groups_once_not_messages() {
 
     // ---- RENAMES: groups + grid.bin + manifest, NOT messages --------------
     // Pre-B this file cost 36 field renames + 36 manifest renames = 72.
-    assert!(renames == 18 as u64 + 2 as u64);
-    assert!(renames < 39 as u64);
+    assert!(renames == 18_u64 + 2_u64);
+    assert!(renames < 39_u64);
 
     // ---- BYTES: ZERO amplification (each byte of the store written ONCE) --
     assert!(bytes == acc.bytes);
-    assert!(bytes <= (11 as u64) * acc.bytes / (10 as u64));
+    assert!(bytes <= 11_u64 * acc.bytes / 10_u64);
 
     println!("MEASURE renames={0} bytes={1} fsyncs={2} field_files={3} aux={4} bin_dirs={5}", renames, bytes, fsyncs, acc.field_files, acc.aux_writes, acc.bin_dirs);
     // ---- FSYNCS: 1 per field inode + 2 per aux writer + 1 per DISTINCT dir
@@ -214,7 +211,7 @@ fn one_file_writes_groups_once_not_messages() {
     // E3a: a crash loses at most one unfinished chunk's records, which
     // re-ingest idempotently (see restart_midchunk.rs + docs/DECISIONS.md).
     let state_saves: u64 = 1;
-    assert!(fsyncs == 18 as u64 + 2 as u64 + 2 as u64 + 6 as u64 + 2 as u64 * state_saves);
+    assert!(fsyncs == 18_u64 + 2_u64 + 2_u64 + 6_u64 + 2_u64 * state_saves);
 
     // ---- counters + live mirror agree --------------------------------------
     assert!(p.counters.groups_written == 18);
@@ -230,16 +227,16 @@ fn one_file_writes_groups_once_not_messages() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(iso) => {
             let c_r = build_context(sref, "gfs", None, "TMP", iso, 850.0, 21600.0,
                                     TimeInterpMode::Linear);
             match c_r {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 9.0, 351.5);
                     match v {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(pv) => {
                             assert!(pv.value == 421.0);
                             assert!(pv.info.horizontal == HorizMethod::Exact);
@@ -252,7 +249,7 @@ fn one_file_writes_groups_once_not_messages() {
     // UGRD/VGRD pairs were grouped and written independently (regular GFS grid
     // -> components stored as-is, no rotation).
     match sref.find_model("gfs") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs[0].fields.len() == 6);
         }
@@ -262,7 +259,7 @@ fn one_file_writes_groups_once_not_messages() {
 }
 
 fn walk_one(dir: &str) -> WalkAcc {
-    let mut acc = WalkAcc { field_files: 0, aux_writes: 0, bin_dirs: 0, bytes: 0 as u64 };
-    walk_store(&dir, &mut acc);
-    return acc;
+    let mut acc = WalkAcc { field_files: 0, aux_writes: 0, bin_dirs: 0, bytes: 0_u64 };
+    walk_store(dir, &mut acc);
+    acc
 }

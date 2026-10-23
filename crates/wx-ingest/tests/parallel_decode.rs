@@ -6,31 +6,30 @@ use wx_ingest::grib2::decode_file;
 use wx_ingest::grib2::ParamFilter;
 
 fn f_is_nan(x: f32) -> bool {
-    return x != x;
+    x.is_nan()
 }
 
 fn spath(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 #[test]
 fn parallel_matches_sequential() {
-    let mut paths: Vec<String> = Vec::<String>::new();
-    paths.push(spath("gfs_small.grib2"));
-    paths.push(spath("hrrr_small.grib2"));
-    paths.push(spath("stat_small.grib2"));
+    let paths: Vec<String> = vec![spath("gfs_small.grib2"),
+                                  spath("hrrr_small.grib2"),
+                                  spath("stat_small.grib2")];
     let results = decode_files_parallel(paths.clone(), ParamFilter::All);
     assert!(results.len() == 3);
     let want_counts: [usize; 3] = [39, 6, 3];
     for x in 0 .. 3 {
         match &results[x] {
-            Err(_) => { assert!(false); }
+            Err(_) => { panic!(); }
             Ok((msgs, _st)) => {
                 assert!(msgs.len() == want_counts[x]);
                 // cross-check against sequential decode of the same file
                 let seq = decode_file(paths[x].to_string(), ParamFilter::All);
                 match seq {
-                    Err(_) => { assert!(false); }
+                    Err(_) => { panic!(); }
                     Ok((sm, _ss)) => {
                         assert!(sm.len() == msgs.len());
                         for y in 0 .. sm.len() {

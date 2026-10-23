@@ -23,15 +23,12 @@ use std::os::unix::fs::symlink;
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -43,7 +40,7 @@ fn count_containing(hay: &[String], pat: &str) -> usize {
             n += 1;
         }
     }
-    return n;
+    n
 }
 
 #[test]
@@ -55,22 +52,13 @@ fn symlink_to_ancestor_terminates_and_still_finds_every_file() {
     write_bytes(&format!("{0}/a/b/deep.grib2", root), b"y");
     // the killer shape: a link INSIDE the tree pointing at an ANCESTOR...
     let l1 = symlink(format!("{0}/a", root), format!("{0}/a/b/up", root));
-    match l1 {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if l1.is_err() { panic!(); }
     // ...and a link pointing at the tree ROOT (loop through two hops).
-    let l2 = symlink(root.to_string(), format!("{0}/a/selfroot", root));
-    match l2 {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    let l2 = symlink(root, format!("{0}/a/selfroot", root));
+    if l2.is_err() { panic!(); }
     // a symlink straight to a FILE must remain a candidate (old behavior kept).
     let l3 = symlink(format!("{0}/top.grib2", root), format!("{0}/alias.grib2", root));
-    match l3 {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if l3.is_err() { panic!(); }
 
     // Pre-E3b this call NEVER RETURNED. Post-E3b it terminates and finds the
     // three REAL files plus the file-alias (dir-links resolve to visited).
@@ -126,6 +114,6 @@ fn path_cap_stops_the_walk_with_one_loud_note() {
     let full = walk_files_bounded(root, WALK_MAX_PATHS, &mut notes2);
     assert!(full.len() == 10);
     assert!(notes2.is_empty());
-    let _r2 = remove_file(&format!("{0}/f0.grib2", root));
+    let _r2 = remove_file(format!("{0}/f0.grib2", root));
     let _d = remove_dir_all(root);
 }

@@ -34,7 +34,7 @@ fn fixture(name: &str) -> String {
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -55,28 +55,25 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -87,15 +84,12 @@ fn copy_file(src: String, dst: String) {
 
 #[allow(clippy::needless_return)]
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -122,8 +116,8 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
 
 #[allow(clippy::needless_return)]
 fn cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest-gfs");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest-gfs");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
@@ -149,7 +143,7 @@ fn serve_setup(root: String) -> Option<Ctx> {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -167,10 +161,10 @@ fn serve_setup(root: String) -> Option<Ctx> {
     let svc = app.into_service();
     let rt_r = Runtime::new();
     let rt = match rt_r {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(rtx) => { rtx }
     };
-    return Some(Ctx { p: p, svc: svc, rt: rt });
+    return Some(Ctx { p, svc, rt });
 }
 
 async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
@@ -193,10 +187,10 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
     let b = resp.into_body();
     let col = b.collect().await;
     match col {
-        Err(_e) => { return (code, Vec::<u8>::new()); }
+        Err(_e) => { (code, Vec::<u8>::new())}
         Ok(cc) => {
             let bb = cc.to_bytes();
-            return (code, bb.to_vec());
+            (code, bb.to_vec())
         }
     }
 }
@@ -204,34 +198,34 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
 #[test]
 fn the_parser_validates_days_against_the_real_calendar_including_leap_years() {
     // leap years: divisible by 4, except centuries unless divisible by 400
-    assert!(parse_iso_z("2024-02-29T00:00:00Z") != None);
-    assert!(parse_iso_z("2000-02-29T00:00:00Z") != None);
-    assert!(parse_iso_z("2026-02-29T00:00:00Z") == None);
-    assert!(parse_iso_z("2100-02-29T00:00:00Z") == None);
+    assert!(parse_iso_z("2024-02-29T00:00:00Z").is_some());
+    assert!(parse_iso_z("2000-02-29T00:00:00Z").is_some());
+    assert!(parse_iso_z("2026-02-29T00:00:00Z").is_none());
+    assert!(parse_iso_z("2100-02-29T00:00:00Z").is_none());
     // impossible days
-    assert!(parse_iso_z("2026-02-30T00:00:00Z") == None);
-    assert!(parse_iso_z("2026-02-31T00:00:00Z") == None);
-    assert!(parse_iso_z("2026-04-31T00:00:00Z") == None);
-    assert!(parse_iso_z("2026-11-31T00:00:00Z") == None);
-    assert!(parse_iso_z("2026-01-00T00:00:00Z") == None);
-    assert!(parse_iso_z("2026-13-01T00:00:00Z") == None);
+    assert!(parse_iso_z("2026-02-30T00:00:00Z").is_none());
+    assert!(parse_iso_z("2026-02-31T00:00:00Z").is_none());
+    assert!(parse_iso_z("2026-04-31T00:00:00Z").is_none());
+    assert!(parse_iso_z("2026-11-31T00:00:00Z").is_none());
+    assert!(parse_iso_z("2026-01-00T00:00:00Z").is_none());
+    assert!(parse_iso_z("2026-13-01T00:00:00Z").is_none());
     // last valid day of a 31-day month and of February in a leap year
-    assert!(parse_iso_z("2026-12-31T23:59:59Z") != None);
-    assert!(parse_iso_z("2024-02-29T23:59:59Z") != None);
+    assert!(parse_iso_z("2026-12-31T23:59:59Z").is_some());
+    assert!(parse_iso_z("2024-02-29T23:59:59Z").is_some());
 
     // NO SILENT ROLLOVER: Feb 28 + 1 DAY is exactly Mar 1, and the pre-fix
     // behaviour would have made "2026-02-31" equal "2026-03-03".
     let feb28 = match parse_iso_z("2026-02-28T00:00:00Z") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(e) => { e }
     };
     let mar1 = match parse_iso_z("2026-03-01T00:00:00Z") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(e) => { e }
     };
     assert!(mar1 - feb28 == 86400);
     // round trip still exact for every accepted value above
-    assert!(format_iso_z(mar1) == "2026-03-01T00:00:00Z".to_string());
+    assert!(format_iso_z(mar1) == "2026-03-01T00:00:00Z");
 }
 
 #[test]
@@ -239,7 +233,7 @@ fn an_impossible_date_answers_400_bad_time_instead_of_answering_wrong_data() {
     let root = "/tmp/opencode/wxpoint-dates".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;

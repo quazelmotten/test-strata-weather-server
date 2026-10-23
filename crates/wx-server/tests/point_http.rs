@@ -32,7 +32,7 @@ fn fixture(name: &str) -> String {
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -53,28 +53,25 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -85,15 +82,12 @@ fn copy_file(src: String, dst: String) {
 
 #[allow(clippy::needless_return)]
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -127,10 +121,10 @@ fn has(body: &[u8], pat: &str) -> bool {
 // exercised end-to-end through the server too).
 #[allow(clippy::needless_return)]
 fn cfg_text(root: &str) -> String {
-    let ing_gfs = join_path(&root, "ingest-gfs");
-    let ing_hrr = join_path(&root, "ingest-hrrr");
-    let ing_stat = join_path(&root, "ingest-stat");
-    let data = join_path(&root, "data");
+    let ing_gfs = join_path(root, "ingest-gfs");
+    let ing_hrr = join_path(root, "ingest-hrrr");
+    let ing_stat = join_path(root, "ingest-stat");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\ningest_threads = 2\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
@@ -169,7 +163,7 @@ fn serve_setup(root: String) -> Option<Ctx> {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -187,10 +181,10 @@ fn serve_setup(root: String) -> Option<Ctx> {
     let svc = app.into_service();
     let rt_r = Runtime::new();
     let rt = match rt_r {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(rtx) => { rtx }
     };
-    return Some(Ctx { p: p, svc: svc, rt: rt });
+    return Some(Ctx { p, svc, rt });
 }
 
 // Drive one GET through the real router; returns (status, body bytes).
@@ -214,10 +208,10 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
     let b = resp.into_body();
     let col = b.collect().await;
     match col {
-        Err(_e) => { return (code, Vec::<u8>::new()); }
+        Err(_e) => { (code, Vec::<u8>::new())}
         Ok(cc) => {
             let bb = cc.to_bytes();
-            return (code, bb.to_vec());
+            (code, bb.to_vec())
         }
     }
 }
@@ -227,7 +221,7 @@ fn point_endpoint_truth_table() {
     let root = "/tmp/opencode/wxpoint-http".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;
@@ -299,7 +293,7 @@ fn error_status_table() {
     let root = "/tmp/opencode/wxpoint-http-err".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;
@@ -409,7 +403,7 @@ fn meta_endpoints_and_metrics() {
     let root = "/tmp/opencode/wxpoint-http-meta".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;
@@ -465,7 +459,41 @@ fn meta_endpoints_and_metrics() {
             assert!(has(&rx.1, "wxpoint_queries_total{status=\"2xx\"}"));
             assert!(has(&rx.1, "wxpoint_query_latency_us_bucket{le=\"1\"}"));
             assert!(has(&rx.1, "wxpoint_query_latency_us_bucket{le=\"+inf\"}"));
-            assert!(has(&rx.1, "wxpoint_ingest_lag_seconds"));
+            assert!(has(&rx.1, "wxpoint_data_age_seconds"));
+            // V1.3 phase E6: the TRUE latency pair must be exposed too (this
+            // harness indexes without an attached pipeline -> legitimate 0
+            // VALUES; presence + well-formedness is what we pin here).
+            assert!(has(&rx.1, "wxpoint_ingest_publish_latency_seconds"));
+            assert!(has(&rx.1, "wxpoint_ingest_publish_latency_seconds_max"));
+            // ---- V1.3 phase E6 TARGETED %-DECODE EQUIVALENCE ----------------
+            // %3A/%3a inside a level VALUE and %2C/%2c inside a param VALUE must
+            // behave EXACTLY like their bare counterparts: byte-identical
+            // responses (queryapi header documents the rule).
+            let d_plain = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(d_plain.0 == 200);
+            let d_up = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric%3A1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(d_up.0 == 200 && d_up.1 == d_plain.1);
+            let d_lo = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric%3a1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(d_lo.0 == 200 && d_lo.1 == d_plain.1);
+            // %2C splits tokens exactly like a bare comma (TMP,TMP keeps the
+            // probe valid on whatever single-param fixture this harness holds).
+            let dm_plain = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP,TMP&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dm_plain.0 == 200);
+            let dm_up = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%2CTMP&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dm_up.0 == 200 && dm_up.1 == dm_plain.1);
+            let dm_lo = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%2cTMP&level=isobaric%3A1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dm_lo.0 == 200 && dm_lo.1 == dm_plain.1); // lowercase-hex %2c + uppercase-hex %3A together
+            // Passthrough rules: unknown/malformed % sequences stay LITERAL
+            // bytes (so they look up as an unknown parameter -> 404), '+' is
+            // never a space, and %-decoding never invents a valid level.
+            let dq_zz = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%zz&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dq_zz.0 == 404 && has(&dq_zz.1, "unknown_param"));
+            let dq_tail = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dq_tail.0 == 404 && has(&dq_tail.1, "unknown_param"));
+            let dq_plus = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TM+P&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dq_plus.0 == 404 && has(&dq_plus.1, "unknown_param"));
+            let dq_lvl = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric%3A85%zz&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
+            assert!(dq_lvl.0 == 400 && has(&dq_lvl.1, "bad_level"));
             assert!(has(&rx.1, "wxpoint_ingested_files_total"));
             // V1.3 phase E1: stat-collision rejection is observable too.
             assert!(has(&rx.1, "wxpoint_stat_collisions_total"));
@@ -484,11 +512,10 @@ fn epoch_civil_roundtrip_across_boundaries() {
         "2021-01-01T00:00:00Z", "2026-03-01T00:00:00Z", "2026-02-28T00:00:00Z",
         "2026-10-19T00:00:00Z",
     ];
-    for k in 0 .. cases.len() {
-        let s = cases[k];
-        let ep_o = parse_iso_z(&s);
+    for &s in cases.iter() {
+        let ep_o = parse_iso_z(s);
         match ep_o {
-            None => { assert!(false); return; }
+            None => { panic!(); }
             Some(ep) => {
                 let back = format_iso_z(ep);
                 assert!(bytes_contains(back.as_bytes(), s.as_bytes()));
@@ -500,7 +527,7 @@ fn epoch_civil_roundtrip_across_boundaries() {
     let ep2 = epoch_secs(2026, 10, 19, 12, 0, 0);
     let ep1 = parse_iso_z("2026-10-19T12:00:00Z");
     match ep1 {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(x) => { assert!(ep2 == x); }
     }
 }
@@ -515,7 +542,7 @@ fn ready_before_ingest_is_503() {
     write_text(&cfgp, cfg_text(&root));
     let pr = Pipeline::open(&cfgp);
     match pr {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(pp) => {
             // NO scan rounds: nothing indexed yet.
             let stats = new_stats();
@@ -528,7 +555,7 @@ fn ready_before_ingest_is_503() {
             let svc = app.into_service();
             let rt_r = Runtime::new();
             let rt = match rt_r {
-                Err(_e) => { assert!(false); return; }
+                Err(_e) => { panic!(); }
                 Ok(rtx) => { rtx }
             };
             let rr = rt.block_on(fetch(svc.clone(), "/ready".to_string()));
@@ -545,10 +572,7 @@ fn gfs_seam_through_http() {
     // the full GFS geometry. Conditional-skip like wx-ingest perf_fixture.
     let perf = "../../tests/perfdata/gfs_perf_f000.grib2".to_string();
     let pr0 = File::open(&perf);
-    match pr0 {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if pr0.is_err() { return; }
     let root = "/tmp/opencode/wxpoint-seam".to_string();
     rm_tree(&root);
     let ing = join_path(&root, "ing");
@@ -565,7 +589,7 @@ fn gfs_seam_through_http() {
 
     let pr = Pipeline::open(&cfgp);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _r1 = p.scan_round();
@@ -582,7 +606,7 @@ fn gfs_seam_through_http() {
     let svc = app.into_service();
     let rt_r = Runtime::new();
     let rt = match rt_r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(rtx) => { rtx }
     };
 

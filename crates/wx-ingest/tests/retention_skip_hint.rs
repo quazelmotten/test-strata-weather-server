@@ -20,23 +20,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -44,21 +44,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -79,7 +76,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 // sec1 date-stamp patcher (verified pattern: day byte at offset 10, 39 hits).
@@ -102,7 +99,7 @@ fn patch_day(src: &[u8], day: u8) -> Vec<u8> {
         }
     }
     assert!(hits == 39);
-    return out;
+    out
 }
 
 fn cfg_n(data: &str, ing: &str, keep: usize) -> String {
@@ -112,8 +109,8 @@ fn cfg_n(data: &str, ing: &str, keep: usize) -> String {
     let t = format!("{0}{1}", t, keep);
     let t = t + "\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[allow(clippy::needless_return)]
@@ -121,7 +118,7 @@ fn has_grid(data: &str, run_dir: &str) -> bool {
     let model_dir = join_path(data, "gfs");
     let run_dir_full = join_path(&model_dir, run_dir);
     let probe = join_path(&run_dir_full, "grid.bin");
-    return read_bytes(&probe).len() > 0;
+    return !read_bytes(&probe).is_empty();
 }
 
 #[test]
@@ -133,7 +130,7 @@ fn hint_says_old_run_content_is_new_run_so_it_is_still_ingested() {
     let _c = create_dir_all(&ing);
 
     let base = read_bytes(&fixture("gfs_small.grib2"));
-    assert!(base.len() > 0);
+    assert!(!base.is_empty());
     // NAMES claim Oct 19 / 20 / 21; CONTENTS are Oct 24 / 25 / 23.
     write_bytes(&join_path(&ing, "gfs_2026101912.grib2"), &patch_day(&base, 24));
     write_bytes(&join_path(&ing, "gfs_2026102012.grib2"), &patch_day(&base, 25));
@@ -144,7 +141,7 @@ fn hint_says_old_run_content_is_new_run_so_it_is_still_ingested() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0); // observation round
@@ -181,7 +178,7 @@ fn hint_says_new_run_content_is_old_run_so_it_is_skipped() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0);

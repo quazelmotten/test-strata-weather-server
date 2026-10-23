@@ -12,24 +12,15 @@ use wx_core::storage::BIN_FIXED_HEADER;
 use std::io::Write;
 
 fn v1(a: f32) -> Vec<f32> {
-    let mut v: Vec<f32> = Vec::<f32>::new();
-    v.push(a);
-    return v;
+    vec![a]
 }
 
 fn v2(a: f32, b: f32) -> Vec<f32> {
-    let mut v: Vec<f32> = Vec::<f32>::new();
-    v.push(a);
-    v.push(b);
-    return v;
+    vec![a, b]
 }
 
 fn v3(a: f32, b: f32, c: f32) -> Vec<f32> {
-    let mut v: Vec<f32> = Vec::<f32>::new();
-    v.push(a);
-    v.push(b);
-    v.push(c);
-    return v;
+    vec![a, b, c]
 }
 
 #[test]
@@ -48,13 +39,10 @@ fn roundtrip_write_read() {
     let path = "/tmp/opencode/wxpt_rt.bin".to_string();
     let path2 = path.to_string();
     let w = write_bin_atomic(path, &hdr, &[&p0[0 .. 12], &p1[0 .. 12]]);
-    match w {
-        Err(_) => { assert!(false); }
-        Ok(_) => {}
-    }
+    if w.is_err() { panic!(); }
     let mf = open_field(path2);
     match mf {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(mfield) => {
             assert!(mfield.header.nx == 4);
             assert!(mfield.header.ny == 3);
@@ -84,7 +72,7 @@ fn header_roundtrip_codec() {
     assert!(bytes.len() == BIN_FIXED_HEADER + 3 * 4);
     let back = decode_header(&bytes);
     match back {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(h) => {
             assert!(h.nx == 1440 && h.ny == 721);
             assert!(h.levels.len() == 3 && h.levels[2] == 850.0);
@@ -105,24 +93,18 @@ fn reject_bad_magic() {
     let path = "/tmp/opencode/wxpt_badmagic.bin".to_string();
     let f = std::fs::File::create(&path);
     match f {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(mut h) => {
-            let mut bad: Vec<u8> = Vec::<u8>::new();
-            for k in 0 .. bytes.len() {
-                bad.push(bytes[k]);
-            }
+            let mut bad: Vec<u8> = bytes.to_vec();
             bad[0] = 88; // 'X' != 'W': magic mismatch
             let w = h.write_all(&bad);
             if w.is_err() {
-                assert!(false);
+                panic!();
             }
         }
     }
     let mf = open_field(path);
-    match mf {
-        Ok(_) => { assert!(false); }
-        Err(_) => {}
-    }
+    if mf.is_ok() { panic!(); }
 }
 
 #[test]
@@ -136,12 +118,12 @@ fn reject_truncated_data() {
     let path = "/tmp/opencode/wxpt_trunc.bin".to_string();
     let f = std::fs::File::create(&path);
     match f {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(mut h) => {
             // header + only ONE plane of data (two declared) -> truncated
             let w = h.write_all(&head);
             if w.is_err() {
-                assert!(false);
+                panic!();
             }
             let mut zeros: Vec<u8> = Vec::<u8>::new();
             for _k in 0 .. 64 {
@@ -149,15 +131,12 @@ fn reject_truncated_data() {
             }
             let w2 = h.write_all(&zeros);
             if w2.is_err() {
-                assert!(false);
+                panic!();
             }
         }
     }
     let mf = open_field(path);
-    match mf {
-        Ok(_) => { assert!(false); }
-        Err(_) => {}
-    }
+    if mf.is_ok() { panic!(); }
 }
 
 #[test]
@@ -177,13 +156,10 @@ fn scan_flag_accessor() {
     let path = "/tmp/opencode/wxpt_scan.bin".to_string();
     let path2 = path.to_string();
     let w = write_bin_atomic(path, &hdr, &[&p0[0 .. 10]]);
-    match w {
-        Err(_) => { assert!(false); }
-        Ok(_) => {}
-    }
+    if w.is_err() { panic!(); }
     let mf = open_field(path2);
     match mf {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(mfield) => {
             // stored row 0 is the SOUTH row (scan_ns=false): value 0;
             // logical north row 0 -> stored row ny-1 = 4 -> value 4
@@ -219,13 +195,10 @@ fn header_stat_metadata_round_trips_and_guards() {
     }
     let path = "/tmp/opencode/wxpt_stat.bin".to_string();
     let w = write_bin_atomic(path.to_string(), &hdr, &[&p0[0 .. 4]]);
-    match w {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if w.is_err() { panic!(); }
     let mf = open_field(path.to_string());
     match mf {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mfield) => {
             assert!(mfield.header.stat.processed);
             assert!(mfield.header.stat.kind == STAT_ACCUMULATION);
@@ -249,7 +222,7 @@ fn header_stat_metadata_round_trips_and_guards() {
     };
     let head2 = encode_header(&hdr2);
     match decode_header(&head2) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             assert!(!h.stat.processed);
             assert!(h.stat.kind == 0);
@@ -285,22 +258,19 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
     let good = encode_header(&hdr);
     assert!(good.len() == BIN_FIXED_HEADER + 4);
     // baseline parses
-    match decode_header(&good) {
-        Err(_) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if decode_header(&good).is_err() { panic!(); }
 
     // (a) version bumped by hand -> BadVersion (the warm-start recovery trigger)
     let mut b = good.to_vec();
-    b[8] = ((BIN_VERSION as u32) + 1) as u8;
+    b[8] = (BIN_VERSION + 1) as u8;
     match decode_header(&b) {
         Err(e) => {
             match e {
                 HeaderError::BadVersion => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
 
     // (b) stat_kind outside the table -> BadStat (never guess what it meant)
@@ -310,10 +280,10 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
         Err(e) => {
             match e {
                 HeaderError::BadStat => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
 
     // (c) stat_processed byte not 0/1 -> BadStat
@@ -323,10 +293,10 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
         Err(e) => {
             match e {
                 HeaderError::BadStat => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
 
     // (d) reserved bytes must be zero: mid-block byte 26 ...
@@ -336,10 +306,10 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
         Err(e) => {
             match e {
                 HeaderError::BadStat => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
     // ... and the trailing reserved u32 at 52..56
     let mut b5 = good.to_vec();
@@ -348,9 +318,9 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
         Err(e) => {
             match e {
                 HeaderError::BadStat => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
 }

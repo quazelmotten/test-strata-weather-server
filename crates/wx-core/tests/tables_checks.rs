@@ -80,7 +80,7 @@ fn level_string_parse_format() {
         let s1 = format_level_str(100, c[0]);
         let back = parse_level_str(&s1);
         match back {
-            None => { assert!(false); }
+            None => { panic!(); }
             Some((code, v)) => {
                 assert!(code == 100);
                 let mut d = v - c[0];
@@ -129,14 +129,14 @@ fn hybrid_level_strings_round_trip() {
     assert!(format_level_str(105, 203.5) == "hybrid:203.5");
     // round-trip through parse for everything format can emit
     let probes = [1.0f64, 50.0, 255.0, 152.5, 0.5, -2.5];
-    for k in 0 .. probes.len() {
-        let s = format_level_str(105, probes[k]);
+    for &pv in &probes {
+        let s = format_level_str(105, pv);
         let back = parse_level_str(&s);
         match back {
-            None => { println!("round trip failed for {s}"); assert!(false); }
+            None => { println!("round trip failed for {s}"); panic!(); }
             Some((c, v)) => {
                 assert!(c == 105);
-                let d = if v > probes[k] { v - probes[k] } else { probes[k] - v };
+                let d = if v > pv { v - pv } else { pv - v };
                 assert!(d < 1e-9);
             }
         }

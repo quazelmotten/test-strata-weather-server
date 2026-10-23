@@ -16,18 +16,11 @@ fn gfs_like_gaussian() -> GridGaussian {
 
 fn sample_points() -> Vec<(f64, f64)> {
     // nodes, midpoints, seam, far edge, poles, out-of-domain probes
-    let mut v: Vec<(f64, f64)> = Vec::new();
-    v.push((40.006506, -95.0390625));
-    v.push((89.910324, 0.0));
-    v.push((-89.910324, 12.5));
-    v.push((40.0, 359.9));
-    v.push((40.0, -0.1));
-    v.push((40.00001, 264.9609375));
-    v.push((89.95, 0.0));
-    v.push((90.0, 0.0));
-    v.push((-90.0, 100.0));
-    v.push((0.0, 180.0));
-    return v;
+    vec![
+        (40.006506, -95.0390625), (89.910324, 0.0), (-89.910324, 12.5),
+        (40.0, 359.9), (40.0, -0.1), (40.00001, 264.9609375),
+        (89.95, 0.0), (90.0, 0.0), (-90.0, 100.0), (0.0, 180.0),
+    ]
 }
 
 #[test]
@@ -36,21 +29,20 @@ fn grid_bin_v3_gaussian_roundtrip_bitexact() {
     let bytes = encode_grid(&g);
     if bytes.len() < 56 || bytes[..8] != GRID_MAGIC {
         println!("bad envelope: len {0}", bytes.len());
-        assert!(false);
-        return;
+        panic!();
     }
     // version + kind slots pinned
     if bytes[8] as u32 + ((bytes[9] as u32) << 8) != GRID_VERSION {
         println!("stored version bytes {0:?} != GRID_VERSION {1}",
                  &bytes[8 .. 12], GRID_VERSION);
-        assert!(false);
+        panic!();
     }
     if bytes[12] != 2 {
         println!("stored kind byte {0}, want 2", bytes[12]);
-        assert!(false);
+        panic!();
     }
     let back = match decode_grid(&bytes) {
-        Err(e) => { println!("decode failed: {0}", e); assert!(false); return; }
+        Err(e) => { println!("decode failed: {0}", e); panic!(); }
         Ok(gd) => { gd }
     };
     match (&g, &back) {
@@ -63,21 +55,19 @@ fn grid_bin_v3_gaussian_roundtrip_bitexact() {
             // derived table rebuilt bit-identically
             if a.row_lats().len() != b.row_lats().len() {
                 println!("row table length drift");
-                assert!(false);
-                return;
+                panic!();
             }
             let mut k = 0usize;
             while k < a.row_lats().len() {
                 if a.row_lats()[k] != b.row_lats()[k] {
                     println!("row table differs at {0}: {1} vs {2}",
                              k, a.row_lats()[k], b.row_lats()[k]);
-                    assert!(false);
-                    return;
+                    panic!();
                 }
                 k += 1;
             }
         }
-        _ => { println!("variant changed across roundtrip"); assert!(false); return; }
+        _ => { println!("variant changed across roundtrip"); panic!(); }
     }
     // projections must agree bit-for-bit at every probe
     let mut k = 0usize;
@@ -87,14 +77,14 @@ fn grid_bin_v3_gaussian_roundtrip_bitexact() {
         let p2 = a_proj(&back, la, lo);
         if p1 != p2 {
             println!("projection drift at ({0},{1}): {2:?} vs {3:?}", la, lo, p1, p2);
-            assert!(false);
+            panic!();
         }
         k += 1;
     }
 }
 
 fn a_proj(g: &GridDef, lat: f64, lon: f64) -> Option<(f64, f64)> {
-    return g.project(lat, lon);
+    g.project(lat, lon)
 }
 
 #[test]
@@ -104,7 +94,7 @@ fn grid_bin_v3_regular_and_lambert_still_roundtrip() {
         scan_mode: 0x40, winds_grid: false,
     });
     let rb = match decode_grid(&encode_grid(&reg)) {
-        Err(e) => { println!("regular decode: {0}", e); assert!(false); return; }
+        Err(e) => { println!("regular decode: {0}", e); panic!(); }
         Ok(v) => { v }
     };
     let mut k = 0usize;
@@ -112,8 +102,7 @@ fn grid_bin_v3_regular_and_lambert_still_roundtrip() {
         let (la, lo) = sample_points()[k];
         if a_proj(&reg, la, lo) != a_proj(&rb, la, lo) {
             println!("regular projection drift at ({0},{1})", la, lo);
-            assert!(false);
-            return;
+            panic!();
         }
         k += 1;
     }
@@ -121,7 +110,7 @@ fn grid_bin_v3_regular_and_lambert_still_roundtrip() {
         1799, 1059, 21.11389, 233.44, 265.0, 21.11389, 25.0, 25.0,
         3000.0, 3000.0, 1, 0x00, 2, true));
     let lb = match decode_grid(&encode_grid(&lam)) {
-        Err(e) => { println!("lambert decode: {0}", e); assert!(false); return; }
+        Err(e) => { println!("lambert decode: {0}", e); panic!(); }
         Ok(v) => { v }
     };
     match (&lam, &lb) {
@@ -129,7 +118,7 @@ fn grid_bin_v3_regular_and_lambert_still_roundtrip() {
             assert!(x.ns == y.ns && x.rh == y.rh && x.x0 == y.x0 && x.y0 == y.y0);
             assert!(x.winds_grid == y.winds_grid && x.j_south == y.j_south);
         }
-        _ => { assert!(false); }
+        _ => { panic!(); }
     }
 }
 
@@ -144,10 +133,10 @@ fn grid_bin_stale_version_is_rejected_for_the_recovery_trap() {
         Err(e) => {
             if e.find("version").is_none() {
                 println!("stale-version error text: {0}", e);
-                assert!(false);
+                panic!();
             }
         }
-        Ok(_) => { println!("v2 version slot accepted by v3 reader"); assert!(false); }
+        Ok(_) => { println!("v2 version slot accepted by v3 reader"); panic!(); }
     }
     // unknown kind (e.g. a future variant read by this build) also rejects
     let mut bytes2 = encode_grid(&g);
@@ -156,9 +145,9 @@ fn grid_bin_stale_version_is_rejected_for_the_recovery_trap() {
         Err(e) => {
             if e.find("kind").is_none() {
                 println!("unknown-kind error text: {0}", e);
-                assert!(false);
+                panic!();
             }
         }
-        Ok(_) => { assert!(false); }
+        Ok(_) => { panic!(); }
     }
 }

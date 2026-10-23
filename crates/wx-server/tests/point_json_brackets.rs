@@ -41,7 +41,7 @@ const EPOCH: i64 = 1760889600; // 2025-10-19T16:00:00Z
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -62,14 +62,14 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 use std::path::Path;
 pub fn path_str(p: &Path) -> String {
     match p.to_str() {
-        None => { return "".to_string(); }
-        Some(s) => { return s.to_string(); }
+        None => { "".to_string()}
+        Some(s) => { s.to_string()}
     }
 }
 
@@ -82,18 +82,18 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64) {
         for j in 0 .. (NY as usize) {
             for i in 0 .. (NX as usize) {
                 let v = lv * 100.0 + fh_hours * 10.0 + ((j as f64) * 10.0 + (i as f64));
-                let _p = plane.push(v as f32);
+                plane.push(v as f32);
             }
         }
-        let _m = planes.push(plane);
+        planes.push(plane);
     }
     let mut refs: Vec<&[f32]> = Vec::<&[f32]>::new();
     for pl in &planes {
-        let _r = refs.push(&pl[..]);
+        refs.push(&pl[..]);
     }
     let mut lv32: Vec<f32> = Vec::<f32>::new();
     for lv in levels {
-        let _z = lv32.push(*lv as f32);
+        lv32.push(*lv as f32);
     }
     let hdr = BinHeader {
         nx: NX,
@@ -104,10 +104,7 @@ fn write_field_file(dir: String, name: String, levels: &[f64], fh_hours: f64) {
         stat: StatMeta::instantaneous(),
     };
     let wr = write_bin_atomic(format!("{0}/{1}", dir, name), &hdr, &refs);
-    match wr {
-        Err(_e) => { assert!(false); return; }
-        Ok(_) => {}
-    }
+    if let Err(_e) = wr { panic!(); }
 }
 
 struct Ctx {
@@ -173,7 +170,7 @@ fn serve_snapshot(root: String, a_levels: &[f64], b_levels: &[f64]) -> Option<Ct
                     let rt_r = Runtime::new();
                     match rt_r {
                         Err(_e) => { return None; }
-                        Ok(rt) => { return Some(Ctx { svc: svc, rt: rt }); }
+                        Ok(rt) => { return Some(Ctx { svc, rt }); }
                     }
                 }
             }
@@ -182,15 +179,12 @@ fn serve_snapshot(root: String, a_levels: &[f64], b_levels: &[f64]) -> Option<Ct
 }
 
 pub fn iso_or_zero() -> u8 {
-    match lookup_level_type("isobaric") {
-        None => { return 0; }
-        Some(c) => { return c; }
-    }
+    lookup_level_type("isobaric").unwrap_or_default()
 }
 
 pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
-    return IdxFh {
-        fh_secs: fh_secs,
+    IdxFh {
+        fh_secs,
         field: mf.clone(),
         stat_processed: false,
         stat_kind_code: 0,
@@ -198,7 +192,7 @@ pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64) -> IdxFh {
         stat_begin_secs: 0,
         stat_end_secs: 0,
         stat_step_secs: 0,
-    };
+    }
 }
 
 // Drive one GET through the real router; returns (status, body bytes).
@@ -218,10 +212,10 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
     let b = resp.into_body();
     let col = b.collect().await;
     match col {
-        Err(_e) => { return (code, Vec::<u8>::new()); }
+        Err(_e) => { (code, Vec::<u8>::new())}
         Ok(cc) => {
             let bb = cc.to_bytes();
-            return (code, bb.to_vec());
+            (code, bb.to_vec())
         }
     }
 }
@@ -254,7 +248,7 @@ fn point_json_reports_both_brackets_when_stacks_differ() {
     let b_levels: [f64; 4] = [950.0, 850.0, 800.0, 700.0];
     let cx_o = serve_snapshot(root.to_string(), &a_levels[..], &b_levels[..]);
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(cx) => {
             let rt = cx.rt;
             // mid-level 875 hPa + mid-time 3Z (fh offset 10800 s) at cell centre
@@ -268,7 +262,7 @@ fn point_json_reports_both_brackets_when_stacks_differ() {
             assert!(has(&r.1, "\"vertical\":{\"method\":\"linear\",\"levels\":[900,800],\"levels_per_time\":[[900,800],[950,850]]}"));
             assert!(has(&r.1, "\"time\":{\"method\":\"linear\",\"forecast_hours\":[0,6]}"));
             assert!(has(&r.1, "\"horizontal\":\"bilinear\""));
-            rm_tree(&root);
+            rm_tree(root);
         }
     }
 }
@@ -279,7 +273,7 @@ fn point_json_omits_levels_per_time_when_brackets_agree() {
     let lv: [f64; 4] = [1000.0, 900.0, 800.0, 700.0];
     let cx_o = serve_snapshot(root.to_string(), &lv[..], &lv[..]);
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(cx) => {
             let rt = cx.rt;
             let q = "/v1/point?model=gfs&param=TMP&level=isobaric:875&lat=0.5&lon=0.5&valid=2025-10-19T19:00:00Z";
@@ -289,7 +283,7 @@ fn point_json_omits_levels_per_time_when_brackets_agree() {
             // V1.1-byte-identical vertical object: NO extra key when the pairs agree
             assert!(has(&r.1, "\"vertical\":{\"method\":\"linear\",\"levels\":[900,800]}"));
             assert!(!has(&r.1, "levels_per_time"));
-            rm_tree(&root);
+            rm_tree(root);
         }
     }
 }

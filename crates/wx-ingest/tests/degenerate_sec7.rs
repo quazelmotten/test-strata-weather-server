@@ -38,11 +38,11 @@ use wx_ingest::pipeline::Pipeline;
 use wx_ingest::state::join_path;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -63,12 +63,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn be_u32(b: &[u8], o: usize) -> u64 {
-    return ((b[o] as u64) << 24) | ((b[o + 1] as u64) << 16)
-         | ((b[o + 2] as u64) << 8) | (b[o + 3] as u64);
+    ((b[o] as u64) << 24) | ((b[o + 1] as u64) << 16)
+         | ((b[o + 2] as u64) << 8) | (b[o + 3] as u64)
 }
 
 fn be_u64v(b: &[u8], o: usize) -> u64 {
@@ -78,7 +78,7 @@ fn be_u64v(b: &[u8], o: usize) -> u64 {
         v = (v << 8) | (b[o + k] as u64);
         k += 1;
     }
-    return v;
+    v
 }
 
 fn push_u32(out: &mut Vec<u8>, v: u32) {
@@ -114,7 +114,7 @@ fn walk_sections(b: &[u8], pos: usize) -> Vec<(u8, usize, usize)> {
         }
         q += ln;
     }
-    return out;
+    out
 }
 
 /// Copy sections 1/3/4 verbatim out of gfs_small's FIRST message. The grid
@@ -124,7 +124,7 @@ fn walk_sections(b: &[u8], pos: usize) -> Vec<(u8, usize, usize)> {
 fn donor_sections() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let r = fs::read(fixture("gfs_small.grib2"));
     let b: Vec<u8> = match r {
-        Err(_) => { println!("no gfs_small fixture"); assert!(false); return (Vec::new(), Vec::new(), Vec::new()); }
+        Err(_) => { println!("no gfs_small fixture"); panic!(); }
         Ok(v) => { v }
     };
     let secs = walk_sections(&b, 0);
@@ -138,7 +138,7 @@ fn donor_sections() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         if s.0 == 4 { s4.extend_from_slice(slice); }
     }
     assert!(s1.len() >= 5 && s3.len() >= 5 && s4.len() >= 5);
-    return (s1, s3, s4);
+    (s1, s3, s4)
 }
 
 /// Assemble one degenerate message. `bitmap_bytes`: None = section 6 with
@@ -175,17 +175,13 @@ fn build_msg(bitmap_bytes: Option<usize>, s7_len_override: Option<u32>,
         }
     }
     // section 7: FIVE octets, zero data values (or an over-declared length).
-    let s7_len: u32 = match s7_len_override {
-        Some(v) => { v }
-        None => { 5 }
-    };
+    let s7_len: u32 = s7_len_override.unwrap_or(5);
     push_u32(&mut body, s7_len);
     body.push(7);
     body.push(0x37); body.push(0x37); body.push(0x37); body.push(0x37);
 
     let real_len = 16u64 + body.len() as u64;
-    let mut out: Vec<u8> = Vec::new();
-    out.push(0x47); out.push(0x52); out.push(0x49); out.push(0x42); // GRIB
+    let mut out: Vec<u8> = vec![0x47, 0x52, 0x49, 0x42]; // GRIB
     out.push(0);           // reserved (octet 5)
     out.push(0);           // reserved (octet 6)
     out.push(0);           // discipline 0 (at parser offset +6, verified against
@@ -193,7 +189,7 @@ fn build_msg(bitmap_bytes: Option<usize>, s7_len_override: Option<u32>,
     out.push(2);           // edition 2 (parser offset +7)
     push_u64(&mut out, match msglen_override { Some(v) => { v } None => { real_len } });
     out.extend_from_slice(&body);
-    return out;
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -207,8 +203,7 @@ fn empty_sec7_without_bitmap_decodes_as_zeros() {
     match r {
         Err(e) => {
             println!("degenerate s7 (no bitmap) failed: {0:?}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok((msgs, st)) => {
             assert!(st.messages_total == 1);
@@ -237,8 +232,7 @@ fn empty_sec7_with_full_bitmap_decodes_as_all_nan() {
     match r {
         Err(e) => {
             println!("degenerate s7 (bitmap) failed: {0:?}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok((msgs, st)) => {
             assert!(st.messages_unsupported == 0);
@@ -266,11 +260,11 @@ fn truly_truncated_streams_still_fail_loudly() {
         Err(GribErr::Truncated) => {}
         Err(other) => {
             println!("wrong error for bogus msglen: {0:?}", other);
-            assert!(false);
+            panic!();
         }
         Ok(_) => {
             println!("bogus msglen decoded silently");
-            assert!(false);
+            panic!();
         }
     }
     // D: section 7 claims 10 octets but only 5 exist before the 7777 tail,
@@ -280,11 +274,11 @@ fn truly_truncated_streams_still_fail_loudly() {
         Err(GribErr::Truncated) => {}
         Err(other) => {
             println!("wrong error for overlong s7: {0:?}", other);
-            assert!(false);
+            panic!();
         }
         Ok(_) => {
             println!("overlong s7 decoded silently");
-            assert!(false);
+            panic!();
         }
     }
 }
@@ -294,14 +288,14 @@ fn truly_truncated_streams_still_fail_loudly() {
 // ---------------------------------------------------------------------------
 
 fn degen_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"degen\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"degen*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"degen*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n"
 }
 
 #[test]
@@ -311,7 +305,7 @@ fn masked_degenerate_field_queries_return_missing_data() {
     let probe = build_msg(Some(108), None, None);
     let rp = decode_stream(&probe, ParamFilter::All);
     let want_level = match rp {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok((msgs, _)) => {
             assert!(msgs[0].levels.len() == 1 && msgs[0].levels[0].0 == 100);
             msgs[0].levels[0].1
@@ -322,16 +316,16 @@ fn masked_degenerate_field_queries_return_missing_data() {
     rm_tree(&root);
     let ing = join_path(&root, "ingest");
     let _c = create_dir_all(&ing);
-    match File::create(&join_path(&ing, "degenmask.grib2")) {
-        Err(_) => { assert!(false); return; }
+    match File::create(join_path(&ing, "degenmask.grib2")) {
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(&probe);
-            match n { Err(_) => { assert!(false); return; } Ok(_) => {} }
+            if n.is_err() { panic!(); }
         }
     }
     let cfgp = join_path(&root, "config.toml");
     match File::create(&cfgp) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let _n = w.write_all(degen_cfg_text(&root).as_bytes());
         }
@@ -339,7 +333,7 @@ fn masked_degenerate_field_queries_return_missing_data() {
 
     let po = Pipeline::open(&cfgp);
     let mut p = match po {
-        Err(e) => { println!("open failed: {0}", e); assert!(false); return; }
+        Err(e) => { println!("open failed: {0}", e); panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -352,18 +346,18 @@ fn masked_degenerate_field_queries_return_missing_data() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     match sref.find_model("degen") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso_code) => {
                     let cb = build_context(sref, "degen", None, "TMP", iso_code,
                                            want_level, 0.0, TimeInterpMode::Linear);
                     match cb {
                         Err(e) => {
                             println!("build_context failed: {0:?}", e);
-                            assert!(false);
+                            panic!();
                         }
                         Ok(c) => {
                             // node j=2,i=3 of the 41x21 grid (same probe point
@@ -373,18 +367,18 @@ fn masked_degenerate_field_queries_return_missing_data() {
                                 Err(PointError::MissingData) => {}
                                 Err(other) => {
                                     println!("wrong point error: {0:?}", other);
-                                    assert!(false);
+                                    panic!();
                                 }
                                 Ok(pv) => {
                                     println!("masked plane returned a value: {0}", pv.value);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                             // and a second in-domain point behaves identically
                             let v2 = evaluate_point(&c, 8.5, 350.5);
                             match v2 {
                                 Err(PointError::MissingData) => {}
-                                _ => { assert!(false); }
+                                _ => { panic!(); }
                             }
                         }
                     }

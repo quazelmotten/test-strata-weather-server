@@ -13,7 +13,7 @@ const HNX: usize = 61;
 const HNY: usize = 41;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 // ij_checks from expected.json (wgrib2 -ll2ij): lon, lat, i_wg, j_wg,
@@ -34,7 +34,7 @@ const CHECKS: [[f64; 5]; 8] = [
 fn hrrr_inventory_flags_values() {
     let r = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, st)) => {
             assert!(msgs.len() == 6);
             assert!(st.messages_total == 6);
@@ -43,7 +43,7 @@ fn hrrr_inventory_flags_values() {
             for x in 0 .. 6 {
                 let m = &msgs[x];
                 match m.param_name {
-                    None => { assert!(false); }
+                    None => { panic!(); }
                     Some(s) => {
                         if x < 2 {
                             assert!(s == "TMP");
@@ -82,13 +82,13 @@ fn hrrr_nearest_node_matches_wgrib2() {
     // to each -ll2ij probe point (ties decode order to projection).
     let r = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             let g = &msgs[0].grid;
             for c in &CHECKS {
                 let p = g.project(c[1], c[0]);
                 match p {
-                    None => { assert!(false); }
+                    None => { panic!(); }
                     Some((di, dj)) => {
                         assert!(abs_diff(di + 1.0, c[2]) <= 1e-4);
                         assert!(abs_diff((HNY as f64) - dj, c[3]) <= 1e-4);
@@ -107,18 +107,18 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 #[test]
 fn hrrr_c3_twin_matches_simple() {
     let a = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match a {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((ma, _sa)) => {
             let b = decode_file(fixture_path("hrrr_small_c3.grib2"), ParamFilter::All);
             match b {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok((mb, _sb)) => {
                     assert!(ma.len() == mb.len());
                     for x in 0 .. ma.len() {
@@ -143,7 +143,7 @@ fn hrrr_rotation_invariants() {
     // involution, and exact earth alignment on the LoV meridian.
     let r = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             let gd = &msgs[2].grid;
             let u = &msgs[2].data;
@@ -186,7 +186,7 @@ fn hrrr_rotation_invariants() {
                     for c in &pts {
                         let pr = gl.project(c[1], c[0]);
                         match pr {
-                            None => { assert!(false); }
+                            None => { panic!(); }
                             Some((di, dj)) => {
                                 let gamma = n_c * (c[0] - 229.53);
                                 let beta_w = gl.rot_angle_deg(di, dj);
@@ -214,8 +214,8 @@ fn hrrr_rotation_invariants() {
                         }
                     }
                 }
-                GridDef::Regular(_rg) => { assert!(false); }
-                GridDef::Gaussian(_gg) => { assert!(false); }
+                GridDef::Regular(_rg) => { panic!(); }
+                GridDef::Gaussian(_gg) => { panic!(); }
             }
             // involution: rotating twice returns the grid components exactly
             // (the change-of-basis matrix is symmetric orthogonal).
@@ -234,7 +234,7 @@ fn regular_grid_winds_pass_through() {
     // (documented decision); rotation must be the identity.
     let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     match r {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             let gd = &msgs[15].grid;
             assert!(!grid_winds(gd));
@@ -251,24 +251,13 @@ fn regular_grid_winds_pass_through() {
 fn wind_pair_config_rule() {
     // spec §4.4 config rule: grid-relative model with only one wind component
     // must fail validation with a clear message.
-    let mut ps1: Vec<String> = Vec::<String>::new();
-    ps1.push("TMP".to_string());
-    ps1.push("UGRD".to_string());
+    let ps1: Vec<String> = vec!["TMP".to_string(), "UGRD".to_string()];
     let bad = check_wind_pair(ps1.clone(), true);
     match bad {
-        None => { assert!(false); }
-        Some(msg) => { assert!(msg.len() > 0); }
+        None => { panic!(); }
+        Some(msg) => { assert!(!msg.is_empty()); }
     }
-    let mut ps2: Vec<String> = Vec::<String>::new();
-    ps2.push("TMP".to_string());
-    ps2.push("UGRD".to_string());
-    ps2.push("VGRD".to_string());
-    match check_wind_pair(ps2.clone(), true) {
-        Some(_mg) => { assert!(false); }
-        None => {}
-    }
-    match check_wind_pair(ps1.clone(), false) {
-        Some(_mg) => { assert!(false); }
-        None => {}
-    }
+    let ps2: Vec<String> = vec!["TMP".to_string(), "UGRD".to_string(), "VGRD".to_string()];
+    if let Some(_mg) = check_wind_pair(ps2.clone(), true) { panic!(); }
+    if let Some(_mg) = check_wind_pair(ps1.clone(), false) { panic!(); }
 }

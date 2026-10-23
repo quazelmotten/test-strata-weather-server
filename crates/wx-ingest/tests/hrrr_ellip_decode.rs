@@ -16,7 +16,7 @@ const ENX: usize = 41;
 const ENY: usize = 31;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn abs_diff(a: f64, b: f64) -> f64 {
@@ -24,7 +24,7 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 // lon, lat, i_wg, j_wg (wgrib2 -ll2ij on this fixture)
@@ -51,16 +51,16 @@ const IJ: [[f64; 4]; 16] = [
 fn ellipsoid_axes_come_from_the_file() {
     let r = decode_file(fixture_path("hrrr_ellip_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); }
+        Err(_e) => { panic!(); }
         Ok((msgs, st)) => {
             assert!(msgs.len() == 3);
             assert!(st.messages_total == 3);
             // order: UGRD, VGRD (grid-relative grids), TMP (earth-relative grid)
-            for x in 0 .. 3 {
+            for (x, m) in msgs.iter().enumerate() {
                 let wg = x < 2;
-                assert!(msgs[x].winds_grid == wg);
-                assert!(grid_winds(&msgs[x].grid) == wg);
-                match msgs[x].grid {
+                assert!(m.winds_grid == wg);
+                assert!(grid_winds(&m.grid) == wg);
+                match m.grid {
                     GridDef::Lambert(ref gl) => {
                         // CT 3.2 byte 3 = user-defined spheroid: the axes are
                         // INLINE in section 3 and must be read from there.
@@ -73,8 +73,8 @@ fn ellipsoid_axes_come_from_the_file() {
                         // and the flag bit survives on the wind grids only
                         assert!(gl.winds_grid == wg);
                     }
-                    GridDef::Regular(ref _rg) => { assert!(false); }
-                    GridDef::Gaussian(ref _gg) => { assert!(false); }
+                    GridDef::Regular(ref _rg) => { panic!(); }
+                    GridDef::Gaussian(ref _gg) => { panic!(); }
                 }
             }
             // analytic values: base 255 + param offset + j*100 + i
@@ -99,13 +99,13 @@ fn oblate_projection_matches_wgrib2_ll2ij() {
     // probes, within 1e-4 grid units of wgrib2's own answer.
     let r = decode_file(fixture_path("hrrr_ellip_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); }
+        Err(_e) => { panic!(); }
         Ok((msgs, _st)) => {
             let gd = &msgs[0].grid;
             for row in &IJ {
                 let p = gd.project(row[1], row[0]);
                 match p {
-                    None => { assert!(false); }
+                    None => { panic!(); }
                     Some((di, dj)) => {
                         assert!(abs_diff(di + 1.0, row[2]) <= 1e-4);
                         assert!(abs_diff((ENY as f64) - dj, row[3]) <= 1e-4);
@@ -123,7 +123,7 @@ fn oblate_rotation_and_inverse_roundtrip_at_nodes() {
     // domain corners and the center.
     let r = decode_file(fixture_path("hrrr_ellip_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); }
+        Err(_e) => { panic!(); }
         Ok((msgs, _st)) => {
             match msgs[0].grid {
                 GridDef::Lambert(ref gl) => {
@@ -135,7 +135,7 @@ fn oblate_rotation_and_inverse_roundtrip_at_nodes() {
                         let (lat, lon) = gl.inverse(pt[0], pt[1]);
                         let back = gl.project(lat, lon);
                         match back {
-                            None => { assert!(false); }
+                            None => { panic!(); }
                             Some((di, dj)) => {
                                 assert!(abs_diff(di, pt[0]) <= 1e-6);
                                 assert!(abs_diff(dj, pt[1]) <= 1e-6);
@@ -152,8 +152,8 @@ fn oblate_rotation_and_inverse_roundtrip_at_nodes() {
                         assert!(got > 90.0 && got < 105.0);
                     }
                 }
-                GridDef::Regular(ref _rg) => { assert!(false); }
-                GridDef::Gaussian(ref _gg) => { assert!(false); }
+                GridDef::Regular(ref _rg) => { panic!(); }
+                GridDef::Gaussian(ref _gg) => { panic!(); }
             }
         }
     }

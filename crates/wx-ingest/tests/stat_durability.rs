@@ -38,7 +38,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -59,12 +59,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -85,22 +85,19 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn exists_any(path: &str) -> bool {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return false; }
         Ok(_) => { return true; }
@@ -159,8 +156,8 @@ fn stat_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"stat\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"stat_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"stat_small.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n"
 }
 
 // Same config plus a second model carrying an INSTANTANEOUS field, so a
@@ -170,8 +167,8 @@ fn stat_cfg_with_gfs(data: &str, ing: &str) -> String {
     let t = stat_cfg(data, ing);
     let t = t + "\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_small.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +192,7 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     // ---- life 1: normal ingest (two models, two files) -------------------
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 2usize) == 2usize);
@@ -219,9 +216,9 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     let le_i64 = |b: &[u8], off: usize| -> i64 {
         let mut v: u64 = 0;
         for k in 0 .. 8 {
-            v = v | (((b[off + k] as u64)) << (k * 8));
+            v |= (b[off + k] as u64) << (k * 8);
         }
-        return v as i64;
+        v as i64
     };
     assert!(le_i64(&hb, 28) == 0);      // begin_secs
     assert!(le_i64(&hb, 36) == 21600);  // end_secs   (0-6 h window)
@@ -238,7 +235,7 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     // ---- life 2: warm start with NO manifest ------------------------------
     let p2r = Pipeline::open(&cfg_path);
     let p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // LOUD once per run + counted, but indexing proceeds from the headers.
@@ -249,7 +246,7 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     let sref = &*snap;
     let sm = sref.find_model("stat");
     match sm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             let mut found = false;
@@ -262,7 +259,7 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
                 // `/v1/inventory` and the query path all stay truthful without
                 // any manifest. Pre-fix these two assertions were FALSE.
                 assert!(fe.fd.stat_processed);
-                assert!(fe.fd.stat_kind == "accumulation".to_string());
+                assert!(fe.fd.stat_kind == "accumulation");
                 assert!(fe.fd.fhs.len() == 2);
                 for sl in &fe.fd.fhs {
                     if sl.fh_secs == 0 {
@@ -283,11 +280,11 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     // Pre-fix this returned Ok and the caller blended two accumulations.
     let cg = build_context(sref, "stat", None, "APCP", 1, 0.0, 10800.0, TimeInterpMode::Linear);
     match cg {
-        Ok(_c) => { assert!(false); return; }
+        Ok(_c) => { panic!(); }
         Err(e) => {
             match e {
                 SelectError::StatTimeGuard(..) => {}
-                _ => { assert!(false); return; }
+                _ => { panic!(); }
             }
         }
     }
@@ -295,11 +292,11 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     // and APCP f000 at node (lat 20, lon 240) is still the analytic 10.
     let ce = build_context(sref, "stat", None, "APCP", 1, 0.0, 0.0, TimeInterpMode::Linear);
     match ce {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(c) => {
             let v = evaluate_point(&c, 20.0, 240.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(pv) => {
                     assert!(pv.value == 10.0);
                     assert!(pv.info.horizontal == HorizMethod::Exact);
@@ -314,22 +311,22 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
     // bug); now the accumulation next door stays guarded while this answers.
     let iso_r = lookup_level_type("isobaric");
     let iso = match iso_r {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(vv) => { vv }
     };
     let ci = build_context(sref, "gfs", None, "TMP", iso,
                            1000.0, 10800.0, TimeInterpMode::Linear);
     match ci {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(c) => {
             let v = evaluate_point(&c, 10.0, 350.0);
             match v {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(pv) => {
                     assert!(pv.value == 280.0);
                     assert!(pv.info.horizontal == HorizMethod::Exact);
                     match pv.info.time {
-                        None => { assert!(false); return; }
+                        None => { panic!(); }
                         Some(tm) => {
                             assert!(tm.forecast_hours.0 == 0.0 && tm.forecast_hours.1 == 6.0);
                         }
@@ -359,7 +356,7 @@ fn corrupt_manifest_boot_is_loud_counted_and_still_answers_right() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -371,7 +368,7 @@ fn corrupt_manifest_boot_is_loud_counted_and_still_answers_right() {
 
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // LOUD note naming the file + exactly one error count (visible on /metrics).
@@ -382,14 +379,14 @@ fn corrupt_manifest_boot_is_loud_counted_and_still_answers_right() {
     let sref = &*snap;
     let sm = sref.find_model("stat");
     match sm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             let mut found = false;
             for fe in &m.runs[0].fields {
                 if fe.param_key == "APCP" {
                     found = true;
                     assert!(fe.fd.stat_processed);
-                    assert!(fe.fd.stat_kind == "accumulation".to_string());
+                    assert!(fe.fd.stat_kind == "accumulation");
                 }
             }
             assert!(found);
@@ -398,11 +395,11 @@ fn corrupt_manifest_boot_is_loud_counted_and_still_answers_right() {
     // Guard intact: mid-fh accumulation query is rejected, not blended.
     let cg = build_context(sref, "stat", None, "APCP", 1, 0.0, 10800.0, TimeInterpMode::Linear);
     match cg {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!(); }
         Err(e) => {
             match e {
                 SelectError::StatTimeGuard(..) => {}
-                _ => { assert!(false); return; }
+                _ => { panic!(); }
             }
         }
     }

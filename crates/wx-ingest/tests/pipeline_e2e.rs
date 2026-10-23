@@ -14,6 +14,7 @@ use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode, PointError, HorizMethod};
 use wx_core::tables::{lookup_level_type};
 use memmap2::Mmap;
+use std::sync::atomic::Ordering;
 use std::fs::File;
 use std::io::Write;
 use std::fs::read_dir;
@@ -22,7 +23,7 @@ use std::fs::remove_dir;
 use std::fs::create_dir_all;
 
 fn f_is_nan(x: f64) -> bool {
-    return x != x;
+    x.is_nan()
 }
 
 fn abs_diff(a: f64, b: f64) -> f64 {
@@ -30,15 +31,15 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -59,27 +60,24 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -89,15 +87,12 @@ fn copy_file(src: String, dst: String) {
 }
 
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -105,17 +100,17 @@ fn write_text(path: &str, text: String) {
 fn read_bytes(path: String) -> Vec<u8> {
     let f = File::open(&path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -138,7 +133,7 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }
 
 // The three ingest dirs each receive their fixtures; all three models share one
@@ -146,7 +141,7 @@ fn bytes_contains(hay: &[u8], pat: &[u8]) -> bool {
 // NEXT scan round (the "size/mtime unchanged for the window" rule with a zero
 // window), which is exactly what the two scan_rounds below exercise.
 fn e2e_config_text(root: &str, ing_gfs: &str, ing_hrr: &str, ing_stat: &str) -> String {
-    let data = join_path(&root, "data");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\ningest_threads = 2\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
@@ -155,8 +150,8 @@ fn e2e_config_text(root: &str, ing_gfs: &str, ing_hrr: &str, ing_stat: &str) -> 
     let t = format!("{0}{1}", t, ing_hrr);
     let t = t + "\"\nfile_glob = \"hrrr_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n[[models]]\nname = \"stat\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing_stat);
-    let t = t + "\"\nfile_glob = \"stat_*.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"stat_*.grib2\"\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"*\"]\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -181,7 +176,7 @@ fn e2e_roundtrip_through_index() {
 
     let po = Pipeline::open(&cfg_path);
     let mut p = match po {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -192,6 +187,18 @@ fn e2e_roundtrip_through_index() {
     assert!(n2 == 4);
     assert!(p.counters.ingested_files == 4);
     assert!(p.counters.errors == 0);
+    // ---- V1.3 phase E6 PUBLISH-LATENCY GAUGE INPUTS ----------------------
+    // The fixtures were copied SECONDS ago, so a correct wall-vs-wall
+    // mtime->publish reading is STRICTLY POSITIVE and SANE (< 3600 s); the
+    // lifetime max can only track it upward, and the data-age source (newest
+    // mtime) must be populated for wxpoint_data_age_seconds to render.
+    let lat_last = p.live.publish_latency_last_ns.load(Ordering::Relaxed);
+    let lat_max = p.live.publish_latency_max_ns.load(Ordering::Relaxed);
+    assert!(lat_last > 0);
+    assert!(lat_last < 3_600_000_000_000);
+    assert!(lat_max >= lat_last);
+    assert!(lat_max < 3_600_000_000_000);
+    assert!(p.live.last_mtime_ns.load(Ordering::Relaxed) > 0);
     // Round 3: persistent record says unchanged -> nothing re-ingested.
     let n3 = p.scan_round();
     assert!(n3 == 0);
@@ -202,7 +209,7 @@ fn e2e_roundtrip_through_index() {
     assert!(bytes_contains(&gb, "WXPTGRID".as_bytes()));
     let gd = decode_grid(&gb);
     match gd {
-        Err(_) => { assert!(false); }
+        Err(_) => { panic!(); }
         Ok(g) => {
             assert!(g.nx() == 41);
             assert!(g.ny() == 21);
@@ -234,22 +241,22 @@ fn e2e_roundtrip_through_index() {
     let sref = &*snap;
     let gm = sref.find_model("gfs");
     match gm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 6);
             match lookup_level_type("isobaric") {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(iso_code) => {
                     // exact node: TMP @1000 f000 at (lat 10, lon 350) = 250.
                     let c_r = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_se) => { assert!(false); }
+                        Err(_se) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 10.0, 350.0);
                             match v {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => {
                                     assert!(pv.value == 250.0);
                                     assert!(pv.info.horizontal == HorizMethod::Exact);
@@ -261,11 +268,11 @@ fn e2e_roundtrip_through_index() {
                     let c_b = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_b {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(cb) => {
                             let vb = evaluate_point(&cb, 9.75, 350.25);
                             match vb {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(pvb) => { assert!(pvb.value == 252.5); }
                             }
                         }
@@ -274,15 +281,15 @@ fn e2e_roundtrip_through_index() {
                     let c_v = build_context(sref, "gfs", None, "TMP", iso_code,
                                          925.0, 0.0, TimeInterpMode::Linear);
                     match c_v {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(cv) => {
                             let vv = evaluate_point(&cv, 9.0, 351.5);
                             match vv {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(pvv) => {
                                     assert!(pvv.value == 311.0);
                                     match pvv.info.vertical {
-                                        None => { assert!(false); }
+                                        None => { panic!(); }
                                         Some(vm) => {
                                             assert!(vm.levels.0 == 1000.0 && vm.levels.1 == 850.0);
                                         }
@@ -295,15 +302,15 @@ fn e2e_roundtrip_through_index() {
                     let c_t = build_context(sref, "gfs", None, "TMP", iso_code,
                                          1000.0, 10800.0, TimeInterpMode::Linear);
                     match c_t {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(ct) => {
                             let vt = evaluate_point(&ct, 9.0, 351.5);
                             match vt {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(pvt) => {
                                     assert!(pvt.value == 291.0);
                                     match pvt.info.time {
-                                        None => { assert!(false); }
+                                        None => { panic!(); }
                                         Some(tm) => {
                                             assert!(tm.forecast_hours.0 == 0.0 && tm.forecast_hours.1 == 6.0);
                                         }
@@ -319,16 +326,16 @@ fn e2e_roundtrip_through_index() {
                         Err(ne) => {
                             match ne {
                                 SelectError::TimeExactOnly => {}
-                                _ => { assert!(false); }
+                                _ => { panic!(); }
                             }
                         }
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                     }
                     // masked node: TMP @850 f006 k=0 is NaN -> MissingData.
                     let c_m = build_context(sref, "gfs", None, "TMP", iso_code,
                                          850.0, 21600.0, TimeInterpMode::Linear);
                     match c_m {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(cm) => {
                             let vm = evaluate_point(&cm, 10.0, 350.0);
                             match vm {
@@ -336,7 +343,7 @@ fn e2e_roundtrip_through_index() {
                                 Err(pe) => {
                                     match pe {
                                         PointError::MissingData => {}
-                                        _ => { assert!(false); }
+                                        _ => { panic!(); }
                                     }
                                 }
                             }
@@ -350,21 +357,21 @@ fn e2e_roundtrip_through_index() {
     // HRRR LCC exact-node probe + rotated-wind magnitude invariant (§4.4).
     let hm = sref.find_model("hrrr");
     match hm {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 3);
             match lookup_level_type("height_above_ground") {
-                None => { assert!(false); }
+                None => { panic!(); }
                 Some(hag_code) => {
                     let c5 = build_context(sref, "hrrr", None, "TMP", hag_code,
                                         2.0, 0.0, TimeInterpMode::Linear);
                     match c5 {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v5 = evaluate_point(&c, 21.11389, 233.44);
                             match v5 {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(pv5) => { assert!(pv5.value == 260.0); }
                             }
                         }
@@ -377,18 +384,18 @@ fn e2e_roundtrip_through_index() {
                     let cv = build_context(sref, "hrrr", None, "VGRD", hag_code,
                                         10.0, 0.0, TimeInterpMode::Linear);
                     match cu {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(cu2) => {
                             match cv {
-                                Err(_) => { assert!(false); }
+                                Err(_) => { panic!(); }
                                 Ok(cv2) => {
                                     let eu = evaluate_point(&cu2, 21.11389, 233.44);
                                     let ev = evaluate_point(&cv2, 21.11389, 233.44);
                                     match eu {
-                                        Err(_) => { assert!(false); }
+                                        Err(_) => { panic!(); }
                                         Ok(eu2) => {
                                             match ev {
-                                                Err(_) => { assert!(false); }
+                                                Err(_) => { panic!(); }
                                                 Ok(ev2) => {
                                                     let lhs = eu2.value * eu2.value + ev2.value * ev2.value;
                                                     let rhs = 5260.0 * 5260.0 + 9260.0 * 9260.0;
@@ -411,7 +418,7 @@ fn e2e_roundtrip_through_index() {
     // stat model: PDT 4.8 guard survives ingest into the index.
     let sm2 = sref.find_model("stat");
     match sm2 {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             assert!(m.runs[0].fields.len() == 2);
@@ -420,7 +427,7 @@ fn e2e_roundtrip_through_index() {
                 if fe.param_key == "APCP" {
                     found = true;
                     assert!(fe.fd.stat_processed);
-                    assert!(fe.fd.stat_kind == "accumulation".to_string());
+                    assert!(fe.fd.stat_kind == "accumulation");
                     assert!(fe.fd.fhs.len() == 2);
                 }
             }
@@ -429,12 +436,12 @@ fn e2e_roundtrip_through_index() {
             let cg = build_context(sref, "stat", None, "APCP", 1,
                                 0.0, 10800.0, TimeInterpMode::Linear);
             match cg {
-                Ok(_) => { assert!(false); }
+                Ok(_) => { panic!(); }
                 Err(g) => {
                     match g {
                         SelectError::StatTimeGuard(..) => {}
                         SelectError::TimeExactOnly => {}
-                        _ => { assert!(false); }
+                        _ => { panic!(); }
                     }
                 }
             }
@@ -442,11 +449,11 @@ fn e2e_roundtrip_through_index() {
             let ce = build_context(sref, "stat", None, "APCP", 1,
                                 0.0, 0.0, TimeInterpMode::Linear);
             match ce {
-                Err(_) => { assert!(false); }
+                Err(_) => { panic!(); }
                 Ok(ce2) => {
                     let ve = evaluate_point(&ce2, 20.0, 240.0);
                     match ve {
-                        Err(_) => { assert!(false); }
+                        Err(_) => { panic!(); }
                         Ok(pve) => { assert!(pve.value == 10.0); }
                     }
                 }

@@ -31,7 +31,7 @@ fn fixture(name: &str) -> String {
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -52,28 +52,25 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn copy_file(src: String, dst: String) {
     let f = File::open(&src);
     match f {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let d = File::create(&dst);
                     match d {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(mut w) => {
                             let n = w.write_all(&region[0 .. region.len()]);
-                            match n {
-                                Err(_) => { assert!(false); }
-                                Ok(_) => {}
-                            }
+                            if n.is_err() { panic!(); }
                         }
                     }
                 }
@@ -84,9 +81,9 @@ fn copy_file(src: String, dst: String) {
 
 #[allow(clippy::needless_return)]
 fn cfg_text(root: &str) -> String {
-    let ing_gfs = join_path(&root, "ingest-gfs");
-    let ing_hrr = join_path(&root, "ingest-hrrr");
-    let data = join_path(&root, "data");
+    let ing_gfs = join_path(root, "ingest-gfs");
+    let ing_hrr = join_path(root, "ingest-hrrr");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
@@ -117,7 +114,7 @@ fn serve_setup(root: String) -> Option<Ctx> {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -135,23 +132,20 @@ fn serve_setup(root: String) -> Option<Ctx> {
     let svc = app.into_service();
     let rt_r = Runtime::new();
     let rt = match rt_r {
-        Err(_e) => { assert!(false); return None; }
+        Err(_e) => { panic!(); }
         Ok(rtx) => { rtx }
     };
-    return Some(Ctx { p: p, svc: svc, rt: rt });
+    return Some(Ctx { p, svc, rt });
 }
 
 #[allow(clippy::needless_return)]
 fn write_text(path: &str, text: String) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -176,10 +170,10 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
     let b = resp.into_body();
     let col = b.collect().await;
     match col {
-        Err(_e) => { return (code, Vec::<u8>::new()); }
+        Err(_e) => { (code, Vec::<u8>::new())}
         Ok(cc) => {
             let bb = cc.to_bytes();
-            return (code, bb.to_vec());
+            (code, bb.to_vec())
         }
     }
 }
@@ -188,7 +182,7 @@ async fn fetch(svc: RouterIntoService<Body>, url: String) -> (u16, Vec<u8>) {
 fn body_str(t: (u16, Vec<u8>)) -> String {
     let mut s = "".to_string();
     for k in 0 .. t.1.len() {
-        s = format!("{0}{1}", s, (t.1[k] as char).to_string());
+        s = format!("{0}{1}", s, (t.1[k] as char));
     }
     return s;
 }
@@ -198,7 +192,7 @@ fn meta_endpoints_parse_as_json() {
     let root = "/tmp/opencode/wxpoint-meta".to_string();
     let cx_o = serve_setup(root.to_string());
     match cx_o {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(cx) => {
             let _keep = cx.p;
             let rt = cx.rt;
@@ -213,10 +207,7 @@ fn meta_endpoints_parse_as_json() {
                 let r = rt.block_on(fetch(svc.clone(), u.to_string()));
                 assert!(r.0 == 200);
                 let pv = serde_json::from_slice::<serde_json::Value>(&r.1);
-                match pv {
-                    Err(_e) => { assert!(false); }
-                    Ok(_) => {}
-                }
+                if let Err(_e) = pv { panic!(); }
             }
             // LCC model visible in both meta views.
             let rm = rt.block_on(fetch(svc.clone(), "/v1/models".to_string()));

@@ -53,10 +53,10 @@ fn real_path(name: &str) -> Option<String> {
     let p = format!("{0}/{1}", REALDIR, name);
     let f = File::open(&p);
     match f {
-        Err(_) => { return None; }
+        Err(_) => { None}
         Ok(h) => {
             drop(h);
-            return Some(p);
+            Some(p)
         }
     }
 }
@@ -66,7 +66,7 @@ fn skip_msg(why: &str) {
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -87,19 +87,19 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn copy_in(src: &str, dst: &str) {
     let b = fs::read(src);
     match b {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(v) => {
             match File::create(dst) {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!();}
                 Ok(mut w) => {
                     let n = w.write_all(&v);
-                    match n { Err(_) => { assert!(false); } Ok(_) => {} }
+                    if n.is_err() { panic!(); }
                 }
             }
         }
@@ -132,8 +132,7 @@ fn gfs_sflux_decodes_on_template_3_40() {
         match r {
             Err(e) => {
                 println!("{0}: walk failed: {1:?}", nm, e);
-                assert!(false);
-                return;
+                panic!();
             }
             Ok((msgs, st)) => {
                 let exp = expected[fi];
@@ -146,14 +145,12 @@ fn gfs_sflux_decodes_on_template_3_40() {
                     println!("{0}: total={1} decoded={2} msgs={3} coord={4} grid={5:?} pdt={6:?}",
                              nm, st.messages_total, st.messages_decoded, msgs.len(),
                              st.skip_coordlists, st.skip_grid, st.skip_pdt);
-                    assert!(false);
-                    return;
+                    panic!();
                 }
                 // every decoded plane is the full 3072 x 1536 rectangle
                 if msgs[0].data.len() != 3072 * 1536 {
                     println!("{0}: plane size {1}", nm, msgs[0].data.len());
-                    assert!(false);
-                    return;
+                    panic!();
                 }
             }
         }
@@ -168,8 +165,8 @@ fn gfs_sflux_decodes_on_template_3_40() {
 // ---------------------------------------------------------------------------
 
 fn gfs_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     // E4c shape: the CURRENT-operational spec — every level type these
     // products publish: AGL heights, surface, AND hybrid:* upper-air, plus
     // the out-of-table ACOND triple (Aerodynamic conductance is a LAND
@@ -181,8 +178,8 @@ fn gfs_cfg_text(root: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\", \"hybrid:*\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"HGT\"\n  levels = [\"surface\", \"hybrid:*\"]\n\n  [[models.params]]\n  discipline = 2\n  category = 0\n  number = 228\n  units = \"m/s\"\n  levels = [\"surface\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\", \"hybrid:*\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"HGT\"\n  levels = [\"surface\", \"hybrid:*\"]\n\n  [[models.params]]\n  discipline = 2\n  category = 0\n  number = 228\n  units = \"m/s\"\n  levels = [\"surface\"]\n"
 }
 
 #[test]
@@ -206,17 +203,17 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
     let _c = create_dir_all(&ing);
     copy_in(&f0, &join_path(&ing, "gfs_sflux_f000.grib2"));
     let mut nfiles = 1usize;
-    match &f6 { Some(p) => { copy_in(p, &join_path(&ing, "gfs_sflux_f006.grib2")); nfiles += 1; } None => {} }
-    match &f12 { Some(p) => { copy_in(p, &join_path(&ing, "gfs_sflux_f012.grib2")); nfiles += 1; } None => {} }
+    if let Some(p) = &f6 { copy_in(p, &join_path(&ing, "gfs_sflux_f006.grib2")); nfiles += 1; }
+    if let Some(p) = &f12 { copy_in(p, &join_path(&ing, "gfs_sflux_f012.grib2")); nfiles += 1; }
     let cfgp = join_path(&root, "config.toml");
     match File::create(&cfgp) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => { let _n = w.write_all(gfs_cfg_text(&root).as_bytes()); }
     }
 
     let po = Pipeline::open(&cfgp);
     let mut p = match po {
-        Err(e) => { println!("open failed: {0}", e); assert!(false); return; }
+        Err(e) => { println!("open failed: {0}", e); panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -233,7 +230,7 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     let m = match sref.find_model("gfs") {
-        None => { println!("no gfs model in index"); assert!(false); return; }
+        None => { println!("no gfs model in index"); panic!(); }
         Some(mm) => { mm }
     };
     assert!(m.runs.len() == 1); // one run: 2026-10-21 12Z from section 1
@@ -248,8 +245,8 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         keys.push((fe.param_key.to_string(), fe.level_code));
     }
     keys.sort();
-    for k in 0 .. keys.len() {
-        println!("STORED FIELD {0}: {1} level_type={2}", k, keys[k].0, keys[k].1);
+    for (k, kk) in keys.iter().enumerate() {
+        println!("STORED FIELD {0}: {1} level_type={2}", k, kk.0, kk.1);
     }
     assert!(keys.len() == 7);
     let want_keys: [(&str, u8); 7] = [
@@ -260,7 +257,7 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         if !(keys[k].0 == want_keys[k].0 && keys[k].1 == want_keys[k].1) {
             println!("field set mismatch at {0}: got {1:?} want {2:?}",
                      k, keys[k], want_keys[k]);
-            assert!(false);
+            panic!();
         }
     }
     // the two HYBRID stacks carry the raw coordinate 1.0 at fh 12 (the live
@@ -269,12 +266,12 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         if fe.level_code == 105 {
             if fe.fd.fhs.len() != 1 || fe.fd.fhs[0].fh_secs != 43200 {
                 println!("hybrid stack fhs wrong for {0}", fe.param_key);
-                assert!(false);
+                panic!();
             }
             let lv = &fe.fd.fhs[0].field.header.levels;
             if lv.len() != 1 || lv[0] as f64 != 1.0 {
                 println!("hybrid levels wrong for {0}", fe.param_key);
-                assert!(false);
+                panic!();
             }
         }
     }
@@ -283,7 +280,7 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
     // 40.006506; the table value is what a node-exact request must carry)
     let pos = match wx_core::grid::gaussian_latitudes(1536) {
         Some(v) => v,
-        None => { assert!(false); return; }
+        None => { panic!(); }
     };
     let ts = &pos[..];
     let mut krow = 9999usize;
@@ -292,23 +289,23 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         if absdiff(ts[kk], 40.006506) < 5e-7 { krow = kk; break; }
         kk += 1;
     }
-    if krow == 9999 { println!("probe row not found"); assert!(false); return; }
+    if krow == 9999 { println!("probe row not found"); panic!(); }
     let row_lat = ts[krow];       // northern positive half, storage row krow
     let lon_exact = -95.0390625; // == column 2261 * 360/3072, dyadic exact
 
     // TMP 2 m @ fh 0, NODE-EXACT: wgrib2 printed 286.74 K at this node
     let ct = build_context(sref, "gfs", None, "TMP", 103, 2.0, 0.0, TimeInterpMode::Linear);
     match ct {
-        Err(e) => { println!("TMP ctx: {0:?}", e); assert!(false); }
+        Err(e) => { println!("TMP ctx: {0:?}", e); panic!(); }
         Ok(c) => {
             let v = evaluate_point(&c, row_lat, lon_exact);
             match v {
-                Err(other) => { println!("node probe: {0:?}", other); assert!(false); }
+                Err(other) => { println!("node probe: {0:?}", other); panic!(); }
                 Ok(pv) => {
                     println!("GFS PROBE node-exact TMP = {0} K (wgrib2 286.74)", pv.value);
                     if absdiff(pv.value, 286.74) >= 0.01 {
                         println!("node probe {0} vs wgrib2 286.74", pv.value);
-                        assert!(false);
+                        panic!();
                     }
                 }
             }
@@ -317,11 +314,11 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
             // f32 print rounding of 286.74
             let vr = evaluate_point(&c, 40.006506, -95.039062);
             match vr {
-                Err(other) => { println!("rounded probe: {0:?}", other); assert!(false); }
+                Err(other) => { println!("rounded probe: {0:?}", other); panic!(); }
                 Ok(pv) => {
                     if absdiff(pv.value, 286.74) >= 0.01 {
                         println!("rounded probe {0} vs wgrib2 286.74", pv.value);
-                        assert!(false);
+                        panic!();
                     }
                 }
             }
@@ -329,16 +326,16 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
             // COLUMN: horizontal weight collapses to that column, so the
             // answer must be exactly the mean of the two node values
             let vk = match evaluate_point(&c, row_lat, lon_exact) {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(x) => { x.value }
             };
             let vn = match evaluate_point(&c, ts[krow + 1], lon_exact) {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(x) => { x.value }
             };
             let mid = 0.5 * (row_lat + ts[krow + 1]);
             let vm = match evaluate_point(&c, mid, lon_exact) {
-                Err(_) => { assert!(false); return; }
+                Err(_) => { panic!(); }
                 Ok(x) => { x.value }
             };
             let want = 0.5 * (vk + vn);
@@ -346,20 +343,20 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
                      krow, krow + 1, vk, vn, vm, want);
             if absdiff(vm, want) > 1e-9 {
                 println!("midpoint off: {0} vs {1}", vm, want);
-                assert!(false);
+                panic!();
             }
             // seam: the same point written in 0..360 form answers bit-equal
             let vs = evaluate_point(&c, row_lat, 264.9609375);
             match vs {
-                Err(other) => { println!("seam probe: {0:?}", other); assert!(false); }
+                Err(other) => { println!("seam probe: {0:?}", other); panic!(); }
                 Ok(pv) => {
                     let v0 = match evaluate_point(&c, row_lat, lon_exact) {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(x) => { x.value }
                     };
                     if pv.value != v0 {
                         println!("seam mismatch {0} vs {1}", pv.value, v0);
-                        assert!(false);
+                        panic!();
                     }
                 }
             }
@@ -368,12 +365,12 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
             let vp = evaluate_point(&c, 90.0, 0.0);
             match vp {
                 Err(PointError::OutOfDomain) => {}
-                other => { println!("pole query: {0:?}", other); assert!(false); }
+                other => { println!("pole query: {0:?}", other); panic!(); }
             }
             let vb = evaluate_point(&c, 89.95, 0.0);
             match vb {
                 Err(PointError::OutOfDomain) => {}
-                other => { println!("beyond-top-row query: {0:?}", other); assert!(false); }
+                other => { println!("beyond-top-row query: {0:?}", other); panic!(); }
             }
         }
     }
@@ -383,16 +380,16 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         for keyname in ["UGRD", "VGRD"].iter() {
             let cu = build_context(sref, "gfs", None, keyname, 103, 10.0, 6.0 * 3600.0, TimeInterpMode::Linear);
             match cu {
-                Err(e) => { println!("{0} ctx: {1:?}", keyname, e); assert!(false); }
+                Err(e) => { println!("{0} ctx: {1:?}", keyname, e); panic!(); }
                 Ok(c) => {
                     let vu = evaluate_point(&c, row_lat, lon_exact);
                     match vu {
-                        Err(other) => { println!("{0} probe: {1:?}", keyname, other); assert!(false); }
+                        Err(other) => { println!("{0} probe: {1:?}", keyname, other); panic!(); }
                         Ok(pv) => {
                             println!("GFS PROBE {0} 10m = {1} m/s", keyname, pv.value);
                             if !(pv.value.is_finite() && pv.value.abs() < 200.0) {
                                 println!("{0} implausible: {1}", keyname, pv.value);
-                                assert!(false);
+                                panic!();
                             }
                         }
                     }
@@ -412,16 +409,16 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
     if f12.is_some() {
         let ch = build_context(sref, "gfs", None, "HGT", 1, 0.0, 12.0 * 3600.0, TimeInterpMode::None);
         match ch {
-            Err(e) => { println!("HGT surface fh12 ctx: {0:?}", e); assert!(false); }
+            Err(e) => { println!("HGT surface fh12 ctx: {0:?}", e); panic!(); }
             Ok(c) => {
                 let vh = evaluate_point(&c, row_lat, lon_exact);
                 match vh {
-                    Err(other) => { println!("HGT probe: {0:?}", other); assert!(false); }
+                    Err(other) => { println!("HGT probe: {0:?}", other); panic!(); }
                     Ok(pv) => {
                         println!("GFS PROBE HGT surface = {0} gpm", pv.value);
                         if !(pv.value.is_finite() && pv.value > -500.0 && pv.value < 9000.0) {
                             println!("HGT implausible: {0}", pv.value);
-                            assert!(false);
+                            panic!();
                         }
                     }
                 }
@@ -430,15 +427,15 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         // HYBRID HGT at coordinate 1 (the raw stored value), fh 12:
         let chyb = build_context(sref, "gfs", None, "HGT", 105, 1.0, 12.0 * 3600.0, TimeInterpMode::None);
         match chyb {
-            Err(e) => { println!("HGT hybrid fh12 ctx: {0:?}", e); assert!(false); }
+            Err(e) => { println!("HGT hybrid fh12 ctx: {0:?}", e); panic!(); }
             Ok(c) => {
                 match evaluate_point(&c, row_lat, lon_exact) {
-                    Err(other) => { println!("HGT hybrid probe: {0:?}", other); assert!(false); }
+                    Err(other) => { println!("HGT hybrid probe: {0:?}", other); panic!(); }
                     Ok(pv) => {
                         println!("GFS PROBE HGT hybrid:1 = {0} gpm (wgrib2 306)", pv.value);
                         if absdiff(pv.value, 306.0) > 0.01 {
                             println!("HGT hybrid off: {0} vs 306", pv.value);
-                            assert!(false);
+                            panic!();
                         }
                     }
                 }
@@ -447,15 +444,15 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         // HYBRID TMP at coordinate 1, fh 12:
         let ctyb = build_context(sref, "gfs", None, "TMP", 105, 1.0, 12.0 * 3600.0, TimeInterpMode::None);
         match ctyb {
-            Err(e) => { println!("TMP hybrid fh12 ctx: {0:?}", e); assert!(false); }
+            Err(e) => { println!("TMP hybrid fh12 ctx: {0:?}", e); panic!(); }
             Ok(c) => {
                 match evaluate_point(&c, row_lat, lon_exact) {
-                    Err(other) => { println!("TMP hybrid probe: {0:?}", other); assert!(false); }
+                    Err(other) => { println!("TMP hybrid probe: {0:?}", other); panic!(); }
                     Ok(pv) => {
                         println!("GFS PROBE TMP hybrid:1 = {0} K (wgrib2 292.87)", pv.value);
                         if absdiff(pv.value, 292.87) > 0.01 {
                             println!("TMP hybrid off: {0} vs 292.87", pv.value);
-                            assert!(false);
+                            panic!();
                         }
                     }
                 }
@@ -468,7 +465,7 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         match cf {
             Ok(_) => {
                 println!("TMP grew a hag:2 plane at fh 12 out of nothing?");
-                assert!(false);
+                panic!();
             }
             Err(_) => { println!("hag:2 correctly absent at fh 12 (fh-12 TMP lives on hybrid)"); }
         }
@@ -482,19 +479,19 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
     {
         let ca = build_context(sref, "gfs", None, "d2c0n228", 1, 0.0, 0.0, TimeInterpMode::None);
         match ca {
-            Err(e) => { println!("ACOND ctx: {0:?}", e); assert!(false); }
+            Err(e) => { println!("ACOND ctx: {0:?}", e); panic!(); }
             Ok(c) => {
                 if c.units != "m/s" {
                     println!("ACOND units wrong: {0}", c.units);
-                    assert!(false);
+                    panic!();
                 }
                 match evaluate_point(&c, row_lat, lon_exact) {
-                    Err(other) => { println!("ACOND probe: {0:?}", other); assert!(false); }
+                    Err(other) => { println!("ACOND probe: {0:?}", other); panic!(); }
                     Ok(pv) => {
                         println!("GFS PROBE ACOND surface = {0} m/s (wgrib2 0.0125)", pv.value);
                         if !(pv.value.is_finite() && absdiff(pv.value, 0.0125) <= 0.001) {
                             println!("ACOND off: {0}", pv.value);
-                            assert!(false);
+                            panic!();
                         }
                     }
                 }
@@ -518,13 +515,12 @@ fn apcp_tight_decodes_as_full_size_zero_plane() {
         Some(x) => { x }
     };
     let meta = fs::metadata(&p);
-    let size = match meta { Err(_) => { assert!(false); return; } Ok(m) => { m.len() } };
+    let size = match meta { Err(_) => { panic!(); } Ok(m) => { m.len() } };
     let r = decode_file(p, ParamFilter::All);
     match r {
         Err(e) => {
             println!("APCP tight failed to decode: {0:?}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok((msgs, st)) => {
             assert!(st.messages_unsupported == 0);
@@ -556,14 +552,14 @@ fn wind_max_message_decodes_cleanly() {
     };
     let r = decode_file(p, ParamFilter::All);
     match r {
-        Err(e) => { println!("WIND max walk failed: {0:?}", e); assert!(false); return; }
+        Err(e) => { println!("WIND max walk failed: {0:?}", e); panic!();}
         Ok((msgs, st)) => {
             // structurally fine (PDT 4.8 IS supported for decoding); its
             // TIME-INTERPOLATION rejection is the guard tested by stat_pdt
             // and enforced again at query level in wx-server.
             assert!(st.messages_unsupported == 0);
             assert!(st.skip_grid.is_empty());
-            assert!(msgs.len() >= 1);
+            assert!(!msgs.is_empty());
             assert!(msgs[0].data.len() == 1905141);
         }
     }
@@ -574,14 +570,14 @@ fn wind_max_message_decodes_cleanly() {
 // ---------------------------------------------------------------------------
 
 fn real_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"hrrr_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n\n  # E5: WIND (Wind Speed) lives OUTSIDE the built-in table; raw triple read\n  # from the live bytes (discipline 0, category 2, number 1) with gribtable\n  # units. Its PDT 4.8 max-over-window metadata is production-byte proof.\n  [[models.params]]\n  discipline = 0\n  category = 2\n  number = 1\n  units = \"m/s\"\n  levels = [\"height_above_ground:10\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"hrrr_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n\n  # E5: WIND (Wind Speed) lives OUTSIDE the built-in table; raw triple read\n  # from the live bytes (discipline 0, category 2, number 1) with gribtable\n  # units. Its PDT 4.8 max-over-window metadata is production-byte proof.\n  [[models.params]]\n  discipline = 0\n  category = 2\n  number = 1\n  units = \"m/s\"\n  levels = [\"height_above_ground:10\"]\n"
 }
 
 #[test]
@@ -599,22 +595,13 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
     let _c = create_dir_all(&ing);
     copy_in(&tmpf, &join_path(&ing, "hrrr_tmp2m_f00.grib2"));
     let mut nfiles = 1usize;
-    match &uvf {
-        Some(p) => { copy_in(p, &join_path(&ing, "hrrr_uv10m_f06.grib2")); nfiles += 1; }
-        None => {}
-    }
-    match &apcpf {
-        Some(p) => { copy_in(p, &join_path(&ing, "hrrr_apcp_tight.grib2")); nfiles += 1; }
-        None => {}
-    }
+    if let Some(p) = &uvf { copy_in(p, &join_path(&ing, "hrrr_uv10m_f06.grib2")); nfiles += 1; }
+    if let Some(p) = &apcpf { copy_in(p, &join_path(&ing, "hrrr_apcp_tight.grib2")); nfiles += 1; }
     let windf = real_path("hrrr_windmax_f06.grib2");
-    match &windf {
-        Some(p) => { copy_in(p, &join_path(&ing, "hrrr_windmax_f06.grib2")); nfiles += 1; }
-        None => {}
-    }
+    if let Some(p) = &windf { copy_in(p, &join_path(&ing, "hrrr_windmax_f06.grib2")); nfiles += 1; }
     let cfgp = join_path(&root, "config.toml");
     match File::create(&cfgp) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let _n = w.write_all(real_cfg_text(&root).as_bytes());
         }
@@ -622,7 +609,7 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
 
     let po = Pipeline::open(&cfgp);
     let mut p = match po {
-        Err(e) => { println!("open failed: {0}", e); assert!(false); return; }
+        Err(e) => { println!("open failed: {0}", e); panic!(); }
         Ok(pp) => { pp }
     };
     let _n1 = p.scan_round();
@@ -639,7 +626,7 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
     let snap = p.shared.get_index();
     let sref = &*snap;
     match sref.find_model("hrrr") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 1);
             // E5 PRODUCTION PDT 4.8 METADATA PINS: the stat flags on these
@@ -682,29 +669,29 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
             let cb = build_context(sref, "hrrr", None, "TMP", 103, 2.0, 0.0,
                                    TimeInterpMode::Linear);
             match cb {
-                Err(e) => { println!("TMP ctx: {0:?}", e); assert!(false); }
+                Err(e) => { println!("TMP ctx: {0:?}", e); panic!(); }
                 Ok(c) => {
                     let v1 = evaluate_point(&c, 40.008964, 264.994145);
                     match v1 {
-                        Err(other) => { println!("probe A: {0:?}", other); assert!(false); }
+                        Err(other) => { println!("probe A: {0:?}", other); panic!(); }
                         Ok(pv) => {
                             let mut d = pv.value - 292.957;
                             if d < 0.0 { d = -d; }
-                            if !(d < 0.01) {
+                            if d.is_nan() || d >= 0.01 {
                                 println!("probe A value {0} vs wgrib2 292.957", pv.value);
-                                assert!(false);
+                                panic!();
                             }
                         }
                     }
                     let v2 = evaluate_point(&c, 36.986616, 262.494146);
                     match v2 {
-                        Err(other) => { println!("probe B: {0:?}", other); assert!(false); }
+                        Err(other) => { println!("probe B: {0:?}", other); panic!(); }
                         Ok(pv) => {
                             let mut d = pv.value - 295.582;
                             if d < 0.0 { d = -d; }
-                            if !(d < 0.01) {
+                            if d.is_nan() || d >= 0.01 {
                                 println!("probe B value {0} vs wgrib2 295.582", pv.value);
-                                assert!(false);
+                                panic!();
                             }
                         }
                     }
@@ -715,15 +702,15 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
             let ca = build_context(sref, "hrrr", None, "APCP", 1, 0.0, 0.0,
                                    TimeInterpMode::Linear);
             match ca {
-                Err(e) => { println!("APCP ctx: {0:?}", e); assert!(false); }
+                Err(e) => { println!("APCP ctx: {0:?}", e); panic!(); }
                 Ok(c) => {
                     let v = evaluate_point(&c, 36.986616, 262.494146);
                     match v {
                         Err(PointError::MissingData) => {
                             println!("APCP zero plane answered missing_data");
-                            assert!(false);
+                            panic!();
                         }
-                        Err(other) => { println!("APCP probe: {0:?}", other); assert!(false); }
+                        Err(other) => { println!("APCP probe: {0:?}", other); panic!(); }
                         Ok(pv) => { assert!(pv.value == 0.0); }
                     }
                 }
@@ -735,15 +722,15 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
                 let cu = build_context(sref, "hrrr", None, "UGRD", 103, 10.0,
                                        6.0 * 3600.0, TimeInterpMode::Linear);
                 match cu {
-                    Err(e) => { println!("UGRD ctx: {0:?}", e); assert!(false); }
+                    Err(e) => { println!("UGRD ctx: {0:?}", e); panic!(); }
                     Ok(c) => {
                         let v = evaluate_point(&c, 40.008964, 264.994145);
                         match v {
-                            Err(other) => { println!("UV probe: {0:?}", other); assert!(false); }
+                            Err(other) => { println!("UV probe: {0:?}", other); panic!(); }
                             Ok(pv) => {
                                 if !(pv.value.is_finite() && pv.value.abs() < 100.0) {
                                     println!("implausible U: {0}", pv.value);
-                                    assert!(false);
+                                    panic!();
                                 }
                             }
                         }

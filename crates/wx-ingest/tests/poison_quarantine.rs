@@ -23,23 +23,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -47,21 +47,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -82,7 +79,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 // V1.2 phase D: per-FILE OUTCOME lines (ingested / failed-quarantined / ignored /
@@ -96,7 +93,7 @@ fn count_progress(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 /// How many note-log lines mention a given marker.
@@ -107,7 +104,7 @@ fn count_notes(p: &Pipeline, marker: &str) -> usize {
             hits += 1;
         }
     }
-    return hits;
+    hits
 }
 
 fn quarantine_cfg(data: &str, ing: &str) -> String {
@@ -115,8 +112,8 @@ fn quarantine_cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -150,7 +147,7 @@ fn poison_files_are_quarantined_not_retried() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -170,15 +167,15 @@ fn poison_files_are_quarantined_not_retried() {
     let rs = p.state.find("gfs", sidecar.as_str());
     let rb = p.state.find("gfs", bad.as_str());
     match rg {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_OK); }
     }
     match rs {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_IGNORED); }
     }
     match rb {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_FAILED); }
     }
 
@@ -219,18 +216,18 @@ fn poison_files_are_quarantined_not_retried() {
     // ---- restart preserves the verdicts ---------------------------------
     let p2r = Pipeline::open(&cfg_path);
     let mut p2 = match p2r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p2.scan_round() == 0);
     assert!(p2.counters.errors == 0);           // no NEW decode attempt
     assert!(p2.counters.ingested_files == 0);
     match p2.state.find("gfs", bad.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_FAILED); }
     }
     match p2.state.find("gfs", sidecar.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(r) => { assert!(r.kind == REC_IGNORED); }
     }
 
@@ -255,5 +252,5 @@ fn contains_bytes(hay: &[u8], pat: &[u8]) -> bool {
             return true;
         }
     }
-    return false;
+    false
 }

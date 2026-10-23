@@ -39,7 +39,7 @@ use std::io::Write;
 // V1.3 E0) a 0-6 h accumulation window: processed=true, kind=accumulation,
 // begin=0 s, end=21600 s, step=0 s relative to the run time.
 fn golden_hdr() -> BinHeader {
-    return BinHeader {
+    BinHeader {
         nx: 7,
         ny: 5,
         levels: [1000.0, 837.5, 500.0].to_vec(),
@@ -52,7 +52,7 @@ fn golden_hdr() -> BinHeader {
             end_secs: 21600,
             step_secs: 0,
         },
-    };
+    }
 }
 
 /// Level coordinates of the golden input, canonical (descending) order.
@@ -66,7 +66,7 @@ fn plane_vals(li: usize) -> Vec<f32> {
             pl.push(((li * 1000) + (j * 10) + i) as f32);
         }
     }
-    return pl;
+    pl
 }
 
 // 976 hex chars = the 488-byte v2 golden file (56 fixed header + 3*4 level
@@ -74,16 +74,16 @@ fn plane_vals(li: usize) -> Vec<f32> {
 // scripts/gen_writer_golden.py (independent Python struct.pack of the layout).
 fn golden_hex() -> String {
     let mut hx = "5758505442494e31020000000700000005000000030001010100000000000000000000006054000000000000000000000000".to_string();
-    hx = hx + "00000000000000007a44006051440000fa43000000000000803f0000004000004040000080400000a0400000c04000002041";
-    hx = hx + "0000304100004041000050410000604100007041000080410000a0410000a8410000b0410000b8410000c0410000c8410000";
-    hx = hx + "d0410000f0410000f84100000042000004420000084200000c420000104200002042000024420000284200002c4200003042";
-    hx = hx + "000034420000384200007a4400407a4400807a4400c07a4400007b4400407b4400807b4400807c4400c07c4400007d440040";
-    hx = hx + "7d4400807d4400c07d4400007e4400007f4400407f4400807f4400c07f4400008044002080440040804400c0804400e08044";
-    hx = hx + "0000814400208144004081440060814400808144000082440020824400408244006082440080824400a0824400c082440000";
-    hx = hx + "fa440020fa440040fa440060fa440080fa4400a0fa4400c0fa440040fb440060fb440080fb4400a0fb4400c0fb4400e0fb44";
-    hx = hx + "0000fc440080fc4400a0fc4400c0fc4400e0fc440000fd440020fd440040fd4400c0fd4400e0fd440000fe440020fe440040";
-    hx = hx + "fe440060fe440080fe440000ff440020ff440040ff440060ff440080ff4400a0ff4400c0ff44";
-    return hx;
+    hx += "00000000000000007a44006051440000fa43000000000000803f0000004000004040000080400000a0400000c04000002041";
+    hx += "0000304100004041000050410000604100007041000080410000a0410000a8410000b0410000b8410000c0410000c8410000";
+    hx += "d0410000f0410000f84100000042000004420000084200000c420000104200002042000024420000284200002c4200003042";
+    hx += "000034420000384200007a4400407a4400807a4400c07a4400007b4400407b4400807b4400807c4400c07c4400007d440040";
+    hx += "7d4400807d4400c07d4400007e4400007f4400407f4400807f4400c07f4400008044002080440040804400c0804400e08044";
+    hx += "0000814400208144004081440060814400808144000082440020824400408244006082440080824400a0824400c082440000";
+    hx += "fa440020fa440040fa440060fa440080fa4400a0fa4400c0fa440040fb440060fb440080fb4400a0fb4400c0fb4400e0fb44";
+    hx += "0000fc440080fc4400a0fc4400c0fc4400e0fc440000fd440020fd440040fd4400c0fd4400e0fd440000fe440020fe440040";
+    hx += "fe440060fe440080fe440000ff440020ff440040ff440060ff440080ff4400a0ff4400c0ff44";
+    hx
 }
 
 fn unhex(hx: &str) -> Vec<u8> {
@@ -92,14 +92,14 @@ fn unhex(hx: &str) -> Vec<u8> {
     for k in 0 .. b.len() / 2 {
         out.push((nib(b[2 * k]) << 4) | nib(b[2 * k + 1]));
     }
-    return out;
+    out
 }
 
 fn nib(c: u8) -> u8 {
     if c >= 97 {
         return c - 97 + 10;
     }
-    return c - 48;
+    c - 48
 }
 
 // ---------------------------------------------------------------------------
@@ -110,17 +110,17 @@ fn nib(c: u8) -> u8 {
 fn read_bytes(path: &str) -> Vec<u8> {
     let f = File::open(path);
     match f {
-        Err(_) => { return [].to_vec(); }
+        Err(_) => { [].to_vec()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return [].to_vec(); }
+                Err(_) => { [].to_vec()}
                 Ok(region) => {
                     let mut out: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         out.push(region[k]);
                     }
-                    return out;
+                    out
                 }
             }
         }
@@ -130,7 +130,7 @@ fn read_bytes(path: &str) -> Vec<u8> {
 fn write_raw(path: &str, bytes: &[u8]) {
     let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut h) => {
             let _w = h.write_all(bytes);
         }
@@ -165,12 +165,12 @@ fn ref_write_whole_buffer(path: &str, hdr: &BinHeader, planes: &[&[f32]]) {
     push_i64(&mut bytes, hdr.stat.end_secs);
     push_i64(&mut bytes, hdr.stat.step_secs);
     push_u32(&mut bytes, 0);
-    for k in 0 .. hdr.levels.len() {
-        push_u32(&mut bytes, hdr.levels[k].to_bits());
+    for lv in &hdr.levels {
+        push_u32(&mut bytes, lv.to_bits());
     }
-    for li in 0 .. planes.len() {
-        for k in 0 .. planes[li].len() {
-            let bits = planes[li][k].to_bits();
+    for pl in planes.iter() {
+        for v in pl.iter() {
+            let bits = v.to_bits();
             bytes.push((bits & 0xFF) as u8);
             bytes.push(((bits >> 8) & 0xFF) as u8);
             bytes.push(((bits >> 16) & 0xFF) as u8);
@@ -208,13 +208,13 @@ struct PairPlanes<'a> {
 }
 
 impl<'a> PlaneSource for PairPlanes<'a> {
-    fn next_plane(self: &mut Self) -> Option<&[f32]> {
+    fn next_plane(&mut self) -> Option<&[f32]> {
         if self.idx >= self.items.len() {
             return None;
         }
         let r = &self.items[self.idx].1[..];
         self.idx += 1;
-        return Some(r);
+        Some(r)
     }
 }
 
@@ -229,8 +229,8 @@ fn streaming_writer_output_is_byte_identical_to_golden() {
     let hdr = golden_hdr();
     // pairs FIRST, then borrow the planes out of them for the slice API
     let mut pairs: Vec<(f64, Vec<f32>)> = Vec::<(f64, Vec<f32>)>::new();
-    for li in 0 .. 3 {
-        pairs.push(((LEVEL_VALS[li]) as f64, plane_vals(li)));
+    for (li, lv) in LEVEL_VALS.iter().enumerate() {
+        pairs.push((*lv, plane_vals(li)));
     }
     let refs: Vec<&[f32]> = [&pairs[0].1[..], &pairs[1].1[..], &pairs[2].1[..]].to_vec();
 
@@ -266,7 +266,7 @@ fn streaming_writer_output_is_byte_identical_to_golden() {
     // metadata included (the accumulation window is what the guard reads).
     let op = open_field(p_stream.to_string());
     match op {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok(mf) => {
             assert!(mf.header.nx == 7 && mf.header.ny == 5);
             assert!(mf.header.scan_ns && !mf.header.winds_grid);
@@ -301,7 +301,7 @@ fn v1_golden_is_rejected_as_an_old_format_not_misparsed() {
     // version field says 1 while this build writes 2
     let ver = bin_version_of_path(dst.as_str());
     match ver {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(vv) => {
             assert!(vv == 1);
             assert!(vv != BIN_VERSION);
@@ -310,18 +310,18 @@ fn v1_golden_is_rejected_as_an_old_format_not_misparsed() {
     // decode_header refuses instead of inventing stat metadata
     let dec = decode_header(&v1[..]);
     match dec {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!(); }
         Err(e) => {
             match e {
                 wx_core::storage::HeaderError::BadVersion => {}
-                _ => { assert!(false); }
+                _ => { panic!(); }
             }
         }
     }
     // and open_field reports the DISTINCT string the warm-start recovery keys on
     let of = open_field(dst.to_string());
     match of {
-        Ok(_) => { assert!(false); return; }
+        Ok(_) => { panic!();}
         Err(msg) => { assert!(msg == "bad bin version"); }
     }
 }

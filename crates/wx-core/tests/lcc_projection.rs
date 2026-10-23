@@ -49,7 +49,7 @@ fn make_lcc() -> GridDef {
     // scan byte 0 (rows southward from La1), earth byte 6 (sphere).
     let g = GridLambert::new(61, 41, 21.11389, 233.44, 229.53, 26.5,
                              26.5, 35.0, 3000.0, 3000.0, 1, 0, 6, true);
-    return GridDef::Lambert(g);
+    GridDef::Lambert(g)
 }
 
 fn abs_diff(a: f64, b: f64) -> f64 {
@@ -57,7 +57,7 @@ fn abs_diff(a: f64, b: f64) -> f64 {
     if d < 0.0 {
         return -d;
     }
-    return d;
+    d
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn lcc_matches_wgrib2_ll2ij() {
         let j_wg = row[3];
         let p = g.project(lat, lon);
         match p {
-            None => { assert!(false); }
+            None => { panic!(); }
             Some((di, dj)) => {
                 // storage -> wgrib2 convention
                 assert!(abs_diff(di + 1.0, i_wg) <= 1e-4);
@@ -87,7 +87,7 @@ fn lcc_corner_center_coverage() {
     let g = make_lcc();
     let p = g.project(21.11389, 233.44);
     match p {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some((di, dj)) => {
             assert!(abs_diff(di, 0.0) <= 1e-9);
             assert!(abs_diff(dj, 0.0) <= 1e-9);
@@ -96,7 +96,7 @@ fn lcc_corner_center_coverage() {
     // center of the domain: half-way indices
     let c = g.project(20.55194, 234.23);
     match c {
-        None => { assert!(false); }
+        None => { panic!(); }
         Some((di, dj)) => {
             assert!(di > 15.0 && di < 45.0);
             assert!(dj > 10.0 && dj < 30.0);
@@ -115,7 +115,7 @@ fn lcc_inverse_roundtrip() {
         let (lat, lon) = gl.inverse(pt[0], pt[1]);
         let back = gl.project(lat, lon);
         match back {
-            None => { assert!(false); }
+            None => { panic!(); }
             Some((di, dj)) => {
                 assert!(abs_diff(di, pt[0]) <= 1e-6);
                 assert!(abs_diff(dj, pt[1]) <= 1e-6);

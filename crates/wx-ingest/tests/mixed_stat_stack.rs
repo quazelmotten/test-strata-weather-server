@@ -51,7 +51,7 @@ use std::fs::read_dir;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -72,12 +72,12 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
         Err(_) => { return Vec::<u8>::new(); }
         Ok(h) => {
@@ -98,15 +98,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -136,8 +133,8 @@ fn mix_cfg(model: &str, file: &str, data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"";
     let t = format!("{0}{1}", t, file);
-    let t = t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n"
 }
 
 // ---------------------------------------------------------------------------
@@ -152,7 +149,7 @@ fn probe(sref: &wx_ingest::index::IndexSnapshot, model: &str, want_fh: f64)
     -> Result<f64, (i64, i64, i64, u8)> {
     let agl = lookup_level_type("height_above_ground");
     match agl {
-        None => { assert!(false); return Err((-1, -1, -1, 255)); }
+        None => { panic!(); }
         Some(code) => {
             let c = build_context(sref, model, None, "TMP", code, 2.0, want_fh,
                                   TimeInterpMode::Linear);
@@ -164,8 +161,7 @@ fn probe(sref: &wx_ingest::index::IndexSnapshot, model: &str, want_fh: f64)
                         }
                         _ => {
                             println!("unexpected select error {:?}", e);
-                            assert!(false);
-                            return Err((-1, -1, -1, 255));
+                            panic!();
                         }
                     }
                 }
@@ -174,8 +170,7 @@ fn probe(sref: &wx_ingest::index::IndexSnapshot, model: &str, want_fh: f64)
                     match v {
                         Err(we) => {
                             println!("unexpected eval error {:?}", we);
-                            assert!(false);
-                            return Err((-1, -1, -1, 255));
+                            panic!();
                         }
                         Ok(qr) => {
                             // the probe sits EXACTLY on grid node (i=0, j=0)
@@ -196,7 +191,7 @@ fn probe(sref: &wx_ingest::index::IndexSnapshot, model: &str, want_fh: f64)
 fn check_stack_flags(sref: &wx_ingest::index::IndexSnapshot, model: &str) {
     let m = sref.find_model(model);
     match m {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(mm) => {
             assert!(mm.runs.len() == 1);
             let mut found = false;
@@ -226,7 +221,7 @@ fn check_stack_flags(sref: &wx_ingest::index::IndexSnapshot, model: &str) {
                 // FALSE here while reverse order showed TRUE: the coin flip
                 // the audit called out).
                 assert!(fe.fd.stat_processed);
-                assert!(fe.fd.stat_kind == "accumulation".to_string());
+                assert!(fe.fd.stat_kind == "accumulation");
             }
             assert!(found);
         }
@@ -251,7 +246,7 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -266,11 +261,11 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
     // 256. These pass pre-fix too; they pin that the refactor did not break
     // exactness.
     match probe(sref, "mix", 0.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v == 250.0); }
     }
     match probe(sref, "mix", 21600.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v == 256.0); }
     }
 
@@ -279,7 +274,7 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
     // answered 200 with the SILENT BLEND 253.0 — the wrong number the audit
     // flagged. Post-fix: refused, naming the offending hour + kind.
     match probe(sref, "mix", 10800.0) {
-        Ok(_v) => { assert!(false); return; }
+        Ok(_v) => { panic!(); }
         Err(d) => {
             assert!(d.0 == 0);       // bracket low  = fh 0 h
             assert!(d.1 == 21600);   // bracket high = fh 6 h
@@ -291,7 +286,7 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
     // MID fh 9: bracket [6 h, 12 h] — same accumulation on the LOW side this
     // time; still refused, offender still fh 6.
     match probe(sref, "mix", 32400.0) {
-        Ok(_v) => { assert!(false); return; }
+        Ok(_v) => { panic!(); }
         Err(d) => {
             assert!(d.0 == 21600);
             assert!(d.1 == 43200);
@@ -303,7 +298,7 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
     // MID fh 15: bracket [12 h, 18 h], BOTH endpoints instantaneous -> the
     // guard must NOT over-block: answers the analytic midpoint exactly.
     match probe(sref, "mix", 54000.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v == 265.0); }
     }
 
@@ -311,7 +306,7 @@ fn mixed_stack_instantaneous_first_guards_per_forecast_hour() {
     // slot -> fail closed with the guard naming the first guarded hour
     // (bracket reported as -1/-1: there is none to blend).
     match probe(sref, "mix", 79200.0) {
-        Ok(_v) => { assert!(false); return; }
+        Ok(_v) => { panic!();}
         Err(d) => {
             assert!(d.0 == -1);
             assert!(d.1 == -1);
@@ -340,7 +335,7 @@ fn mixed_stack_accumulation_first_answers_clean_brackets() {
 
     let p1r = Pipeline::open(&cfg_path);
     let mut p1 = match p1r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(settle(&mut p1, 1usize) == 1usize);
@@ -354,14 +349,14 @@ fn mixed_stack_accumulation_first_answers_clean_brackets() {
     // Pre-fix the field flag came from the ACCUMulation registered first and
     // this was WRONGLY refused (422); post-fix it answers exactly 265.
     match probe(sref, "mixr", 54000.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v == 265.0); }
     }
 
     // Mid fh 3 / fh 9: guarded brackets refuse with payloads IDENTICAL to
     // the forward-order test above (order independence, per-fh truth).
     match probe(sref, "mixr", 10800.0) {
-        Ok(_v) => { assert!(false); return; }
+        Ok(_v) => { panic!(); }
         Err(d) => {
             assert!(d.0 == 0);
             assert!(d.1 == 21600);
@@ -370,7 +365,7 @@ fn mixed_stack_accumulation_first_answers_clean_brackets() {
         }
     }
     match probe(sref, "mixr", 32400.0) {
-        Ok(_v) => { assert!(false); return; }
+        Ok(_v) => { panic!(); }
         Err(d) => {
             assert!(d.0 == 21600);
             assert!(d.1 == 43200);
@@ -381,11 +376,11 @@ fn mixed_stack_accumulation_first_answers_clean_brackets() {
 
     // Exact hits unaffected by order.
     match probe(sref, "mixr", 0.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { assert!(v == 250.0); }
     }
     match probe(sref, "mixr", 21600.0) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(v) => { assert!(v == 256.0); }
     }
 }

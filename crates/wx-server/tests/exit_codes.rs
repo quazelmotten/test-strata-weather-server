@@ -13,6 +13,13 @@
 // errors forever. The two tail tests pin both halves: rc == 7 with the default
 // `[ingest].wind_pair_enforce = true`, and NO early exit (killed by `timeout`,
 // rc 124) when the key is set false while the violation note still fires.
+//
+// V1.3 phase E6 closes the two remaining GAPS in this ledger (README §9 keeps
+// the honest list): rc == 4 (startup wind-pair PREFLIGHT decides immediately
+// when the offending file is already stable at boot) and rc == 6 (an address
+// that cannot be bound). Codes 3/5/8 stay wired-but-untested: forcing them
+// black-box needs privileged-environment surgery that would make the suite
+// machine-dependent.
 
 use std::env::var;
 use std::fs::File;
@@ -43,7 +50,7 @@ fn c_str(s: String) -> Vec<i8> {
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -64,20 +71,17 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn write_text(path: &str, text: &str) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(text.as_bytes());
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -132,7 +136,7 @@ fn run_cmd(cmd_body: String, root: String) -> i64 {
     let buf = c_str(cmd);
     let _sys = unsafe { libc_system(&buf[0]) };
     let txt = match read_to_string(&rcf) {
-        Err(_) => { assert!(false); return -999; }
+        Err(_) => { panic!(); }
         Ok(t) => { t }
     };
     // parse the digits following "rc="
@@ -210,7 +214,7 @@ fn the_overlap_guard_rejects_startup_with_a_nonzero_code_naming_both_paths() {
     // and the failure message names BOTH paths, as the spec's loud-failure rule asks
     let logf = join_path(&root, "run.log");
     let txt = match read_to_string(&logf) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t) => { t }
     };
     assert!(txt.contains("OVERLAP"));
@@ -247,12 +251,21 @@ fn an_unknown_parameter_name_in_the_config_exits_with_the_config_code() {
 /// evidence, which is exactly the audit-defect-5 scenario.
 #[allow(clippy::needless_return)]
 fn wind_cfg(data: &str, ing: &str, bind: &str, extra: &str) -> String {
+    return wind_cfg_win(data, ing, bind, extra, 4);
+}
+
+/// Same builder with the stability window pinned EXPLICITLY. V1.3 phase E6
+/// uses win=0 for the STARTUP-PREFLIGHT test: a fixture copied before spawn
+/// is INSTANTLY stable (age >= 0 s), so `startup_wind_preflight` probes it,
+/// decides on the spot, and the boot must die with code 4 BEFORE any data is
+/// ingested or any port bound (main.rs runs preflight ahead of the runtime).
+#[allow(clippy::needless_return)]
+fn wind_cfg_win(data: &str, ing: &str, bind: &str, extra: &str, win: u32) -> String {
     let t = "[server]\nbind = \"";
     let t = format!("{0}{1}", t, bind);
     let t = t + "\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
-    let t = t + "\"\n\n[ingest]\nscan_interval_secs = 1\nretention_runs = 4\nstable_window_secs = 4\n";
-    let t = format!("{0}{1}", t, extra);
+    let t = format!("{0}\"\n\n[ingest]\nscan_interval_secs = 1\nretention_runs = 4\nstable_window_secs = {1}\n{2}", t, win, extra);
     let t = t + "\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n";
@@ -263,13 +276,10 @@ fn wind_cfg(data: &str, ing: &str, bind: &str, extra: &str) -> String {
 fn write_bytes(path: String, bytes: &[u8]) {
     let d = File::create(&path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -287,7 +297,7 @@ fn deferred_wind_violation_exits_seven_after_the_decoding_round() {
     // decode fires the violation.
     let fx = read_file_bytes("../../tests/fixtures/hrrr_small.grib2");
     let bytes = match fx {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(b) => { b }
     };
     write_bytes(join_path(&ing, "hrrr_small.grib2"), &bytes[..]);
@@ -304,7 +314,7 @@ fn deferred_wind_violation_exits_seven_after_the_decoding_round() {
     // The operator saw WHY: the decode-time note AND the FATAL exit line.
     let logf = join_path(&root, "run.log");
     let txt = match read_to_string(&logf) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t) => { t }
     };
     assert!(txt.contains("wind pair rule violated"));
@@ -321,7 +331,7 @@ fn wind_pair_enforce_false_keeps_the_note_but_never_exits_early() {
     let _c = create_dir_all(&ing);
     let fx = read_file_bytes("../../tests/fixtures/hrrr_small.grib2");
     let bytes = match fx {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(b) => { b }
     };
     write_bytes(join_path(&ing, "hrrr_small.grib2"), &bytes[..]);
@@ -340,10 +350,79 @@ fn wind_pair_enforce_false_keeps_the_note_but_never_exits_early() {
     // reported, only the process-level exit is declined.
     let logf = join_path(&root, "run.log");
     let txt = match read_to_string(&logf) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(t) => { t }
     };
     assert!(txt.contains("wind pair rule violated"));
     assert!(!txt.contains("exit 7"));
+    rm_tree(&root);
+}
+
+// ---------------------------------------------------------------------------
+// V1.3 phase E6 — the two exit-code assertions that used to be documented but
+// unenforced (see file header; README §9 carries the matching ledger).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stable_wind_half_pair_exits_four_at_boot() {
+    let root = "/tmp/opencode/wxpoint-exit-wind4".to_string();
+    rm_tree(&root);
+    let ing = join_path(&root, "incoming");
+    let data = join_path(&root, "store");
+    let _c = create_dir_all(&ing);
+    // Same half-pair setup as the deferred rc==7 test, EXCEPT the fixture sits
+    // there BEFORE spawn and stable_window_secs = 0 makes it instantly stable:
+    // the boot preflight can probe it and DECIDE immediately, so main.rs must
+    // print the spec §4.4 rejection and exit(4) BEFORE opening the pipeline,
+    // binding any port, or ingesting anything.
+    let fx = read_file_bytes("../../tests/fixtures/hrrr_small.grib2");
+    let bytes = match fx {
+        Err(_) => { panic!(); }
+        Ok(b) => { b }
+    };
+    write_bytes(join_path(&ing, "hrrr_small.grib2"), &bytes[..]);
+    let cfg = join_path(&root, "config.toml");
+    write_text(&cfg, wind_cfg_win(&data, &ing, "127.0.0.1:8125", "", 0).as_str());
+    let args = format!("--config {0}", cfg);
+    let rc = run_and_capture(args, root.to_string());
+    assert!(rc == 4);
+
+    let logf = join_path(&root, "run.log");
+    let txt = match read_to_string(&logf) {
+        Err(_) => { panic!(); }
+        Ok(t) => { t }
+    };
+    assert!(txt.contains("config error (spec 4.4)"));
+    assert!(txt.contains("GRID-RELATIVE"));
+    // Preflight runs AHEAD of Pipeline::open: nothing was touched in data_dir.
+    let run_marker = join_path(&data, "hrrr");
+    assert!(stat_size_mtime(run_marker.as_str()).is_err());
+    rm_tree(&root);
+}
+
+#[test]
+fn an_unbindable_address_exits_six() {
+    let root = "/tmp/opencode/wxpoint-exit-bind6".to_string();
+    rm_tree(&root);
+    let ing = join_path(&root, "incoming");
+    let data = join_path(&root, "store");
+    let _c = create_dir_all(&ing);
+    // Everything valid except `bind`: an address tokio cannot resolve fails at
+    // TcpListener::bind -> documented code 6. UNPARSEABLE rather than
+    // port-in-use keeps the assertion deterministic regardless of uid or what
+    // else runs on the machine (no privileged-port / race flakiness).
+    let cfgt = format!("[server]\nbind = \"256.256.256.256:8080\"\ndata_dir = \"{0}\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"{1}\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\"]\n", data, ing);
+    let cfg = join_path(&root, "config.toml");
+    write_text(&cfg, cfgt.as_str());
+    let args = format!("--config {0}", cfg);
+    let rc = run_and_capture(args, root.to_string());
+    assert!(rc == 6);
+
+    let logf = join_path(&root, "run.log");
+    let txt = match read_to_string(&logf) {
+        Err(_) => { panic!(); }
+        Ok(t) => { t }
+    };
+    assert!(txt.contains("failed to bind 256.256.256.256:8080"));
     rm_tree(&root);
 }

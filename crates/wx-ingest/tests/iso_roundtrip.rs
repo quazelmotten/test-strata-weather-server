@@ -26,7 +26,7 @@ fn iso_utc_matches_known_instants() {
         let got = iso_utc(tab_ep[k as usize]);
         if got != tab_txt[k as usize] {
             println!("iso_utc({0}) = {1}, expected {2}", tab_ep[k as usize], got, tab_txt[k as usize]);
-            assert!(false);
+            panic!();
         }
         k += 1;
     }
@@ -58,7 +58,7 @@ fn iso_utc_parse_round_trips_across_two_centuries() {
     }
     assert!(bad == 0);
     // negative epochs are refused, not rendered
-    assert!(iso_utc(-1) == "".to_string());
+    assert!(iso_utc(-1).is_empty());
     // strict parser rejects deviations from the canonical form
     assert!(parse_iso_utc("2026-10-19 12:30:00Z").is_none());
     assert!(parse_iso_utc("2026-10-19T12:30:00").is_none());

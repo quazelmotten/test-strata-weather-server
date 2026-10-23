@@ -28,7 +28,7 @@ use std::io::Write;
 
 #[allow(clippy::needless_return)]
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -49,7 +49,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
@@ -63,10 +63,7 @@ fn base_name_of(p: String) -> String {
 #[allow(clippy::needless_return)]
 fn exists_any(p: &str) -> bool {
     // True when p names EITHER a directory or a regular file that exists.
-    match read_dir(&p) {
-        Ok(_) => { return true; }
-        Err(_) => {}
-    }
+    if read_dir(p).is_ok() { return true; }
     let ix = match p.rfind('/') {
         None => { return false; }
         Some(v) => { v }
@@ -91,28 +88,25 @@ fn exists_any(p: &str) -> bool {
 
 #[allow(clippy::needless_return)]
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); return; }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 #[allow(clippy::needless_return)]
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { assert!(false); return Vec::<u8>::new(); }
+        Err(_) => { panic!(); }
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { assert!(false); return Vec::<u8>::new(); }
+                Err(_) => { panic!(); }
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
@@ -168,11 +162,11 @@ fn patch_day(src: &[u8], day: u8) -> Vec<u8> {
 #[test]
 fn quarantined_husk_is_swept_at_boot_before_anything_indexes() {
     let root = "/tmp/opencode/wxpoint-desweep";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     let t = "[server]\nbind = \"b\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
@@ -183,13 +177,13 @@ fn quarantined_husk_is_swept_at_boot_before_anything_indexes() {
     // Plant the crash residue: a renamed husk WITH junk inside (the state a
     // kill between rename and rmdir leaves) under the model's data dir.
     let husk = format!("{0}/gfs/2026101900.deleting.123456", data);
-    let _m1 = create_dir_all(&format!("{0}/TMP/isobaric", husk));
+    let _m1 = create_dir_all(format!("{0}/TMP/isobaric", husk));
     write_bytes(&format!("{0}/TMP/isobaric/f006.bin", husk), b"half-written garbage");
     write_bytes(&format!("{0}/manifest.json", husk), b"{\"broken\":");
 
     let pr = Pipeline::open(&cfg_path);
     let p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     // gone from disk...
@@ -201,8 +195,8 @@ fn quarantined_husk_is_swept_at_boot_before_anything_indexes() {
     assert!(p.counters.errors == 0);
     // Nothing indexed (empty ingest dir: a model earns its registry entry
     // only by having an INDEXED run, and the swept husk never indexed).
-    assert!(p.registry.len() == 0);
-    rm_tree(&root);
+    assert!(p.registry.is_empty());
+    rm_tree(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,9 +221,9 @@ fn quarantine_names_never_parse_as_run_dirs() {
 #[test]
 fn retention_quarantine_leaves_no_residue_on_the_happy_path() {
     let root = "/tmp/opencode/wxpoint-desweep-retention";
-    rm_tree(&root);
-    let ing = join_path(&root, "ing");
-    let data = join_path(&root, "data");
+    rm_tree(root);
+    let ing = join_path(root, "ing");
+    let data = join_path(root, "data");
     let _c = create_dir_all(&ing);
     let base = read_bytes("../../tests/fixtures/gfs_small.grib2");
     // run A: 2026-10-19T12Z, run B: 2026-10-20T12Z (section-1 day patched).
@@ -240,12 +234,12 @@ fn retention_quarantine_leaves_no_residue_on_the_happy_path() {
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 1\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
     let t = t + "\"\nfile_glob = \"*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    let cfg_path = join_path(&root, "config.toml");
+    let cfg_path = join_path(root, "config.toml");
     write_bytes(&cfg_path, t.as_bytes());
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
     assert!(p.scan_round() == 0);
@@ -253,11 +247,11 @@ fn retention_quarantine_leaves_no_residue_on_the_happy_path() {
     assert!(n2 == 2);
     // retention_runs = 1: run A is pruned as soon as B indexes.
     assert!(p.registry[0].runs.len() == 1);
-    assert!(p.registry[0].runs[0].dir_name == "2026102012".to_string());
+    assert!(p.registry[0].runs[0].dir_name == "2026102012");
     // the victim tree is GONE and no quarantine husk lingers...
     assert!(!exists_any(&format!("{0}/gfs/2026101912", data)));
     let mut residue = 0usize;
-    match read_dir(&format!("{0}/gfs", data)) {
+    match read_dir(format!("{0}/gfs", data)) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -279,5 +273,5 @@ fn retention_quarantine_leaves_no_residue_on_the_happy_path() {
     assert!(count_notes(&p, "startup sweep") == 0);
     assert!(count_notes(&p, "quarantine rename FAILED") == 0);
     assert!(count_notes(&p, "partial delete") == 0);
-    rm_tree(&root);
+    rm_tree(root);
 }

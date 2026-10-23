@@ -9,7 +9,7 @@ use wx_ingest::grib2::ParamFilter;
 use wx_ingest::codecs::data_cksum_grid;
 
 fn fixture_path(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 // tools/wgrib2-full tests/fixtures/gfs_small.grib2 -checksum data
@@ -35,7 +35,7 @@ const STAT_CKSUMS: [u32; 3] = [1392457546, 1392457546, 348850530];
 fn gfs_drt50_data_checksums_match_wgrib2() {
     let r = decode_file(fixture_path("gfs_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok((msgs, _st)) => {
             assert!(msgs.len() == GFS_CKSUMS.len());
             for k in 0 .. msgs.len() {
@@ -50,7 +50,7 @@ fn gfs_drt50_data_checksums_match_wgrib2() {
 fn hrrr_drt50_data_checksums_match_wgrib2() {
     let r = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok((msgs, _st)) => {
             assert!(msgs.len() == HRRR_CKSUMS.len());
             for k in 0 .. msgs.len() {
@@ -65,7 +65,7 @@ fn hrrr_drt50_data_checksums_match_wgrib2() {
 fn stat_pdt48_data_checksums_match_wgrib2() {
     let r = decode_file(fixture_path("stat_small.grib2"), ParamFilter::All);
     match r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok((msgs, _st)) => {
             assert!(msgs.len() == 3);
             for k in 0 .. 3 {

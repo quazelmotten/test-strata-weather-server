@@ -22,7 +22,7 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -43,27 +43,27 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn perf_path() -> String {
-    return "../../tests/perfdata/gfs_perf_f000.grib2".to_string();
+    "../../tests/perfdata/gfs_perf_f000.grib2".to_string()
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -71,15 +71,12 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
@@ -103,10 +100,7 @@ const PERF_JPEG_CKSUMS: [u32; 22] = [
 
 #[test]
 fn perf_gfs_hour_jpeg_matches_simple_packing() {
-    match stat_size_mtime("../../tests/perfdata/gfs_perf_f000_jpeg.grib2") {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime("../../tests/perfdata/gfs_perf_f000_jpeg.grib2").is_err() { return; }
 
     let t0 = now_ns_marker("../../tests/perfdata");
     let r = decode_file("../../tests/perfdata/gfs_perf_f000_jpeg.grib2".to_string(), ParamFilter::All);
@@ -114,7 +108,7 @@ fn perf_gfs_hour_jpeg_matches_simple_packing() {
     match r {
         Err(_e) => {
             println!("jpeg perf twin decode failed");
-            assert!(false);
+            panic!();
         }
         Ok((msgs, st)) => {
             assert!(msgs.len() == PERF_JPEG_CKSUMS.len());
@@ -136,10 +130,7 @@ fn perf_gfs_hour_jpeg_matches_simple_packing() {
 #[test]
 fn perf_gfs_hour_ingest_and_query() {
     // skip when the perf fixture was not generated on this machine
-    match stat_size_mtime(&perf_path()) {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if stat_size_mtime(&perf_path()).is_err() { return; }
 
     let root = "/tmp/opencode/wxpoint-perf".to_string();
     rm_tree(&root);
@@ -158,7 +149,7 @@ fn perf_gfs_hour_ingest_and_query() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -176,40 +167,40 @@ fn perf_gfs_hour_ingest_and_query() {
 
     // Correctness on the full grid: value = 250 + row j, lat 89.875 - 0.25j.
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!();}
         Some(iso) => {
             let snap = p.shared.get_index();
             let sref = &*snap;
             match sref.find_model("gfs") {
-                None => { assert!(false); return; }
+                None => { panic!();}
                 Some(_m) => {
                     let c_r = build_context(sref, "gfs", None, "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!();}
                         Ok(c) => {
                             // north edge node
                             let v0 = evaluate_point(&c, 89.875, 0.0);
                             match v0 {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 250.0); }
                             }
                             // row 1
                             let v1 = evaluate_point(&c, 89.625, 0.25);
                             match v1 {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 251.0); }
                             }
                             // south edge node (row 719)
                             let v2 = evaluate_point(&c, -89.875, 359.75);
                             match v2 {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 969.0); }
                             }
                             // off-node bilinear between rows 0/1 at lon 0.125
                             let v3 = evaluate_point(&c, 89.75, 0.125);
                             match v3 {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!();}
                                 Ok(pv) => { assert!(pv.value == 250.5); }
                             }
                         }

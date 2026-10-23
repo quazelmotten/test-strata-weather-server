@@ -19,7 +19,7 @@ use libc::CLOCK_MONOTONIC;
 
 #[allow(clippy::needless_return)]
 pub fn mono_ns_local() -> i64 {
-    let mut ts = timespec { tv_sec: 0 as i64, tv_nsec: 0 as i64 };
+    let mut ts = timespec { tv_sec: 0_i64, tv_nsec: 0_i64 };
     unsafe {
         clock_gettime(CLOCK_MONOTONIC, &mut ts);
     }
@@ -53,17 +53,11 @@ pub fn build_snapshot(dir: &str) -> Result<Arc<IndexSnapshot>, String> {
         refs.push(p.as_slice());
     }
     let wr0 = write_bin_atomic(f0.clone(), &hdr, &refs);
-    match wr0 {
-        Err(e) => { return Err(e.to_string()); }
-        Ok(_) => {}
-    }
+    if let Err(e) = wr0 { return Err(e.to_string()); }
     // fh 6 reuses identical planes: time interp still exercises both slots
     // and time_lerp (equal blend == exact value, bit-safe)
     let wr6 = write_bin_atomic(f6.clone(), &hdr, &refs);
-    match wr6 {
-        Err(e) => { return Err(e.to_string()); }
-        Ok(_) => {}
-    }
+    if let Err(e) = wr6 { return Err(e.to_string()); }
 
     let m0_r = open_field(f0);
     let mf0 = match m0_r { Err(e) => { return Err(e.to_string()); } Ok(x) => { x } };
@@ -76,10 +70,10 @@ pub fn build_snapshot(dir: &str) -> Result<Arc<IndexSnapshot>, String> {
         let mut acc = 0u8;
         let mut off = 0usize;
         while off < n {
-            acc = acc ^ mf[off];
-            off = off + 4096usize;
+            acc ^= mf[off];
+            off += 4096usize;
         }
-        return acc;
+        acc
     };
     let t0 = touch(&mf0.region);
     let t6 = touch(&mf6.region);
@@ -120,7 +114,7 @@ pub fn build_snapshot(dir: &str) -> Result<Arc<IndexSnapshot>, String> {
             runs: [run].to_vec(),
         }].to_vec(),
     };
-    return Ok(Arc::new(snap));
+    Ok(Arc::new(snap))
 }
 
 /// Query strings cycled per iteration (fixed point / seam / vertical+time).
@@ -133,7 +127,7 @@ pub fn make_qs() -> Vec<String> {
                          lats[k], lons[k]);
         out.push(qs);
     }
-    return out;
+    out
 }
 
 #[allow(clippy::needless_return)]
@@ -141,10 +135,7 @@ pub fn bench_handler(c: &mut Criterion) {
     let dir = "/tmp/opencode/wxpoint-bench";
     use std::fs::create_dir_all;
     let mk = create_dir_all(dir);
-    match mk {
-        Err(_) => { return; }
-        Ok(_) => {}
-    }
+    if mk.is_err() { return; }
     let snap_r = build_snapshot(dir);
     let snap = match snap_r { Err(_) => { return; } Ok(x) => { x } };
 
@@ -179,7 +170,7 @@ pub fn bench_handler(c: &mut Criterion) {
             Err(_) => {}
             Ok(pa) => {
                 let pr = answer_all(snp.clone(), &pa);
-                sink = sink + pr.1.len();
+                sink += pr.1.len();
             }
         }
         k = (k + 1) % qs_list.len();
@@ -190,12 +181,10 @@ pub fn bench_handler(c: &mut Criterion) {
     let p50 = samples[n / 2];
     let p90 = samples[(n * 9) / 10];
     let p99 = samples[(n * 99) / 100];
-    let total_us = samples.iter().fold(0u64, |a, b| a + b);
+    let total_us = samples.iter().sum::<u64>();
     println!("handler-level percentiles (no HTTP, warm page cache):");
-    println!("{0}  p50={1} us  p90={2} us  p99={3} us  max={4} us",
-             "", p50, p90, p99, samples[n - 1]);
-    println!("{0}  mean={1} us  single-thread throughput={2} ops/s",
-             "", (total_us as f64) / (n as f64),
+    println!("  p50={0} us  p90={1} us  p99={2} us  max={3} us", p50, p90, p99, samples[n - 1]);
+    println!("  mean={0} us  single-thread throughput={1} ops/s", (total_us as f64) / (n as f64),
              (n as f64) / ((total_us as f64) / 1000000.0));
     if sink == 0usize && n == 0usize {
         // observer

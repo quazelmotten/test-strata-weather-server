@@ -19,7 +19,7 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -40,20 +40,17 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 #[allow(clippy::needless_return)]
 fn touch(path: String) {
     let d = File::create(&path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut h) => {
             let w = h.write_all("x".as_bytes());
-            match w {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if w.is_err() { panic!(); }
         }
     }
 }

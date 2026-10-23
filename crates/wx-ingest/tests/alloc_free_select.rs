@@ -23,7 +23,7 @@ use std::fs::create_dir_all;
 use std::fs::remove_file;
 
 fn lcg(state: usize) -> usize {
-    return state.wrapping_mul(6364136223846793005usize).wrapping_add(1442695072203450757usize);
+    state.wrapping_mul(6364136223846793005usize).wrapping_add(1442695072203450757usize)
 }
 
 #[allow(clippy::needless_return)]
@@ -37,14 +37,10 @@ pub fn make_stub(dir: String) -> Result<Arc<MmapField>, String> {
         stat: StatMeta::instantaneous(),
     };
     let plane: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
-    let mut planes: Vec<&[f32]> = Vec::<&[f32]>::new();
-    let _p = planes.push(&plane[..]);
+    let planes: Vec<&[f32]> = vec![&plane[..]];
     let path = format!("{0}/stub_f.bin", dir);
     let wr = write_bin_atomic(path.clone(), &hdr, &planes);
-    match wr {
-        Err(e) => { return Err(e.to_string()); }
-        Ok(_) => {}
-    }
+    if let Err(e) = wr { return Err(e.to_string()); }
     let of = open_field(path.clone());
     match of {
         Err(e) => { return Err(e.to_string()); }
@@ -53,8 +49,8 @@ pub fn make_stub(dir: String) -> Result<Arc<MmapField>, String> {
 }
 
 pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64, stat: bool) -> IdxFh {
-    return IdxFh {
-        fh_secs: fh_secs,
+    IdxFh {
+        fh_secs,
         field: mf.clone(),
         // uniform per-slot flag per trial (structural resolution ignores it;
         // the guard layer that DOES read it is tested in mixed_stat_stack)
@@ -64,7 +60,7 @@ pub fn mk_fh(mf: Arc<MmapField>, fh_secs: i64, stat: bool) -> IdxFh {
         stat_begin_secs: 0,
         stat_end_secs: 0,
         stat_step_secs: 0,
-    };
+    }
 }
 
 #[test]
@@ -73,7 +69,7 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
     let _c = create_dir_all(&dir);
     let stub_r = make_stub(dir.to_string());
     match stub_r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok(stub) => {
             let mut seed = 0xABCDEFusize;
             let mut checked = 0usize;
@@ -88,8 +84,8 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
                 while k < n {
                     let step = if (trial % 5) == 0 { 1800i64 } else { 3600i64 };
                     let v = base + k as i64 * step;
-                    let _p = fhs.push(mk_fh(stub.clone(), v, (trial % 3) == 0));
-                    let _q = f64s.push(v as f64);
+                    fhs.push(mk_fh(stub.clone(), v, (trial % 3) == 0));
+                    f64s.push(v as f64);
                     k += 1;
                 }
                 let stat = (trial % 3) == 0;
@@ -101,7 +97,7 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
                     while wi < f64s.len() + 4usize {
                         let mut want = 1e9;
                         if wi < f64s.len() {
-                            if (wi % 2) == 0 { want = f64s[wi]; } else { want = f64s[wi] + 1800.0; }
+                            if wi.is_multiple_of(2) { want = f64s[wi]; } else { want = f64s[wi] + 1800.0; }
                         } else if wi == f64s.len() { want = f64s[0] - TIME_MATCH_EPS * 0.4; }
                         else if wi == f64s.len() + 1usize { want = f64s[f64s.len() - 1usize] + TIME_MATCH_EPS * 0.4; }
                         else if wi == f64s.len() + 2usize { want = -1e9; }
@@ -112,13 +108,10 @@ fn field_time_resolution_is_bit_identical_to_materialized_twin() {
                         let old_r = resolve_times(&f64s, want, mode, false);
                         let new_r = resolve_field_times(&fhs, want, mode);
                         assert!(old_r == new_r);
-                        match old_r {
-                            Ok(p) => {
-                                // reported bracket values identical doubles
-                                assert!(f64s[p.0] == (fhs[p.0].fh_secs as f64));
-                                assert!(f64s[p.1] == (fhs[p.1].fh_secs as f64));
-                            }
-                            Err(_) => {}
+                        if let Ok(p) = old_r {
+                            // reported bracket values identical doubles
+                            assert!(f64s[p.0] == (fhs[p.0].fh_secs as f64));
+                            assert!(f64s[p.1] == (fhs[p.1].fh_secs as f64));
                         }
                         checked += 1;
                         wi += 1;
@@ -139,7 +132,7 @@ fn empty_field_never_brackets() {
     let _c = create_dir_all(&dir);
     let stub_r = make_stub(dir.to_string());
     match stub_r {
-        Err(_e) => { assert!(false); return; }
+        Err(_e) => { panic!();}
         Ok(stub) => {
             let empty: Vec<IdxFh> = Vec::<IdxFh>::new();
             let r = resolve_field_times(&empty, 0.0, TimeInterpMode::Linear);
@@ -147,10 +140,10 @@ fn empty_field_never_brackets() {
                 Err(e) => {
                     match e {
                         PointError::NoTimeBracket => {}
-                        _ => { assert!(false); }
+                        _ => { panic!(); }
                     }
                 }
-                Ok(_) => { assert!(false); }
+                Ok(_) => { panic!(); }
             }
             let _u = stub.clone();
         }

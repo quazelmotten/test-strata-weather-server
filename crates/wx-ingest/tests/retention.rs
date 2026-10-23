@@ -6,7 +6,6 @@
 // gfs_small.grib2 (day 19 -> 20/21/22), verified against wgrib2 semantics.
 
 use wx_ingest::pipeline::Pipeline;
-use wx_ingest::pipeline::{build_snapshot};
 use wx_ingest::index::{build_context, evaluate_point, SelectError};
 use wx_core::interp::{TimeInterpMode};
 use wx_core::tables::{lookup_level_type};
@@ -22,23 +21,23 @@ use std::fs::remove_dir;
 use std::fs::read_dir;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn read_bytes(path: &str) -> Vec<u8> {
-    let f = File::open(&path);
+    let f = File::open(path);
     match f {
-        Err(_) => { return Vec::<u8>::new(); }
+        Err(_) => { Vec::<u8>::new()}
         Ok(h) => {
             let m = unsafe { Mmap::map(&h) };
             match m {
-                Err(_) => { return Vec::<u8>::new(); }
+                Err(_) => { Vec::<u8>::new()}
                 Ok(region) => {
                     let mut copy: Vec<u8> = Vec::<u8>::new();
                     for k in 0 .. region.len() {
                         copy.push(region[k]);
                     }
-                    return copy;
+                    copy
                 }
             }
         }
@@ -46,21 +45,18 @@ fn read_bytes(path: &str) -> Vec<u8> {
 }
 
 fn write_bytes(path: &str, bytes: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(bytes);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -81,7 +77,7 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 // sec1 date stamp pattern present once per record (39 records in gfs_small);
@@ -105,7 +101,7 @@ fn patch_day(src: &[u8], day: u8) -> Vec<u8> {
         }
     }
     assert!(hits == 39);
-    return out;
+    out
 }
 
 fn cfg(data: &str, ing: &str) -> String {
@@ -113,8 +109,8 @@ fn cfg(data: &str, ing: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 3\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -136,7 +132,7 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
 
     let pr = Pipeline::open(&cfg_path);
     let mut p = match pr {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(pp) => { pp }
     };
 
@@ -150,7 +146,7 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
     let sref_old = &*snap_old;
     let gm = sref_old.find_model("gfs");
     match gm {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => { assert!(m.runs.len() == 3); }
     }
 
@@ -166,57 +162,57 @@ fn retention_evicts_after_publish_stale_snapshot_still_reads() {
     let sref_new = &*snap_new;
     let gm2 = sref_new.find_model("gfs");
     match gm2 {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(m) => {
             assert!(m.runs.len() == 3);
-            assert!(m.runs[0].dir_name == "2026102012".to_string());
+            assert!(m.runs[0].dir_name == "2026102012");
         }
     }
     // The victim tree is gone from disk (deleted only AFTER the swap).
     let gone = read_bytes(&join_path(&join_path(&join_path(&data, "gfs"), "2026101912"), "grid.bin"));
-    assert!(gone.len() == 0);
+    assert!(gone.is_empty());
 
     // The stale snapshot still answers through the UNLINKED mmaps (§4.6).
-    let epA = epoch_secs(2026, 10, 19, 12, 0, 0);
+    let ep_a = epoch_secs(2026, 10, 19, 12, 0, 0);
     match lookup_level_type("isobaric") {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(iso) => {
             match gm2 {
-                None => { assert!(false); return; }
+                None => { panic!(); }
                 Some(_m) => {
-                    let c_r = build_context(sref_old, "gfs", Some(epA), "TMP", iso,
+                    let c_r = build_context(sref_old, "gfs", Some(ep_a), "TMP", iso,
                                          1000.0, 0.0, TimeInterpMode::Linear);
                     match c_r {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 10.0, 350.0);
                             match v {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 250.0); }
                             }
                         }
                     }
                     // The NEW snapshot can no longer pin the evicted run.
-                    let cn = build_context(sref_new, "gfs", Some(epA), "TMP", iso,
+                    let cn = build_context(sref_new, "gfs", Some(ep_a), "TMP", iso,
                                         1000.0, 0.0, TimeInterpMode::Linear);
                     match cn {
                         Err(e2) => {
                             match e2 {
                                 SelectError::NoRunCovers => {}
-                                _ => { assert!(false); }
+                                _ => { panic!(); }
                             }
                         }
-                        Ok(_) => { assert!(false); }
+                        Ok(_) => { panic!(); }
                     }
                     // Unpinned queries on the new snapshot answer from D.
                     let cd = build_context(sref_new, "gfs", None, "TMP", iso,
                                         1000.0, 0.0, TimeInterpMode::Linear);
                     match cd {
-                        Err(_) => { assert!(false); return; }
+                        Err(_) => { panic!(); }
                         Ok(c) => {
                             let v = evaluate_point(&c, 10.0, 350.0);
                             match v {
-                                Err(_) => { assert!(false); return; }
+                                Err(_) => { panic!(); }
                                 Ok(pv) => { assert!(pv.value == 250.0); }
                             }
                         }

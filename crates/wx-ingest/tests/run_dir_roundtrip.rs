@@ -50,8 +50,7 @@ fn every_minute_and_second_instant_round_trips_through_its_directory_name() {
                     assert!(n.len() == 10 || n.len() == 12 || n.len() == 14);
                     match parse_run_dir(n.as_str()) {
                         None => {
-                            assert!(false);
-                            return;
+                            panic!();
                         }
                         Some(ep) => {
                             // EXACT INSTANT RECOVERED, no silent truncation
@@ -82,11 +81,11 @@ fn every_minute_and_second_instant_round_trips_through_its_directory_name() {
 #[test]
 fn seconds_survive_a_boot_and_the_hour_only_name_stays_back_compatible() {
     // pre-fix this was "2026101912": the 30 s silently vanished. Now 14 chars.
-    assert!(run_dir_name(rt(2026, 10, 19, 12, 0, 30)) == "20261019120030".to_string());
-    assert!(run_dir_name(rt(2026, 10, 19, 12, 30, 15)) == "20261019123015".to_string());
-    assert!(run_dir_name(rt(2026, 10, 19, 12, 30, 0)) == "202610191230".to_string());
+    assert!(run_dir_name(rt(2026, 10, 19, 12, 0, 30)) == "20261019120030");
+    assert!(run_dir_name(rt(2026, 10, 19, 12, 30, 15)) == "20261019123015");
+    assert!(run_dir_name(rt(2026, 10, 19, 12, 30, 0)) == "202610191230");
     // UNCHANGED for whole hours: every pre-V1.2 fixture keeps its name
-    assert!(run_dir_name(rt(2026, 10, 19, 12, 0, 0)) == "2026101912".to_string());
+    assert!(run_dir_name(rt(2026, 10, 19, 12, 0, 0)) == "2026101912");
 
     // the two are DISTINCT directories...
     let na = run_dir_name(rt(2026, 10, 19, 12, 0, 0));
@@ -94,12 +93,12 @@ fn seconds_survive_a_boot_and_the_hour_only_name_stays_back_compatible() {
     assert!(na != nb);
     let base_ep = epoch_secs(2026, 10, 19, 12, 0, 0);
     match parse_run_dir(nb.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(ep) => { assert!(ep == base_ep + 30); }
     }
     // a legacy 10-char directory name still means minute=second=0
     match parse_run_dir(na.as_str()) {
-        None => { assert!(false); return; }
+        None => { panic!(); }
         Some(ep2) => { assert!(ep2 == base_ep); }
     }
     // non-names are rejected, not guessed

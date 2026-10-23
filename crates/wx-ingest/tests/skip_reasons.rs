@@ -34,11 +34,11 @@ use wx_ingest::pipeline::Pipeline;
 use wx_ingest::state::join_path;
 
 fn fixture(name: &str) -> String {
-    return format!("../../tests/fixtures/{name}");
+    format!("../../tests/fixtures/{name}")
 }
 
 fn rm_tree(dir: &str) {
-    match read_dir(&dir) {
+    match read_dir(dir) {
         Err(_) => {}
         Ok(it) => {
             for e in it {
@@ -59,26 +59,23 @@ fn rm_tree(dir: &str) {
             }
         }
     }
-    let _d = remove_dir(&dir);
+    let _d = remove_dir(dir);
 }
 
 fn write_bytes(path: &str, data: &[u8]) {
-    let d = File::create(&path);
+    let d = File::create(path);
     match d {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!();}
         Ok(mut w) => {
             let n = w.write_all(data);
-            match n {
-                Err(_) => { assert!(false); }
-                Ok(_) => {}
-            }
+            if n.is_err() { panic!(); }
         }
     }
 }
 
 fn be_u32(b: &[u8], o: usize) -> u64 {
-    return ((b[o] as u64) << 24) | ((b[o + 1] as u64) << 16)
-         | ((b[o + 2] as u64) << 8) | (b[o + 3] as u64);
+    ((b[o] as u64) << 24) | ((b[o + 1] as u64) << 16)
+         | ((b[o + 2] as u64) << 8) | (b[o + 3] as u64)
 }
 
 fn be_u64v(b: &[u8], o: usize) -> u64 {
@@ -88,7 +85,7 @@ fn be_u64v(b: &[u8], o: usize) -> u64 {
         v = (v << 8) | (b[o + k] as u64);
         k += 1;
     }
-    return v;
+    v
 }
 
 /// Section headers of the message starting at `pos`: (number, start, length).
@@ -109,7 +106,7 @@ fn walk_sections(b: &[u8], pos: usize) -> Vec<(u8, usize, usize)> {
         }
         q += ln;
     }
-    return out;
+    out
 }
 
 /// Message start offsets of a whole GRIB stream.
@@ -120,19 +117,18 @@ fn message_starts(b: &[u8]) -> Vec<usize> {
         out.push(pos);
         pos += be_u64v(b, pos + 8) as usize;
     }
-    return out;
+    out
 }
 
 /// Find the section-start offset of section `num` inside message `mi`.
-fn section_of(b: &[u8], starts: &Vec<usize>, mi: usize, num: u8) -> usize {
+fn section_of(b: &[u8], starts: &[usize], mi: usize, num: u8) -> usize {
     let secs = walk_sections(b, starts[mi]);
     for s in &secs {
         if s.0 == num {
             return s.1;
         }
     }
-    assert!(false);
-    return 0;
+    panic!();
 }
 
 // ---------------------------------------------------------------------------
@@ -143,7 +139,7 @@ fn section_of(b: &[u8], starts: &Vec<usize>, mi: usize, num: u8) -> usize {
 fn patched_templates_tally_by_kind() {
     let r = fs::read(fixture("gfs_small.grib2"));
     let mut b: Vec<u8> = match r {
-        Err(_) => { println!("no gfs_small fixture"); assert!(false); return; }
+        Err(_) => { println!("no gfs_small fixture"); panic!(); }
         Ok(v) => { v }
     };
     let starts = message_starts(&b);
@@ -152,10 +148,10 @@ fn patched_templates_tally_by_kind() {
     // Sanity: UNPATCHED, every message decodes (zero structural skips).
     let pre = decode_stream(&b, ParamFilter::All);
     match pre {
-        Err(e) => { println!("pre-patch decode failed {:?}", e); assert!(false); return; }
+        Err(e) => { println!("pre-patch decode failed {:?}", e); panic!(); }
         Ok((_, st)) => {
             assert!(st.messages_unsupported == 0);
-            assert!(skip_tally_text(&st) == "".to_string());
+            assert!(skip_tally_text(&st).is_empty());
         }
     }
 
@@ -173,7 +169,7 @@ fn patched_templates_tally_by_kind() {
 
     let rr = decode_stream(&b, ParamFilter::All);
     match rr {
-        Err(e) => { println!("patched decode failed {:?}", e); assert!(false); return; }
+        Err(e) => { println!("patched decode failed {:?}", e); panic!(); }
         Ok((msgs, st)) => {
             assert!(st.messages_total as usize == starts.len());
             assert!(st.messages_unsupported == 2);
@@ -182,7 +178,7 @@ fn patched_templates_tally_by_kind() {
             assert!(st.skip_grid.len() == 1 && st.skip_grid[0].0 == 40 && st.skip_grid[0].1 == 1);
             assert!(st.skip_pdt.len() == 1 && st.skip_pdt[0].0 == 77 && st.skip_pdt[0].1 == 1);
             let t = skip_tally_text(&st);
-            assert!(t == "2 skipped: 1 grid template 3.40, 1 PDT 4.77".to_string(),
+            assert!(t == "2 skipped: 1 grid template 3.40, 1 PDT 4.77",
                     "tally text was: {0}", t);
         }
     }
@@ -192,7 +188,7 @@ fn patched_templates_tally_by_kind() {
     // combined tally must show all THREE kinds in the documented order.
     let rb = fs::read(fixture("robust_small.grib2"));
     let both: Vec<u8> = match rb {
-        Err(_) => { println!("no robust_small fixture"); assert!(false); return; }
+        Err(_) => { println!("no robust_small fixture"); panic!(); }
         Ok(v) => {
             let mut w: Vec<u8> = Vec::new();
             w.extend_from_slice(&b);
@@ -202,14 +198,14 @@ fn patched_templates_tally_by_kind() {
     };
     let rc = decode_stream(&both, ParamFilter::All);
     match rc {
-        Err(e) => { println!("combined decode failed {:?}", e); assert!(false); return; }
+        Err(e) => { println!("combined decode failed {:?}", e); panic!();}
         Ok((_, st)) => {
             assert!(st.skip_coordlists == 1);
             assert!(st.skip_grid.len() == 1 && st.skip_grid[0].0 == 40 && st.skip_grid[0].1 == 1);
             assert!(st.skip_pdt.len() == 1 && st.skip_pdt[0].0 == 77 && st.skip_pdt[0].1 == 1);
             assert!(st.messages_unsupported == 3);
             let t = skip_tally_text(&st);
-            assert!(t == "3 skipped: 1 coordinate-list, 1 grid template 3.40, 1 PDT 4.77".to_string(),
+            assert!(t == "3 skipped: 1 coordinate-list, 1 grid template 3.40, 1 PDT 4.77",
                     "combined tally was: {0}", t);
         }
     }
@@ -220,14 +216,14 @@ fn patched_templates_tally_by_kind() {
 // ---------------------------------------------------------------------------
 
 fn mix_cfg_text(root: &str) -> String {
-    let ing = join_path(&root, "ingest");
-    let data = join_path(&root, "data");
+    let ing = join_path(root, "ingest");
+    let data = join_path(root, "data");
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"skipmix\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"skipmix*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n";
-    return t;
+    
+    t + "\"\nfile_glob = \"skipmix*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"isobaric:*\", \"height_above_ground:2\"]\n"
 }
 
 #[test]
@@ -240,7 +236,7 @@ fn pipeline_note_and_counters_break_down_skips_by_kind() {
     // Build the same combined stream as the decoder test above.
     let r = fs::read(fixture("gfs_small.grib2"));
     let mut b: Vec<u8> = match r {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { v }
     };
     let starts = message_starts(&b);
@@ -252,14 +248,14 @@ fn pipeline_note_and_counters_break_down_skips_by_kind() {
     b[q4 + 5 + 3] = 77;
     let rb = fs::read(fixture("robust_small.grib2"));
     match rb {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(v) => { b.extend_from_slice(&v); }
     }
     write_bytes(&join_path(&ing, "skipmix.grib2"), &b);
 
     let cfgp = join_path(&root, "config.toml");
     match File::create(&cfgp) {
-        Err(_) => { assert!(false); return; }
+        Err(_) => { panic!(); }
         Ok(mut w) => {
             let _n = w.write_all(mix_cfg_text(&root).as_bytes());
         }
@@ -269,8 +265,7 @@ fn pipeline_note_and_counters_break_down_skips_by_kind() {
     let mut p = match po {
         Err(e) => {
             println!("pipeline open failed: {0}", e);
-            assert!(false);
-            return;
+            panic!();
         }
         Ok(pp) => { pp }
     };
@@ -302,7 +297,7 @@ fn pipeline_note_and_counters_break_down_skips_by_kind() {
                  && line.find("PDT 4.77").is_some()
                  && line.find("coordinate-list").is_some()) {
                 println!("note lacks breakdown: {0}", line);
-                assert!(false);
+                panic!();
             }
             saw_note = true;
         }
@@ -341,8 +336,7 @@ fn decode_file_on_real_gfs_sflux_decodes_everything() {
         match r {
             Err(e) => {
                 println!("real GFS {0} failed to walk: {1:?}", nm, e);
-                assert!(false);
-                return;
+                panic!();
             }
             Ok((msgs, st)) => {
                 if !(st.messages_total >= 1 && msgs.len() == st.messages_total as usize
@@ -353,14 +347,12 @@ fn decode_file_on_real_gfs_sflux_decodes_everything() {
                      && st.skip_grid.is_empty()) {
                     println!("unexpected stats for {0}: total={1} decoded={2} kinds={3:?} pdt={4:?}",
                              nm, st.messages_total, st.messages_decoded, st.skip_grid, st.skip_pdt);
-                    assert!(false);
-                    return;
+                    panic!();
                 }
                 let t = skip_tally_text(&st);
                 if t.find("grid template 3.40").is_some() {
                     println!("tally still carries 3.40 skips: {0}", t);
-                    assert!(false);
-                    return;
+                    panic!();
                 }
             }
         }

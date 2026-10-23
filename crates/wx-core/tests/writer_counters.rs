@@ -21,19 +21,19 @@ struct OnePlane<'a> {
 }
 
 impl<'a> PlaneSource for OnePlane<'a> {
-    fn next_plane(self: &mut Self) -> Option<&[f32]> {
-        if self.n <= 0 {
+    fn next_plane(&mut self) -> Option<&[f32]> {
+        if self.n == 0 {
             return None;
         }
         self.n -= 1;
-        return Some(&self.data[..]);
+        Some(self.data)
     }
 }
 
 /// How many files whose name contains `.tmp.` exist under `root` (depth 2).
 fn count_tmp(root: &str) -> usize {
     let mut hits: usize = 0;
-    match read_dir(&root) {
+    match read_dir(root) {
         Err(_) => { return hits; }
         Ok(it) => {
             for e in it {
@@ -61,11 +61,10 @@ fn count_tmp(root: &str) -> usize {
                                                         let p2 = pp2.to_str();
                                                         match p2 {
                                                             None => {}
-                                                            Some(s2) => {
-                                                                if s2.contains(".tmp.") {
-                                                                    hits += 1;
-                                                                }
+                                                            Some(s2) if s2.contains(".tmp.") => {
+                                                                hits += 1;
                                                             }
+                                                            Some(_) => {}
                                                         }
                                                     }
                                                 }
@@ -80,7 +79,7 @@ fn count_tmp(root: &str) -> usize {
             }
         }
     }
-    return hits;
+    hits
 }
 
 // ---------------------------------------------------------------------------

@@ -126,11 +126,11 @@ U7="$BASE/v1/point?model=nope&param=TMP&level=isobaric:1000&lat=0&lon=0&valid=$R
 U8="$BASE/v1/point?model=gfs&param=TMP&level=isobaric:1&lat=39.875&lon=25.0&valid=$RUN"
 
 # sanity: every URL answers with its expected class before hammering.
-# NOTE: ingest publishes field-by-field (spec 4.5 incremental visibility), so
-# between /ready and full publication a level stack can be momentarily PARTIAL
-# and a 200-class URL legitimately answers 422 level_out_of_range. Wait each
-# URL out instead of racing the publisher (the documented transient-publish
-# window; see docs/DECISIONS.md). Worst case 15 s per URL.
+# NOTE (V1.2-B reality): ingest publishes PER SOURCE FILE, so within one file a
+# level stack can no longer be PARTIAL and the historic transient 422 window is
+# closed. The wait below stays as cheap insurance for multi-file level stacks
+# (a run whose levels span several delivered files becomes visible file by
+# file); worst case 15 s per URL. [pre-V1.2-B text said "field-by-field".]
 expect=(200 200 200 200 200 200 404 422)
 urls=("$U1" "$U2" "$U3" "$U4" "$U5" "$U6" "$U7" "$U8")
 idx=0

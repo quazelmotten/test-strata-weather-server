@@ -16,7 +16,7 @@ fn rng_next(seed: u64) -> u64 {
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
-    return x.wrapping_mul(2685821657363691481u64);
+    x.wrapping_mul(2685821657363691481u64)
 }
 
 /// GFS-like regular grid inputs: n pseudo-random interior points.
@@ -30,7 +30,7 @@ fn gen_regular_inputs(n: usize) -> Vec<(f64, f64)> {
         let r2 = (seed >> 11) as f64 / 9007199254740992.0;
         out.push((r1 * 179.0 - 89.5, r2 * 359.9 - 179.95));
     }
-    return out;
+    out
 }
 
 /// HRRR CONUS-like LCC inputs: n pseudo-random interior points.
@@ -44,7 +44,7 @@ fn gen_lamcc_inputs(n: usize) -> Vec<(f64, f64)> {
         let r2 = (seed >> 11) as f64 / 9007199254740992.0;
         out.push((24.0 + r1 * 24.0, -124.0 + r2 * 40.0));
     }
-    return out;
+    out
 }
 
 /// (lat, lon) pairs for the gaussian grid: uniform-ish over the live GFS
@@ -59,7 +59,7 @@ fn gen_gauss_inputs(n: usize) -> Vec<(f64, f64)> {
         let r2 = (seed >> 11) as f64 / 9007199254740992.0;
         out.push((-89.5 + r1 * 179.0, r2 * 360.0));
     }
-    return out;
+    out
 }
 
 /// Fractional (di, dj) pairs strictly inside the node rectangle.
@@ -73,7 +73,7 @@ fn gen_cells(nx: usize, ny: usize, n: usize) -> Vec<(f64, f64)> {
         let dj = ((seed >> 11) as f64 / 9007199254740992.0) * ((ny - 1) as f64);
         out.push((di, dj));
     }
-    return out;
+    out
 }
 
 #[allow(clippy::needless_return)]
@@ -178,7 +178,7 @@ fn build_slab(nx: usize, ny: usize) -> Vec<f32> {
             out.push((250.0 + j as f64) as f32);
         }
     }
-    return out;
+    out
 }
 
 /// Write one single-level .bin via the atomic writer, open it with mmap and
@@ -200,13 +200,10 @@ fn mmap_warm_field(nx: usize, ny: usize) -> Result<MmapField, String> {
     let plane = build_slab(nx, ny);
     let pl = &plane;
     let wr = write_bin_atomic(path.clone(), &hdr, &[pl]);
-    match wr {
-        Err(e) => { return Err(e.to_string()); }
-        Ok(_) => {}
-    }
+    if let Err(e) = wr { return Err(e.to_string()); }
     let of = open_field(path);
     match of {
-        Err(e) => { return Err(e.to_string()); }
+        Err(e) => { Err(e.to_string())}
         Ok(mf) => {
             // touch all pages (warm page cache before measuring)
             let region = &mf.region;
@@ -214,13 +211,13 @@ fn mmap_warm_field(nx: usize, ny: usize) -> Result<MmapField, String> {
             let mut acc = 0u8;
             let mut off = 0usize;
             while off < n {
-                acc = acc ^ region[off];
-                off = off + 4096usize;
+                acc ^= region[off];
+                off += 4096usize;
             }
             if acc == 0u8 && n > 0usize && region[0] != 0u8 {
                 // touch-loop observer; never taken in practice
             }
-            return Ok(mf);
+            Ok(mf)
         }
     }
 }
@@ -230,8 +227,8 @@ fn std_fs_mkdir(path: &str) -> bool {
     use std::fs::create_dir_all;
     let r = create_dir_all(path);
     match r {
-        Err(_) => { return true; }
-        Ok(_) => { return false; }
+        Err(_) => { true}
+        Ok(_) => { false}
     }
 }
 
