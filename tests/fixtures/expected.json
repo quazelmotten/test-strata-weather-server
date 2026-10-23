@@ -3396,6 +3396,108 @@
     }
    ]
   },
+  "hybrid_small.grib2": {
+   "inventory_raw": [
+    "1:0:d=2026101912:TMP:1 hybrid level:anl:",
+    "2:1265:d=2026101912:TMP:1 hybrid level:6 hour fcst:",
+    "3:2530:d=2026101912:TMP:50 hybrid level:anl:",
+    "4:3795:d=2026101912:TMP:50 hybrid level:6 hour fcst:",
+    "5:5060:d=2026101912:TMP:255 hybrid level:anl:",
+    "6:6325:d=2026101912:TMP:255 hybrid level:6 hour fcst:",
+    "7:7590:d=2026101912:TMP:850 mb:anl:",
+    "8:8855:d=2026101912:TMP:500 mb:anl:"
+   ],
+   "point_checks": [
+    {
+     "record": "TMP_hyb1_f000",
+     "record_index": 1,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 588.0,
+     "masked": false,
+     "raw": "1:0:lon=355.000000,lat=5.000000,val=588"
+    },
+    {
+     "record": "TMP_hyb1_f006",
+     "record_index": 2,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 648.0,
+     "masked": false,
+     "raw": "2:1265:lon=355.000000,lat=5.000000,val=648"
+    },
+    {
+     "record": "TMP_hyb50_f000",
+     "record_index": 3,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 980.0,
+     "masked": false,
+     "raw": "3:2530:lon=355.000000,lat=5.000000,val=980"
+    },
+    {
+     "record": "TMP_hyb50_f006",
+     "record_index": 4,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 1040.0,
+     "masked": false,
+     "raw": "4:3795:lon=355.000000,lat=5.000000,val=1040"
+    },
+    {
+     "record": "TMP_hyb255_f000",
+     "record_index": 5,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 2620.0,
+     "masked": false,
+     "raw": "5:5060:lon=355.000000,lat=5.000000,val=2620"
+    },
+    {
+     "record": "TMP_hyb255_f006",
+     "record_index": 6,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 2680.0,
+     "masked": false,
+     "raw": "6:6325:lon=355.000000,lat=5.000000,val=2680"
+    },
+    {
+     "record": "TMP_isob850_f000",
+     "record_index": 7,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 101430.0,
+     "masked": false,
+     "raw": "7:7590:lon=355.000000,lat=5.000000,val=101430"
+    },
+    {
+     "record": "TMP_isob500_f000",
+     "record_index": 8,
+     "req_lon": 355.0,
+     "req_lat": 5.0,
+     "snapped_lon": 355.0,
+     "snapped_lat": 5.0,
+     "value": 101080.0,
+     "masked": false,
+     "raw": "8:8855:lon=355.000000,lat=5.000000,val=101080"
+    }
+   ]
+  },
   "hrrr_small.grib2": {
    "inventory_raw": [
     "1:0:d=2026101912:TMP:2 m above ground:anl:",

@@ -38,25 +38,36 @@ pub const PARAM_TABLE: [ParamEntry; 15] = [
 
 /// Level type name -> GRIB2 Code Table 4.5 value. Includes the `msl` alias
 /// used in config/API strings (spec §3 example `msl`).
-pub const LEVEL_TYPE_CODES: [(&str, u8); 8] = [
+///
+/// `hybrid` = CT 4.5 code **105** (V1.3 phase E4c): the hybrid/sigma-pressure
+/// coordinate current operational GFS (FV3GFS) uses for ALL upper-air fields.
+/// Code 100 was NOT usable — it is `isobaric` here (and everywhere else: WMO
+/// table + wgrib2 + live FV3GFS bytes carry real pressure on 100, Pa-scaled);
+/// the sflux hybrid messages verifiably declare t1=105 (raw dump pinned in
+/// docs/DECISIONS.md §17). The coordinate itself is dimensionless: values are
+/// stored RAW (no unit normalization anywhere; contrast `norm_level`'s
+/// deliberate isobaric Pa->hPa divide).
+pub const LEVEL_TYPE_CODES: [(&str, u8); 9] = [
     ("surface", 1),
     ("isobaric_sigma", 9),
     ("isobaric", 100),
     ("above_mean_sea_level", 101),
     ("msl", 101),
     ("height_above_ground", 103),
+    ("hybrid", 105),
     ("isothermal", 114),
     ("freezing_height", 200),
 ];
 
 /// Canonical spelling per code, used when echoing a level back in API
 /// responses (round-trips through parse_level_str).
-pub const LEVEL_CANONICAL: [(&str, u8); 7] = [
+pub const LEVEL_CANONICAL: [(&str, u8); 8] = [
     ("surface", 1),
     ("isobaric_sigma", 9),
     ("isobaric", 100),
     ("msl", 101),
     ("height_above_ground", 103),
+    ("hybrid", 105),
     ("isothermal", 114),
     ("freezing_height", 200),
 ];
@@ -138,9 +149,9 @@ pub fn canonical_level_name(code: u8) -> Option<&'static str> {
 }
 
 /// Parse an API/config level string: "isobaric:850", "height_above_ground:2",
-/// "isobaric:837.5", "surface", "msl". Returns (CT 4.5 code, numeric level
-/// value); bare names get value 0. Decimal values only (no exponent form —
-/// levels never need one). None on any malformed input.
+/// "isobaric:837.5", "hybrid:128.5", "surface", "msl". Returns (CT 4.5 code,
+/// numeric level value); bare names get value 0. Decimal values only (no
+/// exponent form — levels never need one). None on any malformed input.
 pub fn parse_level_str(s: &str) -> Option<(u8, f64)> {
     let n = s.len();
     let mut colon: Option<usize> = None;

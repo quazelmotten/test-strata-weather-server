@@ -146,6 +146,19 @@ case "$radout" in
 esac
 
 # ---------------------------------------------------------------------------
+# hybrid-level fixture (V1.3 phase E4c, CT 4.5 type 105): wgrib2 must list
+# EXACTLY six "N hybrid level" records (coordinates 1/50/255 x fh 0/6) plus
+# two isobaric ones, proving our hand-written type-105 section 4 is read as
+# hybrid by the reference tool (same spelling as live FV3GFS sflux bytes).
+# ---------------------------------------------------------------------------
+nhb=$("$WG" tests/fixtures/hybrid_small.grib2 2>/dev/null | { grep -c "hybrid level" || true; })
+nmb=$("$WG" tests/fixtures/hybrid_small.grib2 2>/dev/null | { grep -c " mb:" || true; })
+if [ "$nhb" != "6" ] || [ "$nmb" != "2" ]; then
+  echo "FATAL: hybrid_small.grib2: $nhb hybrid + $nmb mb records, expected 6 + 2"; exit 1
+fi
+echo "ok hybrid_small (6x 'hybrid level' + 2x 'mb' read back by wgrib2-full)"
+
+# ---------------------------------------------------------------------------
 # orphan-wind fixture (V1.2 phase B gate `wind_orphan.rs`): the FIRST FOUR
 # messages of hrrr_small.grib2 (TMP x2 + UGRD x2, NO VGRD), i.e. a delivered
 # product whose wind pair can NEVER complete -> exercises the per-file pending-

@@ -32,13 +32,15 @@ retention_runs = 4
 [[models]]
 name = "gfs"
 ingest_dir = "/data/incoming/gfs"
-# CURRENT OPERATIONAL PRODUCT (V1.3 phase E4b): FV3GFS delivers surface AND
-# upper-air fields in gfs.tHHZ.sfluxgrbfFFF.grib2 on a GAUSSIAN-LATITUDE
-# lat-lon grid (GRIB2 grid definition template 3.40, global quasi-regular
-# non-thinned, 3072 x 1536 today). Template 3.40 decodes end to end since
-# E4b; HYBRID-level upper-air messages (level type 105) remain stored-skip
-# candidates pending phase E4c (they simply do not match any configured
-# level spec and are filtered like any unrequested level).
+# CURRENT OPERATIONAL PRODUCT (V1.3 phases E4b + E4c): FV3GFS delivers
+# surface AND upper-air fields in gfs.tHHZ.sfluxgrbfFFF.grib2 on a
+# GAUSSIAN-LATITUDE lat-lon grid (GRIB2 grid definition template 3.40, global
+# quasi-regular non-thinned, 3072 x 1536 today). Template 3.40 decodes end to
+# end (E4b); upper-air fields ride the HYBRID level (GRIB Code Table 4.5
+# type 105, the hybrid/sigma-pressure coordinate), supported end to end
+# since E4c -- request e.g. level=hybrid:128 or configure hybrid:* below.
+# The hybrid coordinate is DIMENSIONLESS: values are stored and echoed RAW
+# (no unit conversion anywhere; contrast isobaric's Pa->hPa normalization).
 file_glob = "gfs.t*z.sfluxgrbf*.grib2"
 # LEGACY (pre-FV3GFS) product line, still template 3.0 regular lat-lon
 # 0p25: set file_glob to this instead if you ingest archived runs
@@ -47,24 +49,27 @@ file_glob = "gfs.t*z.sfluxgrbf*.grib2"
 
   [[models.params]]
   name = "HGT"
-  # NOTE (E4b reality): on TODAY's sfluxgrbf line, upper-air HGT/TMP ride the
-  # HYBRID level type (GRIB 4.5 code 105), which these isobaric specs do not
-  # match; those messages decode but stay unSTORED until phase E4c adds the
-  # hybrid level model. Surface HGT would need levels = ["surface"].
-  levels = ["isobaric:1000", "isobaric:925", "isobaric:850", "isobaric:700",
-            "isobaric:500", "isobaric:300", "isobaric:250", "isobaric:200"]
+  # On TODAY's sfluxgrbf line, upper-air HGT rides the HYBRID level (type
+  # 105): "hybrid:*" captures every hybrid height plane, "surface" the
+  # terrain height. The isobaric list below only matches the LEGACY pgrb2
+  # line (kept commented for archived runs).
+  levels = ["surface", "hybrid:*"]
+  #levels = ["isobaric:1000", "isobaric:925", "isobaric:850", "isobaric:700",
+  #          "isobaric:500", "isobaric:300", "isobaric:250", "isobaric:200"]
 
   [[models.params]]
   name = "TMP"
-  levels = ["height_above_ground:2", "isobaric:*"]
+  # surface layer at 2 m + ALL hybrid-level temperatures (the operational
+  # upper-air line; query e.g. level=hybrid:837.5 between stored coordinates)
+  levels = ["height_above_ground:2", "hybrid:*"]
 
   [[models.params]]
   name = "UGRD"
-  levels = ["height_above_ground:10", "isobaric:*"]
+  levels = ["height_above_ground:10", "hybrid:*"]
 
   [[models.params]]
   name = "VGRD"
-  levels = ["height_above_ground:10", "isobaric:*"]
+  levels = ["height_above_ground:10", "hybrid:*"]
 
 [[models]]
 name = "hrrr"

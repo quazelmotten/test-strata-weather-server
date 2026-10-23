@@ -706,6 +706,12 @@ pub fn parse_sec4(p: &[u8]) -> Result<ProdInfo, GribErr> {
 /// Normalize one fixed-surface level: value = scaled * 10^-scalefactor; isobaric
 /// (CT 4.5 code 100) arrives in Pa and is normalized to hPa so it matches the
 /// config/API convention ("isobaric:850" = hPa). Documented decision.
+/// HYBRID (code 105, V1.3 phase E4c) deliberately gets NO conversion: the
+/// hybrid/sigma-pressure coordinate is DIMENSIONLESS, so the stored level
+/// value is the raw GRIB coordinate as-is (config `hybrid:1` matches what the
+/// file says; nothing to convert). Sign handling rides `sm_i4` (sign-magnitude,
+/// same as every other level field). Unknown types pass through unchanged and
+/// simply never match a configured spec (decode-ok / store-skip, spec §4.2).
 fn norm_level(code: u8, scale_factor: i8, scaled: f64) -> (u8, f64) {
     let raw = scaled * pow10(-scale_factor as i32);
     if code == 100 {

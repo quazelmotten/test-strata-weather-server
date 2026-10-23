@@ -101,10 +101,14 @@ optional `units = "..."` override (V1.3 phase E2; the ONLY place the key is
 legal — setting it on a table-known param is a hard startup error, and a raw
 param without units boots with one loud note per affected entry because
 responses must report units). Level specs map to Code Table 4.5
-(`isobaric`=100, `height_above_ground`=103, `surface`=1, `msl`=101, …) with
-grammar `"*"`, `"type:*"`, `"type:value"`, bare `"type"` (= 0, e.g. `surface`).
-Isobaric levels arrive in Pa in section 4 and are normalized to hPa internally
-so config/API strings match (`isobaric:850`).
+(`isobaric`=100, `height_above_ground`=103, `hybrid`=105, `surface`=1,
+`msl`=101, …) with grammar `"*"`, `"type:*"`, `"type:value"`, bare `"type"`
+(= 0, e.g. `surface`). Isobaric levels arrive in Pa in section 4 and are
+normalized to hPa internally so config/API strings match (`isobaric:850`).
+HYBRID (V1.3 phase E4c) is the FV3GFS upper-air coordinate: it is
+DIMENSIONLESS, so `hybrid:NN` values are stored and echoed RAW — no unit
+conversion — and `hybrid:*` captures every hybrid coordinate present
+(current operational GFS upper-air lives entirely on hybrid levels).
 
 **Wind-pair startup preflight (spec §4.4, V1.1 phase 4).** Summary of the
 semantics, full rationale in docs/DECISIONS.md:
@@ -447,7 +451,16 @@ return f64.
    GFS 3072×1536): there are NO pole nodes, so lat ±90 is ALWAYS 422 — defined
    behavior, pinned by tests. Any NaN
    among the 4 neighbors → `null` + `missing_data` (weights never renormalized).
-2. **Vertical — linear in the level coordinate** (hPa for isobaric). Exact
+2. **Vertical — linear in the level coordinate** (hPa for isobaric, RAW
+   hybrid coordinate for hybrid levels — V1.3 phase E4c: hybrid coordinates
+   order numerically and interpolate LINEARLY IN THE HYBRID COORDINATE
+   between bracketing stored hybrid levels; that is an approximation choice
+   consistent with the spec letter — any numeric orderable level type
+   interpolates linearly in its own coordinate, and a sigma-vs-pressure
+   refinement would need producer A/B coefficients we do not parse,
+   docs/DECISIONS.md §17). Brackets NEVER cross level types: every field
+   file carries one type's levels (separate directories), pinned by tests.
+   Exact
    stored level used directly; otherwise bracketing stored levels interpolate
    linearly (a log-pressure option is structurally possible but NOT enabled —
    spec default). Request outside the stored range → 422 `level_out_of_range`,
@@ -830,11 +843,16 @@ it fetches the `.idx` message index of live NOMADS products and HTTP-Range-extra
 only the messages under test — a few MB total — into the gitignored
 `tests/realdata/`). With that directory present, `cargo test -p wx-ingest
 --test realdata_gate` activates live-byte gates (GFS sflux messages now DECODE
-on template 3.40 end to end since V1.3 E4b — the gate pins decoded == total per
-file and replays TMP/UV/HGT probes through the full ingest+index path against
-recorded `wgrib2 -lon` values, plus the 212-byte degenerate APCP and HRRR node
-probes); without it they skip cleanly, so CI stays offline. Recorded probes and
-the full diagnosis: docs/DECISIONS.md §15 (E4a) and §16 (E4b acceptance table).
+on template 3.40 end to end since V1.3 E4b and STORE fully — current
+operational GFS sflux products are fully queryable end-to-end, surface +
+hybrid upper-air, since E4c: the gate pins decoded == total per file, an
+exact seven-entry stored-field set (zero unstored decodes, incl. the out-of-
+table ACOND raw triple), and replays TMP/UV/HGT/ACOND plus the HYBRID-level
+HGT/TMP probes through the full ingest+index path against recorded
+`wgrib2 -lon` values, plus the 212-byte degenerate APCP and HRRR node
+probes); without it they skip cleanly, so CI stays offline. Recorded probes
+and the full diagnosis: docs/DECISIONS.md §15 (E4a), §16 (E4b grid
+acceptance) and §17 (E4c hybrid acceptance table).
 See §9 Limitations for what remains unverified until you do.
 
 Beyond §9 (V1.1 additions): packing parity — each small fixture exists in six
@@ -972,9 +990,10 @@ live in §10 and docs/DECISIONS.md.
     because their row structure needs per-row counts we do not model yet.
     Gaussian grids also have NO node at the poles (outermost rows ~±89.91°),
     so lat ±90 is always 422 `out_of_domain` there (defined behavior, tested).
-    And HYBRID-level upper-air fields on the current GFS line (level type 105)
-    still stay unSTORED pending phase E4c — they decode, they just match no
-    configured level spec. Since E4a the skip note names kinds AND template
+    HYBRID-level upper-air fields (level type 105 — where ALL current
+    operational GFS upper-air lives) are supported end to end SINCE phase
+    E4c: the whole sflux line, surface AND upper-air, is fully queryable
+    (acceptance evidence: docs/DECISIONS.md §17). Since E4a the skip note names kinds AND template
     numbers ("N skipped: X coordinate-list, Y grid template 3.<t>, Z PDT 4.<t>")
     and each kind advances its own flat counter
     (`wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /

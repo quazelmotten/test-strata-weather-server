@@ -11,9 +11,12 @@
 //     3.40 (gaussian lat-lon, 3072 x 1536). Since E4b these DECODE: 2/2/3
 //     messages respectively, zero structural skips. Under the E4a build they
 //     all skipped as Grid(40) — correct-by-design then, superseded now.
-//     The two HYBRID-LEVEL messages in f012 (HGT/TMP "1 hybrid level")
-//     decode fine but stay UNSTORED pending E4c (hybrid level model), and
-//     the surface HGT at fh 12 answers queries.
+//     The two HYBRID-LEVEL messages in f012 (HGT/TMP "1 hybrid level", CT 4.5
+//     type 105) STORE and answer queries end to end since E4c under the
+//     configured `hybrid:*` spec; the surface HGT at fh 12 answers too, and
+//     with the operational config (AGL + surface + hybrid:* + the ACOND raw
+//     triple) ALL 7 messages become stored fields — zero unstored decodes
+//     (before/after table: docs/DECISIONS.md §17).
 //   * hrrr_apcp_tight.grib2 (212 bytes, zero-window 0-0 day accumulation):
 //     decodes successfully as a full-size all-zero plane (wgrib2 parity).
 //   * hrrr_tmp2m_f00 / hrrr_uv10m_f06: decode CLEANLY (zero structural
@@ -167,19 +170,29 @@ fn gfs_sflux_decodes_on_template_3_40() {
 fn gfs_cfg_text(root: &str) -> String {
     let ing = join_path(&root, "ingest");
     let data = join_path(&root, "data");
+    // E4c shape: the CURRENT-operational spec — every level type these
+    // products publish: AGL heights, surface, AND hybrid:* upper-air, plus
+    // the out-of-table ACOND triple (Aerodynamic conductance is a LAND
+    // SURFACE product: section-0 discipline 2, proven from the live bytes;
+    // wgrib2's gribtable.dat entry reads {2,0,0,...,228}) with its m/s units
+    // so EVERY message in the three files maps to a stored field (zero
+    // unstored-decodes; docs/DECISIONS.md §17 before/after table).
     let t = "[server]\nbind = \"127.0.0.1:8080\"\ndata_dir = \"";
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"gfs\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"HGT\"\n  levels = [\"surface\"]\n";
+    let t = t + "\"\nfile_glob = \"gfs_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\", \"hybrid:*\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"HGT\"\n  levels = [\"surface\", \"hybrid:*\"]\n\n  [[models.params]]\n  discipline = 2\n  category = 0\n  number = 228\n  units = \"m/s\"\n  levels = [\"surface\"]\n";
     return t;
 }
 
 #[test]
 fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
-    // Full acceptance proof for DECISIONS §16 "before/after". Ingests all
-    // three live sflux samples through the real Pipeline with the E4b-era
-    // operational config shape, then replays the Oct-22 wgrib2 probes.
+    // Full acceptance proof for DECISIONS §16 (E4b grid) AND §17 (E4c
+    // hybrid). Ingests all three live sflux samples through the real
+    // Pipeline with the CURRENT-operational config (AGL + surface +
+    // hybrid:* + the ACOND raw triple), then replays the Oct-22/Oct-23
+    // wgrib2 probes: EVERY message stores, every recorded node value
+    // replays within f32 rounding.
     let f0 = match real_path("gfs_sflux_f000.grib2") {
         None => { skip_msg("gfs_sflux_f000.grib2 absent"); return; }
         Some(x) => { x }
@@ -224,6 +237,47 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         Some(mm) => { mm }
     };
     assert!(m.runs.len() == 1); // one run: 2026-10-21 12Z from section 1
+
+    // E4c FULL-STORE PIN: every message in all three files maps onto a
+    // stored field — exactly seven (param, level-type) entries, nothing
+    // missing and nothing extra. Before E4c this same config-minus-hybrid
+    // left three decoded-but-unstored messages (ACOND + both HYBRID ones);
+    // the honest E4b pins flip here (docs/DECISIONS.md §17 table).
+    let mut keys: Vec<(String, u8)> = Vec::<(String, u8)>::new();
+    for fe in &m.runs[0].fields {
+        keys.push((fe.param_key.to_string(), fe.level_code));
+    }
+    keys.sort();
+    for k in 0 .. keys.len() {
+        println!("STORED FIELD {0}: {1} level_type={2}", k, keys[k].0, keys[k].1);
+    }
+    assert!(keys.len() == 7);
+    let want_keys: [(&str, u8); 7] = [
+        ("HGT", 1), ("HGT", 105), ("TMP", 103), ("TMP", 105),
+        ("UGRD", 103), ("VGRD", 103), ("d2c0n228", 1),
+    ];
+    for k in 0 .. 7 {
+        if !(keys[k].0 == want_keys[k].0 && keys[k].1 == want_keys[k].1) {
+            println!("field set mismatch at {0}: got {1:?} want {2:?}",
+                     k, keys[k], want_keys[k]);
+            assert!(false);
+        }
+    }
+    // the two HYBRID stacks carry the raw coordinate 1.0 at fh 12 (the live
+    // FV3GFS encoding we byte-dumped in DECISIONS §17: t1=105 val1=1.0)
+    for fe in &m.runs[0].fields {
+        if fe.level_code == 105 {
+            if fe.fd.fhs.len() != 1 || fe.fd.fhs[0].fh_secs != 43200 {
+                println!("hybrid stack fhs wrong for {0}", fe.param_key);
+                assert!(false);
+            }
+            let lv = &fe.fd.fhs[0].field.header.levels;
+            if lv.len() != 1 || lv[0] as f64 != 1.0 {
+                println!("hybrid levels wrong for {0}", fe.param_key);
+                assert!(false);
+            }
+        }
+    }
 
     // locate the recorded probe row exactly (row whose latitude prints as
     // 40.006506; the table value is what a node-exact request must carry)
@@ -347,8 +401,14 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
         }
     }
 
-    // HGT surface @ fh 12 (the non-hybrid f012 message) answers; hybrid TMP
-    // at hag:2 must NOT exist at fh 12 (hybrid pending E4c — honest pin).
+    // HGT surface @ fh 12 (the non-hybrid f012 message) answers; BOTH hybrid
+    // stacks now answer TOO (E4c): recorded node truth from tools/wgrib2-full
+    // `-lon 264.960938 40.006506` on gfs_sflux_f012 was
+    //   msg1 (hybrid HGT)  val=306      msg2 (hybrid TMP) val=292.87
+    // and gfs_sflux_f000 msg1 (ACOND surface) val=0.0125 — replayed below at
+    // the same node through the full ingest+index path (tolerance 0.01, the
+    // established precedent for 6-decimal request lats blending at <=0.25%
+    // weight; docs/DECISIONS.md §16.7/§17).
     if f12.is_some() {
         let ch = build_context(sref, "gfs", None, "HGT", 1, 0.0, 12.0 * 3600.0, TimeInterpMode::None);
         match ch {
@@ -367,13 +427,78 @@ fn gfs_real_data_ingests_and_matches_wgrib2_probes() {
                 }
             }
         }
+        // HYBRID HGT at coordinate 1 (the raw stored value), fh 12:
+        let chyb = build_context(sref, "gfs", None, "HGT", 105, 1.0, 12.0 * 3600.0, TimeInterpMode::None);
+        match chyb {
+            Err(e) => { println!("HGT hybrid fh12 ctx: {0:?}", e); assert!(false); }
+            Ok(c) => {
+                match evaluate_point(&c, row_lat, lon_exact) {
+                    Err(other) => { println!("HGT hybrid probe: {0:?}", other); assert!(false); }
+                    Ok(pv) => {
+                        println!("GFS PROBE HGT hybrid:1 = {0} gpm (wgrib2 306)", pv.value);
+                        if absdiff(pv.value, 306.0) > 0.01 {
+                            println!("HGT hybrid off: {0} vs 306", pv.value);
+                            assert!(false);
+                        }
+                    }
+                }
+            }
+        }
+        // HYBRID TMP at coordinate 1, fh 12:
+        let ctyb = build_context(sref, "gfs", None, "TMP", 105, 1.0, 12.0 * 3600.0, TimeInterpMode::None);
+        match ctyb {
+            Err(e) => { println!("TMP hybrid fh12 ctx: {0:?}", e); assert!(false); }
+            Ok(c) => {
+                match evaluate_point(&c, row_lat, lon_exact) {
+                    Err(other) => { println!("TMP hybrid probe: {0:?}", other); assert!(false); }
+                    Ok(pv) => {
+                        println!("GFS PROBE TMP hybrid:1 = {0} K (wgrib2 292.87)", pv.value);
+                        if absdiff(pv.value, 292.87) > 0.01 {
+                            println!("TMP hybrid off: {0} vs 292.87", pv.value);
+                            assert!(false);
+                        }
+                    }
+                }
+            }
+        }
+        // hag:2 TMP at fh 12 is STILL absent — honest product-truth pin: these
+        // sflux samples publish 2 m TMP at fh 0 only; the fh-12 TMP lives on
+        // the HYBRID level (verified above), so nothing may conjure it at 2 m.
         let cf = build_context(sref, "gfs", None, "TMP", 103, 2.0, 12.0 * 3600.0, TimeInterpMode::None);
         match cf {
             Ok(_) => {
-                println!("TMP had a hag:2 plane at fh 12 — hybrid filter regressed?");
+                println!("TMP grew a hag:2 plane at fh 12 out of nothing?");
                 assert!(false);
             }
-            Err(_) => { println!("hybrid TMP correctly absent from hag:2 planes at fh 12"); }
+            Err(_) => { println!("hag:2 correctly absent at fh 12 (fh-12 TMP lives on hybrid)"); }
+        }
+    }
+
+    // ACOND (out-of-table raw triple d2/c0/n228 — section-0 discipline 2,
+    // land-surface products, read from the live bytes; units overridden to
+    // the gribtable value m/s) completes the zero-unstored-decodes story: its
+    // recorded node value 0.0125 replays at fh 0, WITH the overridden units
+    // flowing through FieldDef into the query context (E2 mechanism).
+    {
+        let ca = build_context(sref, "gfs", None, "d2c0n228", 1, 0.0, 0.0, TimeInterpMode::None);
+        match ca {
+            Err(e) => { println!("ACOND ctx: {0:?}", e); assert!(false); }
+            Ok(c) => {
+                if c.units != "m/s" {
+                    println!("ACOND units wrong: {0}", c.units);
+                    assert!(false);
+                }
+                match evaluate_point(&c, row_lat, lon_exact) {
+                    Err(other) => { println!("ACOND probe: {0:?}", other); assert!(false); }
+                    Ok(pv) => {
+                        println!("GFS PROBE ACOND surface = {0} m/s (wgrib2 0.0125)", pv.value);
+                        if !(pv.value.is_finite() && absdiff(pv.value, 0.0125) <= 0.001) {
+                            println!("ACOND off: {0}", pv.value);
+                            assert!(false);
+                        }
+                    }
+                }
+            }
         }
     }
 }

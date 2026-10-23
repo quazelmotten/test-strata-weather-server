@@ -224,6 +224,7 @@ def sec3_lambert(nx, ny, la1, lo1, lov, lad, latin1, latin2, dx_m, dy_m,
 LEVEL_ISOBARIC = 100
 LEVEL_AGL = 103
 LEVEL_SURFACE = 1
+LEVEL_HYBRID = 105  # CT 4.5 "hybrid" (FV3GFS upper-air); dimensionless coord
 
 # parameter codes (wgrib2 NCEP gribtable.dat: pcat, pnum)
 PARAMS = {
@@ -562,6 +563,43 @@ def main():
 
     with open(os.path.join(a.out, "gfs_small.grib2"), "wb") as f:
         for r in recs:
+            f.write(r)
+
+    # ---------------- HYBRID-LEVEL FIXTURE (V1.3 phase E4c) ----------------
+    # Same tiny regular lat/lon grid + run time as gfs_small, but TMP lives on
+    # TWO INDEPENDENT level stacks inside ONE file:
+    #   HYBRID (CT 4.5 type 105) at coordinates 1 / 50 / 255, fh 0 AND 6;
+    #   ISOBARIC at 850 / 500 hPa (written Pa-scaled like every GRIB producer),
+    #   fh 0 only.
+    # Plane values are ANALYTIC and LINEAR IN THE HYBRID COORDINATE:
+    #   v(L, fh, j, i) = 250 + 8*L + 10*fh + 32*j + i      (all integers ->
+    # simple packing round-trips exactly; the coordinate itself is stored RAW,
+    # dimensionless, scale factor 0). Any request strictly between two stored
+    # hybrid levels therefore has an EXACT expected value 250 + 8*Lq + ...,
+    # pinned for Lq = 152.5 (bracket t = 0.5) and 203.5 (t = 0.75), both exact
+    # binary fractions -> zero float slop in the analytic check.
+    # The isobaric planes use a DISJOINT magnitude band (base 100000) so any
+    # accidental cross-stack blend shows up as an obviously wrong number, and
+    # out-of-range requests (hybrid:300 > 255, hybrid:-5 < 1) must 422 rather
+    # than extrapolate or fall through to the other stack.
+    hyb_recs = []
+    for lval in (1, 50, 255):
+        for fh in (0, 6):
+            incs = [8 * lval + 10 * fh + 32 * j + i
+                    for j in range(ny) for i in range(nx)]
+            s5b, s7b, s6b, _ = encode_field(incs, 250.0, 0, None)
+            s4 = sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_HYBRID, lval, fh)
+            hyb_recs.append(build_record(t1, grid, s4, s5b, s7b, s6b))
+    for pval_hpa in (850, 500):
+        incs = [100000 + pval_hpa + 32 * j + i
+                for j in range(ny) for i in range(nx)]
+        s5b, s7b, s6b, _ = encode_field(incs, 250.0, 0, None)
+        s4 = sec4(PARAMS["TMP"][0], PARAMS["TMP"][1], LEVEL_ISOBARIC,
+                  pval_hpa * 100, 0)
+        hyb_recs.append(build_record(t1, grid, s4, s5b, s7b, s6b))
+
+    with open(os.path.join(a.out, "hybrid_small.grib2"), "wb") as f:
+        for r in hyb_recs:
             f.write(r)
 
     # ---------------- HRRR-like: Lambert conformal, grid winds ----------------

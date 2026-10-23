@@ -109,6 +109,25 @@ for name in GFS_TWINS[1:]:
     assert norm(fx["point_checks"]) == norm(gb["point_checks"]), \
         f"{name}: point checks differ"
 
+# ---------------- hybrid_small (V1.3 phase E4c: CT 4.5 type 105) ---------
+# Node probe inside the tiny regular grid (i=j=10); the field is analytic and
+# LINEAR IN THE HYBRID COORDINATE (v = 250 + 8*L + 10*fh + 32*j + i) so these
+# recorded values double as the vertical-interpolation ground truth, and
+# wgrib2's own "N hybrid level" spelling is the type-105 readback proof.
+hyb_records = [
+    ("TMP_hyb1_f000", r":TMP:1 hybrid level:anl:"),
+    ("TMP_hyb1_f006", r":TMP:1 hybrid level:6 hour fcst:"),
+    ("TMP_hyb50_f000", r":TMP:50 hybrid level:anl:"),
+    ("TMP_hyb50_f006", r":TMP:50 hybrid level:6 hour fcst:"),
+    ("TMP_hyb255_f000", r":TMP:255 hybrid level:anl:"),
+    ("TMP_hyb255_f006", r":TMP:255 hybrid level:6 hour fcst:"),
+    ("TMP_isob850_f000", r":TMP:850 mb:anl:"),
+    ("TMP_isob500_f000", r":TMP:500 mb:anl:"),
+]
+add_inventory("hybrid_small.grib2")
+fx = out["fixtures"]["hybrid_small.grib2"]
+fx["point_checks"] = point_checks("hybrid_small.grib2", hyb_records, [(355.0, 5.0)])
+
 # ---------------- hrrr_small & twin (LCC projection + values) ----------
 HRR = "tests/fixtures/hrrr_small.grib2"
 NX, NY = 61, 41

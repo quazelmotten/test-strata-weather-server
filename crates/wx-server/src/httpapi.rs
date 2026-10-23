@@ -242,7 +242,10 @@ pub fn render_grid_json(gd: &GridDef) -> String {
 }
 
 /// Configured level spec back to its string form (config grammar).
-fn render_level_spec(code: u8, val: Option<f64>) -> String {
+/// Render a parsed CONFIG level spec back to its canonical string for
+/// /v1/models. Public so the hybrid/wildcard shapes can be pinned at unit
+/// level (same rationale as `render_grid_json` being public since E4b).
+pub fn render_level_spec(code: u8, val: Option<f64>) -> String {
     if code == 255 {
         return "*".to_string();
     }

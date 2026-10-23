@@ -3114,3 +3114,218 @@ fields nx, ny, lon1, la1, la2, dlon, scan_mode, earth_shape, source_winds_grid
 (`render_grid_json`). No renames, no removals, `/v1/point` semantics unchanged
 (422 `out_of_domain` at poles is new ONLY in the sense that gaussian grids did
 not exist before).
+
+## 17. V1.3 phase E4c — HYBRID level type end-to-end + full operational-GFS acceptance
+
+### 17.1 What landed
+
+GRIB2 Code Table 4.5 level type **105 ("hybrid", the hybrid/sigma-pressure
+coordinate that ALL current operational GFS (FV3GFS) upper-air fields ride)**
+is supported end to end: decoder -> config (`hybrid:NN`, `hybrid:*`) ->
+storage (`<param>/hybrid/fFFF.bin`) -> index/inventory (`level_type`
+"hybrid") -> `/v1/point` (request `hybrid:NN`, vertical interpolation linear
+in the coordinate) -> `/v1/models` spec rendering. The entire core delta is
+TWO table rows (`LEVEL_TYPE_CODES`/`LEVEL_CANONICAL` in wx-core tables.rs)
+plus doc comments: every layer along the path was already level-generic
+(`parse_sec4` reads any fixed-surface type != 255, `parse_level_spec` /
+`level_dir_name` / `level_code_of_dir` / `resolve_levels*` flow through the
+tables), which is itself the strongest argument that the level model was
+designed right. Unknown level types keep today's behavior EXACTLY (decode
+ok, no structural skip, simply never match a configured spec -> unstored),
+pinned by `unknown_level_type_stays_decode_ok_store_skip`.
+
+### 17.2 "Type 100" vs 105: the brief said 100, the bytes say 105
+
+The phase brief called hybrid "CT4.5 type 100". That is WRONG on two counts,
+decided from live bytes rather than prose:
+* Code 100 is `isobaric` in WMO CT 4.5, in wgrib2, in ecCodes AND in this
+  codebase — every existing isobaric probe flows through 100 with the Pa->hPa
+  normalization (a hybrid-on-100 encoding would have COLLIDED with stored
+  pressure levels).
+* Raw dumps of the actual sflux messages (section 4 payload = section[5:],
+  first surface at payload 17, decimal scale factor signed byte at 18, value
+  sign-magnitude i4 at 19 — the decoder's own proven convention):
+
+```
+gfs_sflux_f012 msg0: cat=3 num=5   t1=105 val1=1.0  t2=255   (HGT, wgrib2 "1 hybrid level")
+gfs_sflux_f012 msg1: cat=0 num=0   t1=105 val1=1.0  t2=255   (TMP, wgrib2 "1 hybrid level")
+gfs_sflux_f012 msg2: cat=3 num=5   t1=1   val1=0.0  t2=255   (surface HGT)
+gfs_sflux_f000 msg0: cat=0 num=228 t1=1   val1=0.0  t2=255   (ACOND, DISCIPLINE OCTET = 2!)
+gfs_sflux_f000 msg1: cat=0 num=0   t1=103 val1=2.0  t2=255   (TMP 2 m)
+gfs_sflux_f006 msg0: cat=2 num=2   t1=103 val1=10.0 t2=255   (UGRD 10 m)
+gfs_sflux_f006 msg1: cat=2 num=3   t1=103 val1=10.0 t2=255   (VGRD 10 m)
+```
+
+`("hybrid", 105)` it is; the brief's number is recorded as a misstatement.
+Second fixed surfaces are all 255 (absent) in these products, so single-value
+levels only — the multi-level merge path is exercised by the synthetic
+fixture instead.
+
+### 17.3 sec4 parse details (no decoder change was needed)
+
+`parse_sec4` accepts ANY first-surface type other than 255 generically:
+scale factor is the SIGNED byte after the type octet, the value is a 4-byte
+SIGN-MAGNITUDE integer (`sm_i4`, top bit = sign) scaled by 10^-E, and the
+second face rides identical offsets +6 later. Type 105 therefore decodes
+with zero new decode code; the only special-casing anywhere in the level
+path remains `norm_level`'s deliberate isobaric (100) Pa->hPa divide.
+
+### 17.4 Level-value normalization decision: RAW dimensionless
+
+The hybrid coordinate (eta/A-grid sigma-pressure value; NCEP encodes the
+layer identifier or coefficient-based value per product) is DIMENSIONLESS,
+so stored level values are the raw GRIB coordinate AS-IS — no divide, no
+unit conversion, config `hybrid:1` matches exactly what section 4 says.
+Contrast documented in `norm_level`'s comment. Consequences: the .bin header
+f32 coordinates are unchanged format; `/v1/inventory` emits PARAMETER units
+only (K/gpm/m/s), it never emitted per-LEVEL-coordinate units, so the
+brief's "units \"\" for the LEVEL coordinate" is satisfied by ABSENCE — we
+never fabricate hPa-style units for hybrid levels anywhere.
+
+### 17.5 Wildcard + parsing semantics
+
+`hybrid:*` (config) = every hybrid coordinate present -> `level_specs`
+(105, None), identical machinery to `isobaric:*`. `hybrid:NN` accepts
+integers and decimals like every numeric type (`hybrid:837.5` OK, exponent
+forms rejected, bare `hybrid` = the shared bare-name rule = value 0.0).
+Malformed names fail with the pre-existing "bad level spec '...'" startup
+error style. API requests echo via `format_level_str` canonical strings
+(`hybrid:152.5` round-trips); no special-case echo was added — consistent
+with every other level type.
+
+### 17.6 Storage / manifest / API shape deltas (all additive)
+
+Level-type DIRECTORY name "hybrid" via `canonical_level_name` (fallback
+`ct{code}` untouched); `level_code_of_dir("hybrid")` -> 105 round-trip;
+manifest + inventory enumeration flow through unchanged. Canonical STACK
+ORDER: hybrid rides `level_better`'s non-isobaric branch = deterministic
+ASCENDING coordinate order (isobaric stays descending-pressure).
+`/v1/models` renders configured specs through `render_level_spec` (made
+pub for unit-level pinning, same precedent as `render_grid_json` E4b):
+wildcards print `hybrid:*`, values print raw `hybrid:837.5`; the bare-name
+special case stays EXCLUSIVE to surface. No new status codes, reasons,
+counters or metrics anywhere: vertical-range misses ride the existing 422
+`level_out_of_range` class.
+
+### 17.7 Vertical interpolation: linear in the hybrid coordinate (sigma approximation)
+
+Spec §6.2 interpolates linearly in the NUMERIC LEVEL COORDINATE for any
+orderable numeric level type ("in pressure for isobaric" is the named
+example). Hybrid coordinates ARE numeric and orderable, so linear-in-the-
+hybrid-coordinate between bracketing STORED hybrid levels is the literal
+spec behavior; a true sigma-to-pressure refinement would need the FV3
+producer's A/B layer coefficients, which live outside section 4 and are not
+parsed (out of scope; would be a future option flag next to log-pressure).
+Exact-match-first within LEVEL_MATCH_EPS=1e-9; strictly inside the stored
+range only, NEVER extrapolate; gaps interpolate across (§6.2 letter).
+Brackets can NEVER cross level types because each field file carries ONE
+type's levels in its own directory — structurally impossible, and pinned
+by `hybrid_isobaric_same_param_stacks_never_mix` (a hybrid:128 request
+whose VALUE lies numerically INSIDE the isobaric 500-850 band still
+answers from the hybrid stack; isobaric:300 outside its own band errors
+instead of falling through).
+
+### 17.8 Synthetic fixture + idempotency proof
+
+NEW committed fixture `tests/fixtures/hybrid_small.grib2` (generated by
+scripts/gen_grib2.py, guarded in scripts/gen_fixtures.sh): tiny regular
+lat/lon grid (41x21, lon1 350 dlon 0.5, lat1 10 dlat -0.5 N->S), run
+2026-10-19 12Z, TMP on HYBRID coordinates 1/50/255 x fh {0,6} PLUS TMP on
+ISOBARIC 850/500 hPa x fh 0 in ONE file. Plane values analytic and linear
+in the coordinate: v(L,fh,j,i) = 250 + 8L + 10fh + 32j + i (simple packing
+exact); the isobaric planes sit in a DISJOINT ~1e5 band so any stack leak
+would be blindingly obvious. Bracket probes at binary-exact weights
+(hybrid:152.5 -> t=0.5, hybrid:203.5 -> t=0.75) plus time blend fh 3
+(t=0.5) have ZERO float slop. Node (5.0N, 355.0E)=i=j=10 ground truth
+recorded from tools/wgrib2-full `-lon`: 588/648/980/1040/2620/2680/
+101430/101080 — matches the analytic formula exactly, appended to
+expected.json via scripts/regen_expected.sh (PURELY ADDITIVE diff:
++102 lines, zero drift on any pre-existing entry).
+Idempotency: two consecutive gen_grib2.py runs give hybrid_small md5
+0f5e2b99945a5a5cd6091d99d93ffeae both times; a FULL scripts/gen_fixtures.sh
+re-run (including every wgrib2 packing twin) left ALL tracked fixtures
+byte-identical (git shows only expected.json modified + the new file), and
+the new guard prints `ok hybrid_small (6x 'hybrid level' + 2x 'mb' read
+back by wgrib2-full)` — wgrib2 reads our hand-written type-105 sections
+with the same spelling it uses for live FV3GFS bytes.
+
+### 17.9 Real-GFS acceptance: before -> after
+
+fetch_real_sample.sh needed NO change (the hybrid + ACOND messages were
+already inside the files fetched during E4a/E4b); only the acceptance
+CONFIG grew to current-operational shape: TMP [height_above_ground:2,
+hybrid:*], HGT [surface, hybrid:*], UGRD/VGRD [height_above_ground:10],
+plus the out-of-table ACOND triple discipline=2 category=0 number=228
+units="m/s" (aerodynamic conductance IS a land-surface product — section-0
+discipline octet 2 read from the live bytes; the first acceptance attempt
+stored 6/7 and the `keys.len() == 7` pin caught the wrong-discipline
+config, a nice demonstration that the pin bites).
+
+| metric                                   | before (E4b cfg) | after (E4c cfg) |
+|------------------------------------------|------------------|-----------------|
+| messages decoded / total (3 files)       | 7 / 7            | 7 / 7           |
+| structural skips                         | 0                | 0               |
+| stored field entries                     | 4                | 7               |
+| decoded-but-unstored messages            | 3 (ACOND, HGT-hyb, TMP-hyb) | 0 |
+| hybrid upper-air queryable               | no               | YES             |
+
+Probe replay at the Oct-22 node (row lat 40.006506, col lon -95.0390625),
+recorded `wgrib2 -lon` truth vs server today (Oct 23):
+
+| probe                       | wgrib2        | server              |
+|-----------------------------|---------------|---------------------|
+| TMP hag:2 fh0 node-exact    | 286.74 K      | 286.739990234375 K  |
+| UGRD hag:10 fh6             | 1 m/s         | 1 m/s               |
+| VGRD hag:10 fh6             | 3.2 m/s       | 3.200000047683716   |
+| HGT surface fh12            | 295.7371520996094 | 295.7371520996094 gpm |
+| HGT HYBRID:1 fh12 (NEW)     | 306           | 306 gpm (bit-parity)|
+| TMP HYBRID:1 fh12 (NEW)     | 292.87 K      | 292.8699951171875 K (f32 bit-parity) |
+| ACOND surface fh0 (NEW)     | 0.0125        | 0.012500000186264515 m/s (units pin "m/s") |
+
+Honest negative pin kept: TMP at hag:2 fh 12 must STAY absent (these sflux
+samples publish 2 m TMP at fh 0 only; the fh-12 temperature lives on the
+hybrid level — nothing may conjure it at 2 m). Plainly stated: **current
+operational GFS sflux products are fully queryable end-to-end (surface +
+hybrid upper-air).** Acceptance test wall time: 1322.11 s debug profile
+(failed first attempt: 1080.96 s, discipline bug above).
+
+### 17.10 Tests added
+
+* wx-core `tables_checks.rs`: +`hybrid_level_strings_round_trip` (parse/
+  format matrix incl. round-trips, malformed rejections) — suite 5/5.
+* wx-server `hybrid_models_render.rs` (NEW, 2 tests): wildcard/value
+  rendering, bare-surface exclusivity, other-kinds-unchanged guard.
+* wx-ingest `hybrid_decode.rs` (NEW, 7 tests): raw type-105 decode +
+  isobaric divide coexistence; wildcard store (ascending stack, both fhs,
+  exact node answers at every stored coordinate); bracket interpolation
+  ANALYTIC (t=0.5/0.75 + time-blend bonus); out-of-range never
+  extrapolates (4 probes either side of [1,255]); hybrid-vs-isobaric
+  STACK ISOLATION incl. numeric-inside-band trap; config parse/validation
+  matrix; unknown-type decode-ok/store-skip via runtime byte-patch (type
+  200 patch shrinks the answerable range — hybrid:1 becomes
+  `level_out_of_range`).
+* wx-ingest `realdata_gate.rs` acceptance extended as per §17.9.
+
+### 17.11 Surprises
+
+(a) brief's "type 100" vs live 105 (resolved in §17.2); (b) ACOND lives
+under discipline 2, not 0 — first acceptance run failed exactly where
+designed (the completeness pin) instead of silently under-storing; (c) my
+ad-hoc python section-4 offset guesses misread the bytes twice before I
+anchored on the DECODER's own proven payload convention (payload =
+section[5:], surfaces at +17/+23) — lesson: dump through the tested code
+path's indexing, not from memory of the WMO octet table.
+
+### 17.12 Gate record (Oct 23 2026, this session)
+
+* `cargo test --workspace` TWICE back-to-back, debug profile, realdata gates
+  ACTIVE: run 1 rc=0 — 92 test binaries all `test result: ok`, 229 tests
+  passed 0 failed, wall 3303 s; run 2 rc=0 — identical counts, wall 3281 s.
+  (Wall is dominated by the ~54-min gfs_sflux decode gate; the extended
+  acceptance binary alone measured 1322 s.)
+* `cargo clippy --workspace -- -D warnings`: rc=0 (gate form; the future-
+  incompat warnings on old bitflags deps are pre-existing dependency noise,
+  not lints).
+* `bash scripts/smoke.sh`: **SMOKE PASS**, 17/17 probes, `/health`+`/ready`
+  200, release-build avg point-query latency 25.8 us over 422 queries
+  (target p50 < 50 us).
