@@ -41,3 +41,13 @@ panic = "abort"
 "opt-level" = 3
 lto = "fat"
 codegen-units = 1
+
+# Real-data gates (crates/wx-ingest/tests/realdata_gate.rs) decode live GFS
+# gaussian 3072x1536 + HRRR slices through the pure-Rust GRIB kernels. At the
+# inherited opt-level=0 the full suite costs ~1 h with tests/realdata/ present
+# (README Known Limitations; AUDIT_1.3 finding P2 — CPU-bound, not hung).
+# Bump ONLY the test profile: `cargo build`/`cargo run` keep fast incremental
+# dev builds, and debug-assertions stay ON so the correctness gates keep
+# their teeth (no panic=abort here either — tests must unwind).
+[profile.test]
+"opt-level" = 3

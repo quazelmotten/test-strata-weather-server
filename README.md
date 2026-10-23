@@ -1226,9 +1226,13 @@ live in §10 and docs/DECISIONS.md.
   this, and the escape hatch is documented rather than silently widened because
   decoding `+` (form encoding) would change existing 404-class behaviour.
 * **Real-data gate cost when enabled.** With `tests/realdata/` populated the
-  DEBUG-profile suite pays roughly an hour per run (the slice-decode gates run
-  unoptimized); CI without those files skips them cleanly in seconds. Use
-  `cargo test --release` for quick full-suite passes against live slices.
+  slice-decode gates re-decode live GFS/HRRR bytes, which is compute-heavy;
+  since the `[profile.test] opt-level = 3` change a warm `cargo test` run
+  measures 2 m 21 s (was ~57 min at opt-level 0, AUDIT_1.3 P2). The first
+  run after the bump pays a one-time O3 rebuild of the dependency tree
+  (~24 s). CI without those files skips them cleanly in seconds
+  either way. `cargo test --release` remains valid but is no longer necessary
+  for a quick pass.
 * **Storage scales linearly per grid plane (sizing guidance).** One full
   native HRRR 3 km CONUS plane (1799×1059 f32) is ≈7.6 MB; one full GFS 0.25°
   plane (1440×721 f32) ≈4.0 MB. A run's footprint is planes × levels × params
