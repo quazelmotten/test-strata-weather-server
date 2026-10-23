@@ -853,6 +853,25 @@ HGT/TMP probes through the full ingest+index path against recorded
 probes); without it they skip cleanly, so CI stays offline. Recorded probes
 and the full diagnosis: docs/DECISIONS.md §15 (E4a), §16 (E4b grid
 acceptance) and §17 (E4c hybrid acceptance table).
+
+**Consolidated live acceptance harness (V1.3 phase E5, MANUAL/NETWORK, never
+CI):** `scripts/realdata_acceptance.sh` wires everything end to end in one
+command — idempotent fetch → release build → boots `target/release/wxpoint`
+on a spare port (default 18099) with a current-operational config (gfs sflux
+incl `hybrid:*`, hrrr incl the raw `d0c2n1` WIND triple) → waits `/ready` →
+runs `scripts/realdata_probes.py` (20 pins) → prints the sha256 provenance of
+every fetched slice; server shutdown is trapped, any failed pin exits
+non-zero. The probes validate against expectations derived INDEPENDENTLY of
+our Rust path: real HRRR wind rotation (section-3 component flag byte read
+from bytes; raw grid-relative U/V printed by `wgrib2 -lon`; cone angle
+measured by pyproj via the E-era `validate_rotation.py` chain since this
+wgrib2 build has no IPOLATES `-wind`), real same-run time interpolation
+blends of 2 m TMP across fh {0,6,12}, and production PDT 4.8 metadata +
+guards straight off operational bytes (`/v1/inventory` stat flags, 422
+`stat_time_guard`). What stays in CI: everything network-free — the synthetic
+fixture suites and the realdata gates (which skip cleanly without
+`tests/realdata/`); nothing automated invokes this script. Measured deltas
+and decisions: docs/DECISIONS.md §18.
 See §9 Limitations for what remains unverified until you do.
 
 Beyond §9 (V1.1 additions): packing parity — each small fixture exists in six

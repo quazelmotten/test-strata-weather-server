@@ -580,7 +580,7 @@ fn real_cfg_text(root: &str) -> String {
     let t = format!("{0}{1}", t, data);
     let t = t + "\"\n\n[ingest]\nscan_interval_secs = 30\nretention_runs = 4\nstable_window_secs = 0\n\n[[models]]\nname = \"hrrr\"\ningest_dir = \"";
     let t = format!("{0}{1}", t, ing);
-    let t = t + "\"\nfile_glob = \"hrrr_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n";
+    let t = t + "\"\nfile_glob = \"hrrr_*.grib2\"\n\n  [[models.params]]\n  name = \"TMP\"\n  levels = [\"height_above_ground:2\"]\n\n  [[models.params]]\n  name = \"UGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"VGRD\"\n  levels = [\"height_above_ground:10\"]\n\n  [[models.params]]\n  name = \"APCP\"\n  levels = [\"surface\"]\n\n  # E5: WIND (Wind Speed) lives OUTSIDE the built-in table; raw triple read\n  # from the live bytes (discipline 0, category 2, number 1) with gribtable\n  # units. Its PDT 4.8 max-over-window metadata is production-byte proof.\n  [[models.params]]\n  discipline = 0\n  category = 2\n  number = 1\n  units = \"m/s\"\n  levels = [\"height_above_ground:10\"]\n";
     return t;
 }
 
@@ -605,6 +605,11 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
     }
     match &apcpf {
         Some(p) => { copy_in(p, &join_path(&ing, "hrrr_apcp_tight.grib2")); nfiles += 1; }
+        None => {}
+    }
+    let windf = real_path("hrrr_windmax_f06.grib2");
+    match &windf {
+        Some(p) => { copy_in(p, &join_path(&ing, "hrrr_windmax_f06.grib2")); nfiles += 1; }
         None => {}
     }
     let cfgp = join_path(&root, "config.toml");
@@ -637,6 +642,42 @@ fn hrrr_real_data_ingests_and_matches_wgrib2_probes() {
         None => { assert!(false); return; }
         Some(m) => {
             assert!(m.runs.len() == 1);
+            // E5 PRODUCTION PDT 4.8 METADATA PINS: the stat flags on these
+            // index entries come from REAL section-4 octets of operational
+            // HRRR bytes (docs/DECISIONS.md §18). APCP carries the tight
+            // zero window; WIND (raw key d0c2n1) the 5-6 hour maximum.
+            use wx_core::storage::{STAT_ACCUMULATION, STAT_MAXIMUM};
+            let mut apcp_pin = false;
+            let mut wind_pin = true; // stays true when the slice is absent
+            let mut wind_seen = false;
+            for fe in &m.runs[0].fields {
+                for kh in 0 .. fe.fd.fhs.len() {
+                    let fh = &fe.fd.fhs[kh];
+                    if fe.param_key == "APCP" && fe.level_code == 1 {
+                        println!("PRODUCTION STAT APCP: processed={0} kind={1} range={2} begin={3} end={4} step={5}",
+                                 fh.stat_processed, fh.stat_kind_code,
+                                 fh.stat_has_range, fh.stat_begin_secs,
+                                 fh.stat_end_secs, fh.stat_step_secs);
+                        apcp_pin = fh.stat_processed &&
+                                   fh.stat_kind_code == STAT_ACCUMULATION;
+                    }
+                    if fe.param_key == "d0c2n1" {
+                        wind_seen = true;
+                        println!("PRODUCTION STAT WIND(d0c2n1): processed={0} kind={1} range={2} begin={3} end={4}",
+                                 fh.stat_processed, fh.stat_kind_code,
+                                 fh.stat_has_range, fh.stat_begin_secs,
+                                 fh.stat_end_secs);
+                        wind_pin = fh.stat_processed &&
+                                   fh.stat_kind_code == STAT_MAXIMUM &&
+                                   fh.stat_begin_secs == 18000 &&
+                                   fh.stat_end_secs == 21600;
+                    }
+                }
+            }
+            if windf.is_some() && wind_seen {
+                assert!(wind_pin);
+            }
+            assert!(apcp_pin);
             // TMP @ 2 m AGL, forecast hour 0 (anl), exact-node probes
             let cb = build_context(sref, "hrrr", None, "TMP", 103, 2.0, 0.0,
                                    TimeInterpMode::Linear);

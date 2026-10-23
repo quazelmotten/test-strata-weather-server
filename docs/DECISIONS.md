@@ -3329,3 +3329,141 @@ path's indexing, not from memory of the WMO octet table.
 * `bash scripts/smoke.sh`: **SMOKE PASS**, 17/17 probes, `/health`+`/ready`
   200, release-build avg point-query latency 25.8 us over 422 queries
   (target p50 < 50 us).
+
+## 18. V1.3 phase E5 — consolidated real-data acceptance harness + production wind-rotation validation
+
+### 18.1 What landed
+
+Three new MANUAL/NETWORK artifacts + two test-only extensions; ZERO Rust
+source changes (hot path untouched):
+
+* `scripts/fetch_real_sample.sh` extended (see §18.5),
+* `scripts/realdata_probes.py` — 20-pin probe suite whose expectations are
+  derived independently of our Rust code (wgrib2-decoded node values + pyproj
+  projection/angle geometry + plain f64 arithmetic),
+* `scripts/realdata_acceptance.sh` — one-command orchestrator (idempotent
+  fetch -> release build -> boot `target/release/wxpoint` on port 18099 with
+  a current-operational config -> `/ready` -> probes -> sha256 provenance ->
+  trapped shutdown; non-zero exit on any FAIL),
+* `crates/wx-ingest/tests/realdata_gate.rs` hrrr test extended: production
+  PDT 4.8 stat-metadata pins (APCP accumulation flags; WIND raw triple
+  d0c2n1 stored + maximum kind + begin/end 18000/21600 s pinned from the
+  live 5-6 h window) — offline-safe (skips without tests/realdata/) and
+  verified by the workspace gates.
+
+### 18.2 Wind rotation GROUND TRUTH + verdict
+
+Component convention read from three independent sources, all agreeing:
+section-3 flag byte **flag33 = 0x08** parsed straight from the bytes in
+python (validate_rotation.py's proven reader), decoder bit-0x08 reader, and
+live `/v1/models source_winds_grid=true`. Operational HRRR winds ARE
+grid-relative => the ingest-time rotation is exercised and now validated.
+wgrib2 `-wind`/-new_grid golden remains impossible locally (IPOLATES-less
+build, orchestrator-confirmed), so the §9.3 chain used is: raw U/V at exact
+nodes printed by `tools/wgrib2-full -lon` -> cone angle gamma measured by
+pyproj's own LCC forward/inverse (spherical CT3.2=6 R=6371229 m read from
+bytes) -> vector rotation implemented in python from the documented WMO
+convention (g_i = sin b e_E + cos b e_N, g_j = cos b e_E - sin b e_N =>
+u_e = u_g sin b + v_g cos b; v_n = u_g cos b - v_g sin b) -> compared
+against the LIVE SERVER answer. Tolerance derivation: wgrib2's -lon prints
+six significant digits (half-ulp <= ~3e-6 relative) plus f32 storage
+rounding => 1e-4 m/s bound; any wrong convention/sign would miss by O(1..30)
+m/s, so the check is decisive. Nodes spread across CONUS + one NEAR-EDGE
+(two cells inside the eastern column):
+
+| probe | node (lat, lon)      | gamma deg | max abs delta m/s |
+|-------|----------------------|-----------|-------------------|
+| A1    | (32.70646,-120.0297)| 75.9749   | 1.8e-07 |
+| A2    | (38.4973,-97.5060)  | 89.9963   | 5.0e-06 |
+| A3    | (40.9159,-83.1446)  | 98.9365   | 7.7e-08 |
+| A4    | (44.3864,-70.8140)  | 106.6124  | 3.7e-08 |
+| A5    | (27.9356,-106.5022) | 84.3960   | 1.5e-08 |
+| A6 NE | (34.5455,-67.6748)  | 108.5666  | 4.5e-06 |
+
+Recorded max over all nodes: **5.033e-06 m/s** (vs 1e-4 bound). Verdict:
+production-grid rotation correct to the resolution of the reference tool's
+print; pass-through path (GFS gaussian, flag clear) already pinned by E4-era
+earth-value probes.
+
+### 18.3 Real-data time interpolation (same run, real fields)
+
+Run-consistent 2 m TMP slices fh {0,6,12} (fetch extension, §18.5); node =
+the E4b/E4c gaussian node (40.006506 N, -95.0390625). Endpoint values come
+from wgrib2 -lon (286.74 / 295.60 / ... K family); expectations = plain f64
+lerps of the printed endpoints, tolerance 1e-3 K derived from six-digit
+endpoint print rounding (half-ulp ~1.5e-4 each end):
+
+| probe                              | expected blend        | abs delta |
+|------------------------------------|---------------------|-----------|
+| B1 exact fh6 stays node-exact      | e6                  | 6.3e-06 K |
+| B2 midpoint fh3 (fh0,fh6) t=0.5    | (e0+e6)/2           | 1.4e-06 K |
+| B3 third-point fh2 (fh0,fh6) t=1/3 | e0+(e6-e0)/3        | 3.9e-06 K |
+| B4 midpoint fh9 (fh6,fh12) t=0.5   | (e6+e12)/2          | 7.5e-06 K |
+
+Max 7.515e-06 K. B5: time_interp=none OFF a stored slot answers
+**422 time_exact_only** ("no stored forecast hour equals the requested valid
+time") — observed behavior, no silent blend; pinned as an error-class pin.
+
+### 18.4 Production PDT 4.8 proof + guards
+
+From OPERATIONAL bytes through the release server: `/v1/inventory?model=hrrr`
+shows APCP `stat_processed:true stat_kind:"accumulation"` (units kg/m^2,
+tight zero window) and WIND (out-of-table raw triple d0c2n1, units override
+m/s) `stat_processed:true stat_kind:"maximum"` with forecast_hours [5].
+HONEST SLOT NOTE: stat fields are indexed at their BEGIN offset (5 h for the
+5-6 h maximum) — spec §7 defines `valid = run + fcst hour` slots for
+INSTANTANEOUS fields; stat products ride their own begin/end window and the
+guard enforces exactly that, so C4 queries the stored 5 h slot (answers
+2.6249594 m/s) rather than inventing a 6 h slot. Guards: APCP fh3 linear and
+WIND fh5.5 linear both -> **422 stat_time_guard** with the explanatory
+message naming accumulation/maximum semantics — never blended. Tight-window
+APCP answers EXACT 0 via the API (degenerate empty section 7 tolerance,
+E4a). The same metadata is now also pinned offline in the realdata_gate hrrr
+test (PRODUCTION STAT lines + assertions incl begin==18000/end==21600).
+
+### 18.5 Fetch-list extension (+ surprise)
+
+Added `gfs_tmp_f006.grib2` + `gfs_tmp_f012.grib2` (':TMP:2 m above ground'
+slices, 1.96 + 3.39 MB, total addition 5.3 MB within budget), saved as NEW
+files so every pre-E5 slice stays byte-identical (sha256 provenance printed
+by the harness; realdata_gate message-count pins untouched). Surprise caught
+live: the default GFS_YMD=yesterday had ROLLED OVER between sessions, so the
+first fetch landed the new slices on the Oct-22 run while the kept files were
+Oct-21 — deleted the drifted slices, refetched with GFS_YMD/GFS_HH explicitly
+pinned, verified all GFS files now declare d=2026102112. Lesson: run
+consistency across slices requires PINNING the cycle env, not defaults.
+
+### 18.6 Wire-format observation (pre-existing, recorded honestly)
+
+The server's query parser reads the RAW query string: bare colons in
+`level=height_above_ground:10` / `valid=...T12:00:00Z` (RFC3986-legal in
+query values, what curl sends) work; standard percent-encoded `%3A` arrives
+LITERALLY and 400s (`bad_level`, `bad_time`). Not an E5 regression (nothing
+in-repo ever encoded; smoke.sh/curl always send raw colons) — the python
+harness therefore passes `safe=":,-._/"` to urlencode. If we ever front the
+API with a proxy that normalizes encoding, revisit decoding in the parser;
+documented here rather than silently patched mid-phase.
+
+### 18.7 Reproduce + CI boundary
+
+```
+PORT=18099 scripts/realdata_acceptance.sh     # MANUAL / NETWORK, exit != 0 on FAIL
+```
+Final live tail: `== SUMMARY: 20/20 pins passed ==` / `REALDATA ACCEPTANCE
+PASS`. CI keeps: synthetic suites + realdata gates (skip without data dir);
+the harness itself is invoked by nothing automated (spec §13).
+
+### 18.8 Gate record (Oct 23 2026, this session)
+
+* `bash scripts/realdata_acceptance.sh` live network run: **REALDATA
+  ACCEPTANCE PASS**, 20/20 pins (log tail quoted in §18.7); the extended hrrr
+  gate additions were ALSO exercised offline (next bullet).
+* `cargo test --workspace` TWICE back-to-back, debug profile, realdata gates
+  ACTIVE: run 1 rc=0 — 92 binaries all ok, 229 passed / 0 failed, wall
+  3296 s; run 2 rc=0 — identical counts, wall 3273 s. The hrrr binary grew
+  ~2 min (windmax plane now ingested + raw-triple config) and both runs pin
+  the production stat assertions from §18.4.
+* `cargo clippy --workspace -- -D warnings`: rc=0 (gate form; bitflags
+  future-incompat warnings are pre-existing dependency noise).
+* `bash scripts/smoke.sh`: **SMOKE PASS**, release avg point-query latency
+  28.9 us over 422 queries.

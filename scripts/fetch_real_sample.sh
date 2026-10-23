@@ -178,6 +178,17 @@ fetch_slice gfs_sflux_f006.grib2 \
 fetch_slice gfs_sflux_f012.grib2 \
     "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf012.grib2" \
     ':HGT:' ':TMP:.*hybrid'
+# E5 additions (time-interpolation on REAL bytes): 2 m TMP at fh 6 and fh 12
+# join the fh-0 TMP already inside gfs_sflux_f000.grib2, giving three
+# forecast hours of the SAME field/run for real linear-blend probes (fh 3
+# midpoint etc.). Saved as SEPARATE files so every pre-E5 slice stays
+# byte-identical (sha256 + the realdata_gate message-count pins untouched).
+fetch_slice gfs_tmp_f006.grib2 \
+    "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf006.grib2" \
+    ':TMP:2 m above ground'
+fetch_slice gfs_tmp_f012.grib2 \
+    "$GFS_DIR/gfs.t${GFS_HH}z.sfluxgrbf012.grib2" \
+    ':TMP:2 m above ground'
 
 # --- HRRR CONUS family ------------------------------------------------------
 fetch_slice hrrr_tmp2m_f00.grib2 \
