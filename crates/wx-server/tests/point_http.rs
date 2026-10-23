@@ -465,10 +465,13 @@ fn meta_endpoints_and_metrics() {
             // VALUES; presence + well-formedness is what we pin here).
             assert!(has(&rx.1, "wxpoint_ingest_publish_latency_seconds"));
             assert!(has(&rx.1, "wxpoint_ingest_publish_latency_seconds_max"));
-            // ---- V1.3 phase E6 TARGETED %-DECODE EQUIVALENCE ----------------
-            // %3A/%3a inside a level VALUE and %2C/%2c inside a param VALUE must
-            // behave EXACTLY like their bare counterparts: byte-identical
-            // responses (queryapi header documents the rule).
+            // ---- V1.3 phase E6 %-DECODE EQUIVALENCE (uniform since V1.4 A) --
+            // %3A/%3a inside values and %2C/%2c inside param values behave
+            // EXACTLY like their bare counterparts: byte-identical responses.
+            // V1.4 phase A made decoding UNIFORM over every value (E6 decoded
+            // only those two escapes in two keys); the equivalence probes below
+            // hold unchanged under either rule set (queryapi header documents
+            // the current one).
             let d_plain = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
             assert!(d_plain.0 == 200);
             let d_up = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric%3A1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
@@ -483,17 +486,21 @@ fn meta_endpoints_and_metrics() {
             assert!(dm_up.0 == 200 && dm_up.1 == dm_plain.1);
             let dm_lo = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%2cTMP&level=isobaric%3A1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
             assert!(dm_lo.0 == 200 && dm_lo.1 == dm_plain.1); // lowercase-hex %2c + uppercase-hex %3A together
-            // Passthrough rules: unknown/malformed % sequences stay LITERAL
-            // bytes (so they look up as an unknown parameter -> 404), '+' is
-            // never a space, and %-decoding never invents a valid level.
+            // V1.4 phase A rules: malformed % sequences are now a TYPED 400
+            // bad_percent_escape (pre-A they rode through as literal bytes and
+            // surfaced as unknown_param 404 — a client encoding bug masquerading
+            // as a data answer). The escape check runs BEFORE any domain
+            // lookup, so it even PREEMPTS bad_level for mixed values like
+            // isobaric%3A85%zz (pre-A: bad_level). '+' remains literal (never
+            // a space): TM+P still looks up as an unknown parameter -> 404.
             let dq_zz = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%zz&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
-            assert!(dq_zz.0 == 404 && has(&dq_zz.1, "unknown_param"));
+            assert!(dq_zz.0 == 400 && has(&dq_zz.1, "\"error\":\"bad_percent_escape\""));
             let dq_tail = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP%&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
-            assert!(dq_tail.0 == 404 && has(&dq_tail.1, "unknown_param"));
+            assert!(dq_tail.0 == 400 && has(&dq_tail.1, "\"error\":\"bad_percent_escape\""));
             let dq_plus = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TM+P&level=isobaric:1000&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
             assert!(dq_plus.0 == 404 && has(&dq_plus.1, "unknown_param"));
             let dq_lvl = rt.block_on(fetch(svc.clone(), "/v1/point?model=gfs&param=TMP&level=isobaric%3A85%zz&lat=10&lon=350&valid=2026-10-19T12:00:00Z".to_string()));
-            assert!(dq_lvl.0 == 400 && has(&dq_lvl.1, "bad_level"));
+            assert!(dq_lvl.0 == 400 && has(&dq_lvl.1, "bad_percent_escape"));
             assert!(has(&rx.1, "wxpoint_ingested_files_total"));
             // V1.3 phase E1: stat-collision rejection is observable too.
             assert!(has(&rx.1, "wxpoint_stat_collisions_total"));

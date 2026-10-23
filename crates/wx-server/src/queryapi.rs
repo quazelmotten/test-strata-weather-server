@@ -21,116 +21,160 @@ use wx_core::interp::{TimeInterpMode, HorizMethod, PointError, InterpInfo, Level
 use wx_core::tables::{parse_level_str, format_level_str, parse_f64, fmt_num};
 
 // ---------------------------------------------------------------------------
-// V1.3 phase E6 TARGETED PERCENT-DECODE (follow-up to docs/DECISIONS.md §18.6,
-// which recorded that the server historically read the RAW query string and
-// therefore saw `%3A` as three literal bytes). The contract stays raw-first —
-// the canonical wire form remains BARE colons/commas (curl style) — but the
-// two escapes clients most often emit ARE now accepted, and ONLY these, and
-// ONLY inside the VALUES of `param` and `level`:
-//   %3A / %3a -> ':'      %2C / %2c -> ','
-// Everything else passes through BYTE-FOR-BYTE: '+' never becomes a space
-// (no plus-decoding rule anywhere), unknown or malformed `%` sequences (%zz,
-// trailing %, stray %) stay verbatim, and every other key's value (model,
-// valid, run, lat, lon, time_interp) is never touched. Because decode runs
-// BEFORE parse_query, `%2C` splits param tokens EXACTLY like a bare comma and
-// `%3A` feeds parse_level_str exactly like a real colon: encoded and bare
-// requests produce byte-identical responses (pinned by tests/point_http.rs).
+// V1.4 phase A UNIFORM PERCENT-DECODING (supersedes the V1.3 E6 targeted rule
+// documented in docs/DECISIONS.md §19.3, itself a follow-up to §18.6's raw-
+// query observation). AUDIT_1.3 P1: E6 decoded %3A/%2C ONLY inside param/
+// level VALUES, so valid=2026-10-19T15%3A00%3A00Z answered 400 bad_time while
+// bare colons answered 200 — standard clients (python requests and friends)
+// percent-encode ':' in EVERY value and were locked out of the API. Now ONE
+// single-pass percent-decode runs in the PARSE LAYER over EVERY query value
+// before the key/value walk. The contract stays raw-first — the canonical
+// wire form remains BARE colons/commas (curl style) — but any complete
+// escape is now understood, uniformly:
+//   %XY (X,Y ASCII hex, either case) -> that byte (%3A -> ':' , %2c -> ',' ,
+//                                        %20 -> ' ', %E2%82%AC -> U+20AC)
+//   %%               -> literal '%'  (so the wire text "%%3A" decodes ONCE
+//                                      into the literal TEXT "%3A", never ':')
+//   '+'              -> literal '+' ALWAYS. Deliberate (deviation note): the
+//                      form-encoding "+ = space" rule is HTML-form specific,
+//                      RFC 3986 defines no such thing, applying it would make
+//                      a literal '+' unrepresentable without %2B, and it
+//                      would silently mutate values like TM+P that resolve as
+//                      unknown_param today (pinned by point_http.rs /
+//                      client_compat.rs). Clients wanting a space send %20.
+//   any other '%'    -> typed 400 token bad_percent_escape (%zz, trailing %,
+//                      %3z): every '%' MUST open a complete escape. Guessing
+//                      "leave it literal" was the pre-A behavior and pushed
+//                      client encoding bugs behind confusing 404-class answers.
+//   escapes that do not reassemble into valid UTF-8 (a lone %FF) -> same 400.
+// NO DOUBLE DECODING: exactly one left-to-right pass per value; the pass
+// never re-examines its own output, so wire %253A yields the literal text
+// "%3A" (NOT ':'), and the old E6 special-case decoder INSIDE param/level
+// handling is REMOVED (decode_targeted/is_target_escape/has_target deleted) —
+// there is exactly one decode path. Because decoding happens BEFORE
+// parse_query, %2C splits param tokens EXACTLY like a bare comma and %3A
+// feeds parse_level_str / parse_iso_z exactly like real colons: encoded and
+// bare requests produce BYTE-IDENTICAL responses (pinned end-to-end).
+// KEYS stay byte-literal: the vocabulary (model,param,level,lat,lon,valid,
+// run,time_interp) is fixed ASCII and clients never need to encode it.
+// Splitting on '&' and the FIRST '=' happens on RAW bytes, so a wire %26/%3D
+// inside a value cannot fake a separator; the documented consequence is that
+// a DECODED '&' re-enters the separator vocabulary when parse_query walks the
+// REWRITTEN string (model=a%26b -> 400 unknown_query_param "b"), which can
+// only ever reject, never answer wrong: no configured model/param name
+// contains '&'. A decoded '=' always stays inside its value (first-'=' split).
+// THE STRICT ISO VALIDATOR IS NOT LOOSENED (timeparse.rs untouched): decoded
+// valid/run values still must match the exact 20-char YYYY-MM-DDTHH:MM:SSZ
+// form with the calendar table, pinned both ways by client_compat.rs (a
+// %3A-encoded real timestamp answers 200; a decoded Feb-31 still 400 bad_time).
 // HOT-PATH RULE (§5): when the query contains no '%' AT ALL — every curl-
 // style request — the original borrow is returned and NOTHING allocates; an
-// owned rewrite happens only when a targeted escape actually appears inside
-// one of those two values. This lives here rather than as ParsedArgs storage
+// owned rewrite happens only when the query actually carries escapes. The
+// rewrite lives at the httpapi boundary rather than as ParsedArgs storage
 // surgery because Cow-ing the whole borrow chain would ripple through
 // FailInfo/'r lifetimes on the zero-alloc hot path for a cold-path nicety.
 // ---------------------------------------------------------------------------
 
-/// True if a targeted escape starts at byte index `i` (bounds-safe).
-fn is_target_escape(b: &[u8], i: usize) -> bool {
-    if b[i] != b'%' || i + 2 >= b.len() {
-        return false;
+/// ASCII hex digit value, None otherwise.
+fn hex_val(b: u8) -> Option<u8> {
+    if b >= b'0' && b <= b'9' {
+        return Some(b - b'0');
     }
-    let h1 = b[i + 1];
-    let h2 = b[i + 2];
-    return (h1 == b'3' && (h2 == b'A' || h2 == b'a'))
-        || (h1 == b'2' && (h2 == b'C' || h2 == b'c'));
+    if b >= b'a' && b <= b'f' {
+        return Some(b - b'a' + 10);
+    }
+    if b >= b'A' && b <= b'F' {
+        return Some(b - b'A' + 10);
+    }
+    return None;
 }
 
-/// Does a targeted escape occur anywhere in this value?
-fn has_target(val: &str) -> bool {
-    let b = val.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if is_target_escape(b, i) {
-            return true;
-        }
-        i += 1;
-    }
-    return false;
-}
-
-/// Decode ONE value: replace exactly %3A/%3a -> ':' and %2C/%2c -> ',',
-/// copying every other byte verbatim (unknown/malformed %-sequences ride
-/// along untouched). Returns Borrowed when nothing matched.
-fn decode_targeted(val: &str) -> Cow<'_, str> {
-    if !has_target(val) {
-        return Cow::Borrowed(val);
+/// Decode ONE query value in a SINGLE left-to-right pass (rules in the header
+/// block above). Borrowed when the value has no '%'. Err(()) signals a
+/// malformed escape ('%' not doubling itself and not followed by two hex
+/// digits, or escapes that do not reassemble into UTF-8); the caller turns
+/// that into the typed 400 bad_percent_escape.
+fn decode_value_once<'v>(val: &'v str) -> Result<Cow<'v, str>, ()> {
+    if val.find('%').is_none() {
+        return Ok(Cow::Borrowed(val));
     }
     let b = val.as_bytes();
     let mut out: Vec<u8> = Vec::<u8>::with_capacity(val.len());
-    let mut i = 0;
+    let mut i = 0usize;
     while i < b.len() {
-        if is_target_escape(b, i) {
-            let h1 = b[i + 1];
-            out.push(if h1 == b'3' { b':' } else { b',' });
-            i += 3;
-        } else {
-            out.push(b[i]);
+        let c = b[i];
+        if c != b'%' {
+            out.push(c);
             i += 1;
+            continue;
+        }
+        // Every '%' must open a COMPLETE escape: %% or %XY. Anything else is
+        // a client encoding bug -> typed 400, never a silent literal.
+        if i + 1 >= b.len() {
+            return Err(()); // trailing '%'
+        }
+        if b[i + 1] == b'%' {
+            out.push(b'%');
+            i += 2;
+            continue;
+        }
+        if i + 2 >= b.len() {
+            return Err(()); // "%X" at end of value
+        }
+        let h1_r = hex_val(b[i + 1]);
+        let h2_r = hex_val(b[i + 2]);
+        match (h1_r, h2_r) {
+            (Some(h1), Some(h2)) => {
+                out.push(h1 * 16 + h2);
+                i += 3;
+            }
+            _ => { return Err(()); } // %zz / %3z / %2G ...
         }
     }
-    // Input was UTF-8 and we inserted ASCII after deleting exact %XX triples,
-    // so the result is UTF-8; from_utf8 can only fail theoretically.
+    // Escapes may recombine arbitrary bytes; a sequence that is not valid
+    // UTF-8 (a lone %FF splitting the &str contract) gets the same typed 400.
     match String::from_utf8(out) {
-        Ok(s) => { return Cow::Owned(s); }
-        Err(_e) => { return Cow::Borrowed(val); }
+        Ok(s) => { return Ok(Cow::Owned(s)); }
+        Err(_e) => { return Err(()); }
     }
 }
 
-/// Rewrite `level=` and `param=` VALUES with the targeted decode, leaving all
-/// other bytes (keys, separators, other values) identical. Fast path returns
-/// the original borrow whenever no targeted escape sits in either value.
-pub fn normalize_qs<'q>(qs: &'q str) -> Cow<'q, str> {
+/// Rewrite the ENTIRE query string applying the uniform single-pass decode to
+/// EVERY `key=value` VALUE (keys and separators byte-literal; keyless
+/// segments ride along verbatim and still reach parse_query's unknown-key
+/// rejection). Fast path: no '%' anywhere -> the original borrow, ZERO
+/// allocations (hot-path rule §5). Err(ParseFail { BadEscape, detail }) names
+/// the offending VALUE text of the first malformed escape, mirroring how
+/// bad_time/bad_level details echo the offending text.
+pub fn normalize_qs<'q>(qs: &'q str) -> Result<Cow<'q, str>, ParseFail> {
     if qs.find('%').is_none() {
-        return Cow::Borrowed(qs);
+        return Ok(Cow::Borrowed(qs));
     }
-    let mut changed = false;
-    let mut parts: Vec<String> = Vec::<String>::new();
+    let mut out = String::with_capacity(qs.len());
+    let mut first_seg = true;
     for seg in qs.split('&') {
-        let kv = seg.split_once('=');
-        let dv_opt = match kv {
-            None => { None }
-            Some((k, v)) => {
-                if *k == *"param" || *k == *"level" {
-                    if has_target(v) { Some(decode_targeted(v)) } else { None }
-                } else {
-                    None
+        if !first_seg {
+            out.push('&');
+        }
+        first_seg = false;
+        let eq_r = seg.find('=');
+        match eq_r {
+            None => { out.push_str(seg); }
+            Some(eq) => {
+                let key = &seg[0 .. eq];
+                let val = &seg[eq + 1 .. seg.len()];
+                match decode_value_once(val) {
+                    Err(_) => { return Err(ParseFail { tok: ArgTok::BadEscape, detail: val.to_string() }); }
+                    Ok(dv) => {
+                        out.push_str(key);
+                        out.push('=');
+                        out.push_str(dv.as_ref());
+                    }
                 }
             }
-        };
-        match dv_opt {
-            Some(dv) => {
-                changed = true;
-                match kv {
-                    Some((k, _v)) => { parts.push(format!("{0}={1}", k, dv)); }
-                    None => {}
-                }
-            }
-            None => { parts.push(seg.to_string()); }
         }
     }
-    if !changed {
-        return Cow::Borrowed(qs);
-    }
-    return Cow::Owned(parts.join("&"));
+    return Ok(Cow::Owned(out));
 }
 
 /// Inline capacity for parsed parameter tokens AND per-request result entries
@@ -169,6 +213,11 @@ pub enum ArgTok {
     BadTime, // not exactly YYYY-MM-DDTHH:MM:SSZ
     BadTimeInterp, // time_interp neither linear nor none
     EmptyValue, // model/param present but empty
+    /// V1.4 phase A: a '%' inside a query value that opens NO complete escape
+    /// (%zz, trailing %, %3z) or whose escapes do not reassemble into UTF-8 —
+    /// see the uniform-decoder header block. Wire-level defect, reported
+    /// BEFORE any domain lookup, token `bad_percent_escape`.
+    BadEscape,
 }
 
 #[derive(Clone, Debug)]
@@ -188,6 +237,11 @@ pub fn arg_token(t: ArgTok) -> String {
         ArgTok::BadTime => { return "bad_time".to_string(); }
         ArgTok::BadTimeInterp => { return "bad_time_interp".to_string(); }
         ArgTok::EmptyValue => { return "empty_value".to_string(); }
+        // V1.4 phase A token name chosen per the mission ("pick a name,
+        // document it"): bad_percent_escape pairs with the existing bad_*
+        // family and names the DEFECT, not the key, because the defect lives
+        // in the VALUE's escaping (header block above documents the rule).
+        ArgTok::BadEscape => { return "bad_percent_escape".to_string(); }
     }
 }
 
@@ -634,9 +688,90 @@ pub fn lookup_entries<'q: 'r, 'r>(snap: &'r IndexSnapshot, pa: &ParsedArgs<'q>, 
 // ---------------------------------------------------------------------------
 // response rendering (allocation allowed: this IS the response body)
 // ---------------------------------------------------------------------------
+//
+// JSON-SAFE ECHOES (V1.4 phase A, AUDIT_1.3 P2 cluster): EVERY body this
+// server serves is HAND-BUILT with format!/push_str — NO endpoint serializes
+// through serde_json (the dependency exists only for tests/benches), so any
+// external string landing inside a quoted JSON slot must be escaped or one
+// stray quote/backslash/control char corrupts the whole body. Reproduced
+// pre-fix: GET /v1/point?model=a\qb&... answered a 404 whose body was
+// INVALID JSON (the raw backslash became a dangling escape). External-text
+// sources: request query echoes (unknown_model/unknown_param messages and
+// the "model" field of point responses; parse-fail details carry raw value
+// text) and CONFIG-DERIVED strings (model names, param keys, units — units
+// are config-overridable since E2 — surfaced by /v1/models, /v1/inventory
+// and entries). Canonical internal renderings (format_iso_z timestamps,
+// fmt_num numbers, level_dir_name / format_level_str grammar, dir_name
+// YYYYMMDDHH) need no escaping and json_escape_cow returns them BORROWED
+// (zero cost). Escape at these choke points once:
+//   * render_error_json      -> token AND message (covers every error path,
+//                               incl. arg-parse details and the /ready list)
+//   * render_point_json      -> "model" echo
+//   * render_entry           -> per-result "param" + "units"
+//   * httpapi models_handler -> model name, param key, units
+//   * httpapi inventory      -> model name, param key, units (dir_name +
+//                               stat_kind defensive, see comments there)
 
+/// Append `s` to `out` with JSON STRING-BODY escaping (RFC 8259 §7): '"' and
+/// '\' get backslash escapes; C0 control chars become \b \t \n \f \r or a
+/// generic \u00XX; everything else (including multi-byte UTF-8) rides along
+/// byte-for-byte. Does NOT emit the surrounding quotes — callers keep their
+/// literal \" bytes. (&mut String target rather than &mut impl Write: every
+/// echo site already builds into a String, keeping the escaper monomorphic
+/// and infallible.)
+pub fn json_escape_into(out: &mut String, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '"' => { out.push_str("\\\""); }
+            '\\' => { out.push_str("\\\\"); }
+            '\n' => { out.push_str("\\n"); }
+            '\r' => { out.push_str("\\r"); }
+            '\t' => { out.push_str("\\t"); }
+            '\u{8}' => { out.push_str("\\b"); }
+            '\u{c}' => { out.push_str("\\f"); }
+            _ => {
+                if (ch as u32) < 0x20 {
+                    out.push_str(&format!("\\u00{0:02x}", ch as u32));
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+}
+
+/// Cow convenience OVER [`json_escape_into`] (still ONE escaper): Borrowed
+/// when nothing needs escaping — every canonical name today — owned escaped
+/// text otherwise, so format! sites stay readable.
+pub fn json_escape_cow<'a>(s: &'a str) -> Cow<'a, str> {
+    let mut need = false;
+    for ch in s.chars() {
+        let u = ch as u32;
+        if u < 0x20 || u == 0x22 || u == 0x5C {
+            need = true;
+            break;
+        }
+    }
+    if !need {
+        return Cow::Borrowed(s);
+    }
+    let mut t = String::with_capacity(s.len() + 8);
+    json_escape_into(&mut t, s);
+    return Cow::Owned(t);
+}
+
+/// The single error-body choke point (`{"error":T,"message":M}` per spec §7).
+/// V1.4 phase A: token AND message are escaped HERE, so every caller's echo
+/// of request/config text (model names, param keys, raw parse-fail values,
+/// /ready's missing-model list) is JSON-safe without touching call sites.
 pub fn render_error_json(token: String, message: String) -> String {
-    return format!("{{\"error\":\"{0}\",\"message\":\"{1}\"}}", token, message);
+    let mut out = String::with_capacity(24 + token.len() + message.len());
+    out.push_str("{\"error\":\"");
+    json_escape_into(&mut out, &token);
+    out.push_str("\",\"message\":\"");
+    json_escape_into(&mut out, &message);
+    out.push_str("\"}");
+    return out;
 }
 
 /// Entry-shaped result object for one parameter.
@@ -648,8 +783,13 @@ fn render_entry(e: QueryEntry) -> String {
     // single top-level echo was silently wrong for the other params.
     use crate::timeparse::format_iso_z;
     let run_s = format_iso_z(e.run_epoch);
+    // V1.4 phase A JSON-safe echoes: "param" here is REQUEST TEXT and units
+    // are config-overridable since E2 (raw-triple params carry their config
+    // `units` string verbatim).
+    let p_e = json_escape_cow(e.param);
+    let u_e = json_escape_cow(e.units);
     if e.masked {
-        return format!("{{\"param\":\"{0}\",\"value\":null,\"reason\":\"missing_data\",\"units\":\"{1}\",\"interpolation\":null,\"run\":\"{2}\"}}", e.param, e.units, run_s);
+        return format!("{{\"param\":\"{0}\",\"value\":null,\"reason\":\"missing_data\",\"units\":\"{1}\",\"interpolation\":null,\"run\":\"{2}\"}}", p_e, u_e, run_s);
     }
     let info = e.info;
     let interp: String = match info {
@@ -703,7 +843,7 @@ fn render_entry(e: QueryEntry) -> String {
             obj
         }
     };
-    return format!("{{\"param\":\"{0}\",\"value\":{1},\"units\":\"{2}\",\"interpolation\":{3},\"run\":\"{4}\"}}", e.param, e.value, e.units, interp, run_s);
+    return format!("{{\"param\":\"{0}\",\"value\":{1},\"units\":\"{2}\",\"interpolation\":{3},\"run\":\"{4}\"}}", p_e, e.value, u_e, interp, run_s);
 }
 
 /// Top-level /v1/point success body, spec §7 example shape (values in native
@@ -735,8 +875,12 @@ pub fn render_point_json(model: &str, valid_epoch: i64, lat: f64, lon: f64, code
         }
     };
     let valid_s = format_iso_z(valid_epoch);
-    let lvl_s = format_level_str(code, val);
-    let mut out = format!("{{\"model\":\"{0}\",\"run\":{1},\"valid\":\"{2}\",\"lat\":{3},\"lon\":{4},\"level\":\"{5}\",\"results\":[", model, run_tok, valid_s, lat, lon, lvl_s);
+    let lvl_s = format_level_str(code, val); // canonical grammar: needs no escaping
+    // V1.4 phase A: "model" here is REQUEST TEXT (echoed verbatim per spec
+    // §7), escaped like every other external string. lat/lon/run/valid/level
+    // are numbers or canonical renderings — safe untouched.
+    let m_e = json_escape_cow(model);
+    let mut out = format!("{{\"model\":\"{0}\",\"run\":{1},\"valid\":\"{2}\",\"lat\":{3},\"lon\":{4},\"level\":\"{5}\",\"results\":[", m_e, run_tok, valid_s, lat, lon, lvl_s);
     for k in 0 .. eb.n {
         if k > 0 {
             out = format!("{0}{1}", out, ",");

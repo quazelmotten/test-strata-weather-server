@@ -28,6 +28,19 @@
 //! |    | exit; set `[ingest].wind_pair_enforce = false` to opt out |
 //! | 8  | the HTTP server itself returned an error |
 //!
+//! V1.4 phase A GRACEFUL SHUTDOWN changes NONE of the rows above. SIGTERM and
+//! SIGINT are now HANDLED (previously their default disposition killed the
+//! process mid-response): accept stops, in-flight connections drain, serve
+//! returns Ok and the process exits 0 — exactly the "(or stopped cleanly)"
+//! half of row 0. Startup codes were RE-READ at this commit and stay wired as
+//! documented: usage 2 (resolve_cfg_path empty), config 1 (load_config Err),
+//! preflight 4 (startup_wind_preflight Err, BEFORE Pipeline::open's
+//! destructive recovery), pipeline init 3 (Pipeline::open Err), runtime 5
+//! (Runtime::new Err), bind 6 (TcpListener::bind Err), provisional wind 7
+//! (exit(7) from the ingest thread), serve Err 8. Tests:
+//! `tests/shutdown_drain.rs` pins SIGTERM/SIGINT -> exit 0 + the drain log
+//! line; `tests/exit_codes.rs` keeps pinning the startup classes unchanged.
+//!
 //! Distinct codes are deliberate (the task allowed "at least 1"): an operator can
 //! fix a bad config without reading logs, and `scripts/smoke.sh` style harnesses
 //! can gate on it. `crates/wx-server/tests/exit_codes.rs` SPAWNS the built binary
@@ -158,6 +171,57 @@ fn realtime_epoch_ns() -> i64 {
     return ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
+// ---------------------------------------------------------------------------
+// V1.4 phase A GRACEFUL SHUTDOWN (SIGTERM + SIGINT, unix cfg'd): axum 0.7.9's
+// Serve::with_graceful_shutdown stops accepting NEW connections when the
+// signal future resolves, lets IN-FLIGHT requests finish, then serve()
+// returns Ok. Pre-A a bare serve() meant SIGTERM's DEFAULT DISPOSITION
+// killed the process mid-response (cut bodies, lost accepts). tokio feature
+// set is "full" so the signal module needs no new dependency.
+// ---------------------------------------------------------------------------
+
+/// Await SIGTERM (unix only). If handler registration fails (rare fd/
+/// nonblocking issues) this NEVER resolves: SIGINT still drains via the
+/// select, and an escalated SIGTERM then takes the default hard-kill — loud
+/// note so logs explain the difference.
+#[cfg(unix)]
+async fn wait_sigterm() {
+    let rx_r = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    match rx_r {
+        Ok(mut rx) => {
+            rx.recv().await;
+        }
+        Err(_e) => {
+            println!("warn: could not register the SIGTERM handler; SIGINT still drains, an escalated SIGTERM will hard-kill");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_sigterm() {
+    // no SIGTERM concept here; ctrl_c below covers the interactive case
+    std::future::pending::<()>().await;
+}
+
+/// Resolves on the FIRST of SIGINT (via tokio's ctrl_c listener) or SIGTERM,
+/// printing the single drain log line operators see in journald between
+/// "listening on ..." and "server stopped".
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    let sig_name: &str = "SIGTERM";
+    #[cfg(not(unix))]
+    let sig_name: &str = "shutdown signal";
+    tokio::select! {
+        _cc = tokio::signal::ctrl_c() => {
+            println!("SIGINT received; draining in-flight connections (no new connections accepted)");
+            return;
+        }
+        _t = wait_sigterm() => {}
+    }
+    println!("{0} received; draining in-flight connections (no new connections accepted)", sig_name);
+}
+
 #[allow(clippy::needless_borrow)]
 fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) -> i64 {
     let pr = Pipeline::open(&cfg_path);
@@ -273,7 +337,11 @@ fn start_pipeline(cfg_path: &str, bind_str: &str, interval_secs: u32) -> i64 {
             }
             Ok(listener) => {
                 println!("listening on {0}", bind_str);
-                let srv = serve(listener, app);
+                // V1.4 phase A: SIGTERM/SIGINT drives with_graceful_shutdown
+                // (header note above documents why this cannot change any
+                // startup exit code: every other code path precedes or
+                // bypasses the accept loop). Drained stop => rc 0.
+                let srv = serve(listener, app).with_graceful_shutdown(shutdown_signal());
                 let res = srv.await;
                 match res {
                     Err(e) => { println!("server error: {0}", e); srv_rc = 8; }

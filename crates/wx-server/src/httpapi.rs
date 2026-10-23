@@ -19,7 +19,7 @@ use wx_core::tables::{fmt_num};
 use wx_core::storage::{stat_kind_name};
 use wx_core::grid::{GridDef};
 use crate::stats::{mono_ns, QueryStats};
-use crate::queryapi::{parse_query, normalize_qs, lookup_entries, new_entries, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, ParsedArgs, FailTok};
+use crate::queryapi::{parse_query, normalize_qs, lookup_entries, new_entries, render_error_json, render_point_json, fail_http_status, fail_token, arg_token, json_escape_cow, ParsedArgs, FailTok};
 use crate::timeparse::{format_iso_z};
 
 // ---------------------------------------------------------------------------
@@ -72,27 +72,37 @@ pub async fn point_handler(st: State<ServerState>, req: Request) -> Response {
             return json_error(400, "missing_required".to_string(), "no query parameters".to_string());
         }
         Some(qs) => {
-            // V1.3 phase E6: targeted %-decode of `%3A`/`%2C` inside ONLY the
-            // level/param values before parsing (queryapi header documents the
-            // full rule; canonical colon-form requests take the zero-copy
-            // Borrowed path and pay nothing but one cheap scan). nq MUST
+            // V1.4 phase A: UNIFORM single-pass percent-decode over EVERY
+            // query value (queryapi header documents the full rule: complete
+            // %XY escapes, %% -> literal '%', '+' literal, malformed escape
+            // or non-UTF-8 result -> typed 400 bad_percent_escape). Canonical
+            // colon-form requests carry no '%' and take the zero-copy
+            // Borrowed path, paying nothing but one cheap scan. nq MUST
             // outlive pa — both live to the end of this arm, and the response
             // body is fully built here, so the borrows are sound.
-            let nq = normalize_qs(qs);
-            let pa_r = parse_query(nq.as_ref());
-            match pa_r {
+            let nq_r = normalize_qs(qs);
+            match nq_r {
                 Err(pf) => {
                     st.stats.record_status(400);
                     return json_error(400, arg_token(pf.tok), format!("bad query parameter: {0}", pf.detail));
                 }
-                Ok(pa) => {
-                    let snap = st.index.get_index();
-                    let pair = answer_all(snap, &pa);
-                    st.stats.record_status(pair.0);
-                    let t1 = mono_ns();
-                    let us = (((t1 - t0) + 500) / 1000) as u64;
-                    st.stats.record_latency(us);
-                    return make_response(pair.0, "application/json".to_string(), pair.1);
+                Ok(nq) => {
+                    let pa_r = parse_query(nq.as_ref());
+                    match pa_r {
+                        Err(pf) => {
+                            st.stats.record_status(400);
+                            return json_error(400, arg_token(pf.tok), format!("bad query parameter: {0}", pf.detail));
+                        }
+                        Ok(pa) => {
+                            let snap = st.index.get_index();
+                            let pair = answer_all(snap, &pa);
+                            st.stats.record_status(pair.0);
+                            let t1 = mono_ns();
+                            let us = (((t1 - t0) + 500) / 1000) as u64;
+                            st.stats.record_latency(us);
+                            return make_response(pair.0, "application/json".to_string(), pair.1);
+                        }
+                    }
                 }
             }
         }
@@ -171,7 +181,11 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
             out = format!("{0}{1}", out, ",");
         }
         let m = &cfg[k];
-        out = format!("{0}{{\"name\":\"{1}\"", out, m.name);
+        // V1.4 phase A JSON-safe echoes: model name / param key / units all
+        // come from CONFIG (arbitrary strings; units even user-overridable
+        // since E2). Level specs re-render from parsed codes (canonical
+        // grammar) — that wrapper is defensive only and stays Borrowed.
+        out = format!("{0}{{\"name\":\"{1}\"", out, json_escape_cow(&m.name));
         // grid info from the newest indexed run of this model, else null.
         let gm = sref.find_model(&m.name);
         match gm {
@@ -192,12 +206,12 @@ pub async fn models_handler(st: State<ServerState>, _req: Request) -> Response {
                 out = format!("{0}{1}", out, ",");
             }
             let rp = &m.params[pk];
-            out = format!("{0}{{\"name\":\"{1}\",\"units\":\"{2}\",\"levels\":[", out, rp.key, rp.units);
+            out = format!("{0}{{\"name\":\"{1}\",\"units\":\"{2}\",\"levels\":[", out, json_escape_cow(&rp.key), json_escape_cow(&rp.units));
             for lk in 0 .. rp.level_specs.len() {
                 if lk > 0 {
                     out = format!("{0}{1}", out, ",");
                 }
-                out = format!("{0}\"{1}\"", out, render_level_spec(rp.level_specs[lk].0, rp.level_specs[lk].1));
+                out = format!("{0}\"{1}\"", out, json_escape_cow(render_level_spec(rp.level_specs[lk].0, rp.level_specs[lk].1).as_str()));
             }
             out = format!("{0}{1}", out, "]}");
         }
@@ -280,12 +294,28 @@ pub async fn inventory_handler(st: State<ServerState>, req: Request) -> Response
     match qs_opt {
         None => {}
         Some(qs) => {
-            let mv = qs_value(qs, "model");
-            match mv {
-                None => {}
-                Some(v) => {
-                    if !v.is_empty() {
-                        want_model = v;
+            // V1.4 phase A: SAME uniform single-pass percent-decode as
+            // /v1/point (exactly one decode path across endpoints). Pre-A the
+            // raw value was matched byte-literal, so model=gfs%zz silently
+            // answered 404-unknown_model over a client encoding bug; now it
+            // is the typed 400 bad_percent_escape like everywhere else. The
+            // keyless-garbage tolerance below (unknown keys ignored here) is
+            // pre-existing behavior for this non-point endpoint, unchanged.
+            let nq_r = normalize_qs(qs);
+            match nq_r {
+                Err(pf) => {
+                    st.stats.record_status(400);
+                    return json_error(400, arg_token(pf.tok), format!("bad query parameter: {0}", pf.detail));
+                }
+                Ok(nq) => {
+                    let mv = qs_value(nq.as_ref(), "model");
+                    match mv {
+                        None => {}
+                        Some(v) => {
+                            if !v.is_empty() {
+                                want_model = v;
+                            }
+                        }
                     }
                 }
             }
@@ -316,21 +346,27 @@ pub async fn inventory_handler(st: State<ServerState>, req: Request) -> Response
             out = format!("{0}{1}", out, ",");
         }
         first_model = false;
-        out = format!("{0}{{\"model\":\"{1}\",\"runs\":[", out, mm.name);
+        // V1.4 phase A JSON-safe echoes: mm.name is CONFIG text, param_key +
+        // units are CONFIG/GRIB-derived, and dir_name + stat_kind are today
+        // canonical renderings (YYYYMMDDHH / stat_kind_name; stat_kind can
+        // also arrive via manifest.json on warm starts = external file) — the
+        // wrappers keep every one of them quoted-string-safe at zero cost
+        // when nothing needs escaping (Borrowed fast path).
+        out = format!("{0}{{\"model\":\"{1}\",\"runs\":[", out, json_escape_cow(&mm.name));
         for ri in 0 .. mm.runs.len() {
             if ri > 0 {
                 out = format!("{0}{1}", out, ",");
             }
             let rr = &mm.runs[ri];
             let run_s = format_iso_z(rr.epoch_secs);
-            out = format!("{0}{{\"run\":\"{1}\",\"dir\":\"{2}\",\"fields\":[", out, run_s, rr.dir_name);
+            out = format!("{0}{{\"run\":\"{1}\",\"dir\":\"{2}\",\"fields\":[", out, run_s, json_escape_cow(&rr.dir_name));
             for fi in 0 .. rr.fields.len() {
                 if fi > 0 {
                     out = format!("{0}{1}", out, ",");
                 }
                 let fe = &rr.fields[fi];
                 let lvl_dir = level_dir_name(fe.level_code);
-                out = format!("{0}{{\"param\":\"{1}\",\"level_type\":\"{2}\",\"units\":\"{3}\",\"stat_processed\":{4},\"stat_kind\":\"{5}\"", out, fe.param_key, lvl_dir, fe.fd.units, fe.fd.stat_processed, fe.fd.stat_kind);
+                out = format!("{0}{{\"param\":\"{1}\",\"level_type\":\"{2}\",\"units\":\"{3}\",\"stat_processed\":{4},\"stat_kind\":\"{5}\"", out, json_escape_cow(&fe.param_key), json_escape_cow(lvl_dir.as_str()), json_escape_cow(&fe.fd.units), fe.fd.stat_processed, json_escape_cow(&fe.fd.stat_kind));
                 out = format!("{0},\"forecast_hours\":[", out);
                 for kh in 0 .. fe.fd.fhs.len() {
                     if kh > 0 {
