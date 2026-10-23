@@ -198,7 +198,13 @@ impl GridRegular {
         let wraps = self.lon_wrap();
 
         // signed shortest delta from lon1 in cells (positive = east of lon1)
-        let delta = ((lon - self.lon1 + 180.0) % 360.0) - 180.0;
+        // V1.4 phase R: rem_euclid, NOT %. Rust % keeps the dividend's sign,
+        // so for lon < lon1 - 180 (query east of the antimeridian on a
+        // NON-wrapping grid whose longitudes cross it) the old form returned
+        // ~-350 deg instead of ~+10 deg and rejected real stored columns
+        // (found by phase T; see seam_small_http.rs). Identical results
+        // everywhere else, incl. all global lon1=0 grids.
+        let delta = (lon - self.lon1 + 180.0).rem_euclid(360.0) - 180.0;
         let mut di = delta / self.dlon;
         if (self.scan_mode & 0x80) != 0 {
             di = -di; // i decreases eastward: columns run westward from lon1
@@ -460,7 +466,13 @@ impl GridGaussian {
         let wraps = self.lon_wrap();
 
         // signed shortest delta from lon1 in cells (positive = east of lon1)
-        let delta = ((lon - self.lon1 + 180.0) % 360.0) - 180.0;
+        // V1.4 phase R: rem_euclid, NOT %. Rust % keeps the dividend's sign,
+        // so for lon < lon1 - 180 (query east of the antimeridian on a
+        // NON-wrapping grid whose longitudes cross it) the old form returned
+        // ~-350 deg instead of ~+10 deg and rejected real stored columns
+        // (found by phase T; see seam_small_http.rs). Identical results
+        // everywhere else, incl. all global lon1=0 grids.
+        let delta = (lon - self.lon1 + 180.0).rem_euclid(360.0) - 180.0;
         let mut di = delta / self.dlon;
         if (self.scan_mode & 0x80) != 0 {
             di = -di; // i decreases eastward: columns run westward from lon1
