@@ -22,8 +22,10 @@
 
 use arc_swap::ArcSwap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use wx_core::grid::GridDef;
-use wx_core::storage::{MmapField, STAT_INSTANTANEOUS};
+use wx_core::storage::{BinHeader, MmapField, STAT_INSTANTANEOUS};
 use wx_core::interp::{
     EXACT_NODE_EPS, TIME_MATCH_EPS, LevelInterpMethod, TimeInterpMode, HorizMethod,
     InterpInfo, PointError, PointValue, QueryResult, VertMeta, TimeMeta,
@@ -551,6 +553,212 @@ pub fn evaluate_point<'s>(ctx: &PointQueryContext<'s>, lat: f64, lon: f64) -> Qu
 }
 
 // ---------------------------------------------------------------------------
+// index-build cross-validation (V1.4 phase C, risk register #9)
+// ---------------------------------------------------------------------------
+//
+// A derived-store field header and a run's `grid.bin` are written together but
+// rot INDEPENDENTLY, and nothing used to compare them. `MmapField::value()`
+// derives every plane offset from the HEADER's `nx`/`ny`, while `evaluate_point`
+// walks that memory with the GRID's extent and scanning mode: when the two
+// disagree, the kernel reads real bytes from the WRONG position and answers a
+// plausible number. That is the silent-wrong-answer class this section closes.
+//
+// Placement rules (the reason this lives here and nowhere else):
+//   * BUILD TIME ONLY. Every predicate below runs once per field per published
+//     snapshot, on the ingest thread. The query hot path stays exactly as it
+//     was — no extra load, no allocation, no branch (`tests/hotpath_alloc.rs`
+//     and `crates/wx-core/tests/alloc_free_kernels.rs` pin that).
+//   * SKIP THE FIELD, KEEP THE RUN. A mismatch degrades one `.bin` (or one run
+//     whose grid cannot back anything), never the whole model: partial service
+//     beats a wrong answer and beats an outage.
+//   * LOUD. Each rejection emits a note through `tracing` AND advances a
+//     process-wide counter read by [`index_build_counters`], mirroring how
+//     `wx-core::storage` counts its own durability actions.
+//
+// ACTIVATION CAVEAT (documented deliberately, because it is outside this
+// crate's ownership): `Pipeline::publish` currently swaps its `ArcSwap`
+// DIRECTLY (`pipeline.rs`: `self.shared.store.swap(Arc::new(snap))`) instead of
+// calling [`SharedIndex::publish`]. Everything below is wired into
+// `SharedIndex::publish` so any publisher gets the validation, and the tests in
+// `crates/wx-ingest/tests/geometry_xval_ingest.rs` drive it through that entry
+// point; adopting the one-line change in `Pipeline::publish` (swap via
+// `self.shared.publish(build_snapshot(&self.registry))`) activates it for the
+// cold/warm ingest path too. Until then the CRC + exact-length + structural
+// checks inside `wx_core::storage::open_field` carry the warm-boot guarantee.
+
+/// Process-wide cross-validation counters (relaxed atomics: build-time only,
+/// same policy as the storage durability counters).
+#[derive(Clone, Debug)]
+pub struct IndexBuildCounters {
+    pub checks: u64,        // field headers compared against their grid
+    pub geom_rejects: u64,  // FIELDS skipped for geometry disagreement
+    pub grid_rejects: u64,  // RUNS skipped for an unusable grid definition
+}
+
+static XVAL_CHECKS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static XVAL_GEOM_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+static XVAL_GRID_REJECT_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn index_build_counters() -> IndexBuildCounters {
+    return IndexBuildCounters {
+        checks: XVAL_CHECKS_TOTAL.load(Ordering::Relaxed),
+        geom_rejects: XVAL_GEOM_REJECT_TOTAL.load(Ordering::Relaxed),
+        grid_rejects: XVAL_GRID_REJECT_TOTAL.load(Ordering::Relaxed),
+    };
+}
+
+/// Zero the cross-validation counters (test helper; production never calls it).
+pub fn index_build_counters_reset() {
+    XVAL_CHECKS_TOTAL.store(0, Ordering::Relaxed);
+    XVAL_GEOM_REJECT_TOTAL.store(0, Ordering::Relaxed);
+    XVAL_GRID_REJECT_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Why this field file must NOT be indexed against `gd`, or None when its
+/// geometry agrees with the run's grid definition. Delegates to the single
+/// wx-core predicate so the store reader and the index can never drift.
+pub fn field_geometry_reason(gd: &GridDef, hdr: &BinHeader) -> Option<&'static str> {
+    let _c = XVAL_CHECKS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    return wx_core::storage::header_geometry_reason(hdr, gd);
+}
+
+/// Why a run's GRID cannot back any query at all, or None when it can. A
+/// corrupt/hostile `grid.bin` reaches this after `store::decode_grid` rejected
+/// the outright-degenerate Lambert cases (V1.4 phase C typed error), so what is
+/// left here is defense-in-depth for grids built by OTHER paths (a cold decode
+/// of a hostile template-3.30 message yields a POISONED projection without ever
+/// going through grid.bin) plus the zero-extent and non-finite-parameters cases
+/// on the regular and gaussian variants, whose constructors are infallible.
+pub fn grid_usability_reason(gd: &GridDef) -> Option<&'static str> {
+    match gd {
+        GridDef::Regular(g) => {
+            if g.nx == 0 || g.ny == 0 {
+                return Some("regular grid extent is zero");
+            }
+            if !(g.lon1.is_finite() && g.lat1.is_finite()
+                 && g.dlon.is_finite() && g.dlat.is_finite()
+                 && g.dlon > 0.0 && g.dlat > 0.0) {
+                return Some("regular grid cell size / corner is not finite-positive");
+            }
+            return None;
+        }
+        GridDef::Lambert(g) => {
+            if g.nx == 0 || g.ny == 0 {
+                return Some("lambert grid extent is zero");
+            }
+            if !g.anchors_ok() {
+                return Some("lambert projection has no finite anchor (degenerate or poisoned grid.bin)");
+            }
+            return None;
+        }
+        GridDef::Gaussian(g) => {
+            if g.nx == 0 || g.ny == 0 {
+                return Some("gaussian grid extent is zero");
+            }
+            if !(g.lon1.is_finite() && g.dlon.is_finite() && g.dlon > 0.0) {
+                return Some("gaussian grid cell size / corner is not finite-positive");
+            }
+            if g.row_lats().len() != g.ny as usize {
+                return Some("gaussian row table does not cover ny rows");
+            }
+            return None;
+        }
+    }
+}
+
+/// Cross-validate one assembled snapshot and REMOVE everything that cannot be
+/// trusted, returning the (possibly cheaper) snapshot to publish plus one note
+/// per removal. The CLEAN case — every operational store, every round — returns
+/// the SAME `Arc` it was given and allocates nothing: the scan is read-only and
+/// the notes vector stays empty, so wiring this into the publish path costs one
+/// pass over already-resident index metadata per published file.
+///
+/// Removal rules:
+///   * grid unusable  -> the WHOLE RUN goes (its every field would answer from
+///     a meaningless projection); counted in `grid_rejects`.
+///   * header vs grid -> that FORECAST-HOUR SLOT goes, others in the same
+///     `(param, level type)` survive; an entry left with no slots is dropped
+///     too. Counted in `geom_rejects`.
+pub fn prune_geometry_mismatches(snap: Arc<IndexSnapshot>) -> (Arc<IndexSnapshot>, Vec<String>) {
+    // ---- pass 1: detect, without touching memory -----------------------------
+    let mut notes: Vec<String> = Vec::<String>::new();
+    for m in &snap.models {
+        for r in &m.runs {
+            match grid_usability_reason(&r.grid) {
+                Some(why) => {
+                    notes.push(format!("GEOMETRY CROSS-VALIDATION: run '{0}'/{1} has an unusable grid definition ({2}) — the WHOLE RUN is withheld from queries",
+                        m.name, r.dir_name, why));
+                }
+                None => {
+                    for fe in &r.fields {
+                        for fhv in &fe.fd.fhs {
+                            let why = field_geometry_reason(&r.grid, &fhv.field.header);
+                            if let Some(cause) = why {
+                                notes.push(format!("GEOMETRY CROSS-VALIDATION: field '{0}'/{1} f{2}s of run '{3}'/{4} disagrees with the run's grid definition ({5}) — this forecast hour is NOT indexed; the rest of the run keeps serving",
+                                    fe.param_key, level_dir_short(fe.level_code),
+                                    fhv.fh_secs, m.name, r.dir_name, cause));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if notes.is_empty() {
+        return (snap, notes);
+    }
+
+    // ---- pass 2: rebuild WITHOUT the rejected pieces (cold path only) --------
+    let mut out = IndexSnapshot { models: Vec::<IdxModel>::new() };
+    for m in &snap.models {
+        let mut keep_runs: Vec<IdxRun> = Vec::<IdxRun>::new();
+        for r in &m.runs {
+            if grid_usability_reason(&r.grid).is_some() {
+                let _g = XVAL_GRID_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            let mut keep_fields: Vec<IdxFieldEntry> = Vec::<IdxFieldEntry>::new();
+            for fe in &r.fields {
+                let mut keep_fhs: Vec<IdxFh> = Vec::<IdxFh>::new();
+                for fhv in &fe.fd.fhs {
+                    // Re-decide with the RAW predicate (no counter): the
+                    // `checks` total means exactly "comparisons made", one per
+                    // field per published snapshot, which pass 1 already did.
+                    if wx_core::storage::header_geometry_reason(&fhv.field.header, &r.grid).is_none() {
+                        keep_fhs.push(fhv.clone());
+                    } else {
+                        let _f = XVAL_GEOM_REJECT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                if !keep_fhs.is_empty() {
+                    let mut fd = fe.fd.clone();
+                    fd.fhs = keep_fhs;
+                    let mut entry = fe.clone();
+                    entry.fd = fd;
+                    keep_fields.push(entry);
+                }
+            }
+            let mut nr = r.clone();
+            nr.fields = keep_fields;
+            keep_runs.push(nr);
+        }
+        let mut nm = m.clone();
+        nm.runs = keep_runs;
+        out.models.push(nm);
+    }
+    return (Arc::new(out), notes);
+}
+
+/// Level-type name for a note (a bare CT 4.5 code is unreadable to an
+/// operator). Notes are cold-path strings, so the copy is free of consequence.
+fn level_dir_short(code: u8) -> String {
+    match wx_core::tables::canonical_level_name(code) {
+        None => { return format!("level{0}", code); }
+        Some(name) => { return name.to_string(); }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // publication wrapper
 // ---------------------------------------------------------------------------
 
@@ -568,8 +776,18 @@ impl SharedIndex {
         return self.store.load_full();
     }
 
-    /// Atomically publish a new snapshot.
+    /// Atomically publish a new snapshot, FIRST cross-validating it against the
+    /// runs' grid definitions (V1.4 phase C): a field whose header strides
+    /// disagree with the grid, or a run whose grid cannot back any query, is
+    /// dropped here rather than served wrong. A clean snapshot — every normal
+    /// round — is swapped through UNTOUCHED (same `Arc`, zero allocation, zero
+    /// cloning); only a rejection pays for the rebuild. See the cross-validation
+    /// section above for the placement rules and the activation caveat.
     pub fn publish(self: &Self, snap: Arc<IndexSnapshot>) {
-        self.store.swap(snap);
+        let pair = prune_geometry_mismatches(snap);
+        for k in 0 .. pair.1.len() {
+            tracing::error!("{0}", pair.1[k]);
+        }
+        self.store.swap(pair.0);
     }
 }

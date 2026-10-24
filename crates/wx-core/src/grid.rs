@@ -541,16 +541,43 @@ impl GridGaussian {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Construction errors (V1.4 phase C)
+// ---------------------------------------------------------------------------
+
+/// Why [`GridLambert::try_prepare`] cannot produce a usable projection.
+///
+/// Before V1.4 phase C the ONLY input-dependent `unwrap()` in this crate sat in
+/// `prepare()`, on the projected position of the stored point (0,0): a grid
+/// whose La1 sits on a cone pole made `for_point` return None, and the unwrap
+/// ABORTED the process — under the release profile's `panic = "abort"`
+/// (spec §8) one corrupt `grid.bin` byte took the whole daemon down instead of
+/// costing one run. That was the single remaining place where file-derived
+/// bytes could decide to panic (AUDIT_1.1 risk register #9), and hostile or
+/// bit-rotted parameters reach the same class of failure by other routes: a
+/// NaN/inf latitude poisons every constant, and `dx_m == 0` makes `inv_dx`
+/// infinite. `try_prepare` therefore reports the degeneracy as a value AND
+/// sweeps every precomputed constant for finiteness rather than trusting it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GridError {
+    /// The stored point (Lo1, La1) has no projected position: La1 is at (or
+    /// numerically indistinguishable from, per `for_point`'s 1e-10 radian band)
+    /// a cone pole, so there is no x0/y0 anchor and every fractional grid
+    /// coordinate derived from it would be meaningless.
+    DegenerateAnchor,
+    /// At least one precomputed projection constant came out NaN or infinite
+    /// (non-finite template-3.30 angles or distances, `dx_m`/`dy_m` of zero,
+    /// or standard parallels sitting on a singularity of the cone constant).
+    NonFiniteConstants,
+}
+
 impl GridLambert {
-    /// Build from raw GRIB fields and precompute all projection constants
-    /// once (spec §4.3). `scan_mode` bit 0x40 set means stored rows advance
-    /// toward the north pole; clear (the GFS/HRRR-fixture convention,
-    /// verified empirically against `wgrib2 -ll2ij`) means rows advance
-    /// southward from La1, i.e. La1 is the northern edge.
-    pub fn new(nx: u32, ny: u32, la1: f64, lo1: f64, lov: f64, lad: f64,
-               latin1: f64, latin2: f64, dx_m: f64, dy_m: f64, proj_flag: u8,
-               scan_mode: u8, earth_shape: u8, winds_grid: bool) -> Self {
-        let mut g = Self {
+    /// Field scaffold shared by [`GridLambert::new`] and [`GridLambert::try_new`]:
+    /// raw template-3.30 bytes in, all precomputed constants still zeroed.
+    fn unprepared(nx: u32, ny: u32, la1: f64, lo1: f64, lov: f64, lad: f64,
+                  latin1: f64, latin2: f64, dx_m: f64, dy_m: f64, proj_flag: u8,
+                  scan_mode: u8, earth_shape: u8, winds_grid: bool) -> Self {
+        return Self {
             nx: nx, ny: ny, la1: la1, lo1: lo1, lov: lov, lad: lad,
             latin1: latin1, latin2: latin2, dx_m: dx_m, dy_m: dy_m,
             proj_flag: proj_flag, scan_mode: scan_mode, earth_shape: earth_shape,
@@ -560,8 +587,54 @@ impl GridLambert {
             j_south: false,
             ua_major_m: 0.0, ua_minor_m: 0.0, inline_axes: false,
         };
+    }
+
+    /// Build from raw GRIB fields and precompute all projection constants
+    /// once (spec §4.3). `scan_mode` bit 0x40 set means stored rows advance
+    /// toward the north pole; clear (the GFS/HRRR-fixture convention,
+    /// verified empirically against `wgrib2 -ll2ij`) means rows advance
+    /// southward from La1, i.e. La1 is the northern edge.
+    ///
+    /// NEVER panics (V1.4 phase C): a degenerate projection leaves the grid
+    /// POISONED (see [`GridLambert::anchors_ok`]) instead of unwrapping, and
+    /// every query against it is rejected as out-of-domain. Callers that must
+    /// tell WHY should use [`GridLambert::try_new`].
+    pub fn new(nx: u32, ny: u32, la1: f64, lo1: f64, lov: f64, lad: f64,
+               latin1: f64, latin2: f64, dx_m: f64, dy_m: f64, proj_flag: u8,
+               scan_mode: u8, earth_shape: u8, winds_grid: bool) -> Self {
+        let mut g = Self::unprepared(nx, ny, la1, lo1, lov, lad, latin1, latin2,
+                                     dx_m, dy_m, proj_flag, scan_mode,
+                                     earth_shape, winds_grid);
         g.prepare();
-        g
+        return g;
+    }
+
+    /// Fallible twin of [`GridLambert::new`]: Ok only when the projection
+    /// anchored AND every precomputed constant is finite. `wx-ingest`'s
+    /// grid.bin decoder uses this so a corrupt/hostile grid is REJECTED with a
+    /// reason (the pipeline's loud run-level recovery) rather than silently
+    /// answering wrong values — or, before this change, aborting the process.
+    pub fn try_new(nx: u32, ny: u32, la1: f64, lo1: f64, lov: f64, lad: f64,
+                   latin1: f64, latin2: f64, dx_m: f64, dy_m: f64, proj_flag: u8,
+                   scan_mode: u8, earth_shape: u8, winds_grid: bool)
+        -> Result<Self, GridError> {
+        let mut g = Self::unprepared(nx, ny, la1, lo1, lov, lad, latin1, latin2,
+                                     dx_m, dy_m, proj_flag, scan_mode,
+                                     earth_shape, winds_grid);
+        return g.try_prepare().map(|_u| g);
+    }
+
+    /// TRUE when every precomputed projection constant is finite, i.e. the grid
+    /// can answer queries at all. A poisoned grid (`prepare()` mapped a
+    /// [`GridError`], or `set_user_axes` was handed nonsense) reads false for
+    /// its whole lifetime; `project` rejects every point on it and the index
+    /// build drops the run loudly instead of indexing it.
+    pub fn anchors_ok(self: &Self) -> bool {
+        return self.es.is_finite() && self.e.is_finite()
+               && self.ns.is_finite() && self.f0.is_finite()
+               && self.rh.is_finite() && self.x0.is_finite()
+               && self.y0.is_finite() && self.lov_rad.is_finite()
+               && self.inv_dx.is_finite() && self.inv_dy.is_finite();
     }
 
     /// Attach the inline user-defined earth axes (meters) declared by Code
@@ -578,7 +651,44 @@ impl GridLambert {
         self.prepare();
     }
 
+    /// Compute every projection constant, mapping any degeneracy onto POISONED
+    /// values instead of panicking (V1.4 phase C). `new()` calls this so the
+    /// infallible constructor can never abort the process on hostile grid.bin
+    /// bytes; use [`GridLambert::try_prepare`] / [`GridLambert::try_new`] when
+    /// the failure has to be REPORTED (the grid.bin decoder does).
     pub fn prepare(self: &mut Self) {
+        match self.try_prepare() {
+            Ok(()) => { return; }
+            Err(_e) => { self.poison(); }
+        }
+    }
+
+    /// Overwrite every DERIVED constant with NaN (raw template bytes and the
+    /// scan flag stay as given, so the grid still describes itself honestly and
+    /// the cross-validation at index-build time sees the real extent). With
+    /// NaN anchors and NaN cell sizes, `project` computes NaN fractional
+    /// coordinates, and its NaN-rejecting domain test answers out-of-domain for
+    /// EVERY point: a poisoned grid can never return a number, wrong or right.
+    fn poison(self: &mut Self) {
+        let n = f64::NAN;
+        self.es = n;
+        self.e = n;
+        self.ns = n;
+        self.f0 = n;
+        self.rh = n;
+        self.x0 = n;
+        self.y0 = n;
+        self.inv_dx = n;
+        self.inv_dy = n;
+    }
+
+    /// The precomputation itself (spec §4.3: "precompute projection constants
+    /// once per grid"), reporting the two ways it can fail. Finiteness is
+    /// checked for EVERY constant, not just the anchor: `dx_m == 0` (infinite
+    /// `inv_dx`) and non-finite latitudes poison the grid without touching the
+    /// anchor, and a grid that silently projects to NaN answers plausible-but-
+    /// wrong values forever.
+    pub fn try_prepare(self: &mut Self) -> Result<(), GridError> {
         let (maj, min) = if self.inline_axes && self.ua_major_m > 0.0 {
             (self.ua_major_m, self.ua_minor_m)
         } else {
@@ -586,6 +696,10 @@ impl GridLambert {
         };
         self.r_major = maj;
         self.r_minor = min;
+        // Scan direction is raw template data, NOT projection output: record it
+        // FIRST so a poisoned grid still reports its true row order (the
+        // index-build cross-check compares it against every field header).
+        self.j_south = (self.scan_mode & 0x40) == 0;
         self.es = 1.0 - (self.r_minor / self.r_major).powf(2.0);
         self.e = self.es.sqrt();
         self.lov_rad = self.lov * D2R;
@@ -608,13 +722,24 @@ impl GridLambert {
         let ts0 = tsfnz(self.e, lad_rad, lad_rad.sin());
         self.rh = self.r_major * self.f0 * ts0.powf(self.ns);
 
-        // projected position of stored point (0,0) == (lo1, la1)
-        let (x, y) = self.for_point(norm_lon(self.lo1) * D2R, self.la1 * D2R).unwrap();
-        self.x0 = x;
-        self.y0 = y;
+        // projected position of stored point (0,0) == (lo1, la1). THE audited
+        // site: this used to `.unwrap()`, i.e. a La1 on the pole (or a NaN that
+        // lands inside `for_point`'s pole band by way of comparisons below)
+        // panicked. V1.4 phase C returns the typed error instead.
+        let pair = self.for_point(norm_lon(self.lo1) * D2R, self.la1 * D2R);
+        match pair {
+            None => { return Err(GridError::DegenerateAnchor); }
+            Some((x, y)) => {
+                self.x0 = x;
+                self.y0 = y;
+            }
+        }
         self.inv_dx = 1.0 / self.dx_m;
         self.inv_dy = 1.0 / self.dy_m;
-        self.j_south = (self.scan_mode & 0x40) == 0;
+        if !self.anchors_ok() {
+            return Err(GridError::NonFiniteConstants);
+        }
+        return Ok(());
     }
 
     /// Snyder/gctpc Lambert Conformal Conic forward transform (mirrors
@@ -645,10 +770,17 @@ impl GridLambert {
         let di = (x - self.x0) * self.inv_dx;
         let dj_north = (y - self.y0) * self.inv_dy;
         let dj = if self.j_south { -dj_north } else { dj_north };
-        if di < -PROJ_NODE_EPS || di > (self.nx as f64) - 1.0 + PROJ_NODE_EPS {
+        // NaN-REJECTING domain test (V1.4 phase C): the identical two bounds
+        // written ACCEPT-side. For every finite value this is bit-for-bit the
+        // old reject-side form (pure De Morgan); what changes is that NaN and
+        // infinities — which a POISONED grid produces for every point — now
+        // fall outside the domain instead of sailing through both comparisons
+        // (NaN `<` and `>` are both false) and getting clamped onto node (0,0).
+        // Zero extra comparisons, so the query hot path costs nothing.
+        if !(di >= -PROJ_NODE_EPS && di <= (self.nx as f64) - 1.0 + PROJ_NODE_EPS) {
             return None;
         }
-        if dj < -PROJ_NODE_EPS || dj > (self.ny as f64) - 1.0 + PROJ_NODE_EPS {
+        if !(dj >= -PROJ_NODE_EPS && dj <= (self.ny as f64) - 1.0 + PROJ_NODE_EPS) {
             return None;
         }
         Some((

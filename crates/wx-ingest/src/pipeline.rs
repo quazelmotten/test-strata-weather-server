@@ -2229,9 +2229,12 @@ impl Pipeline {
     }
 
     /// Publish the current registry as a new immutable snapshot atomically.
+    /// V1.4 phase C2: routes through SharedIndex::publish so the ingest path
+    /// gets the same geometry cross-validation as warm boot (clean rounds
+    /// swap the SAME Arc through -- zero cost on the operational path).
     pub fn publish(self: &Self) {
         let snap = build_snapshot(&self.registry);
-        self.shared.store.swap(Arc::new(snap));
+        self.shared.publish(Arc::new(snap));
     }
 
     /// V1.2 phase C — RETENTION-AWARE SKIP DECISION (spec §4.6 efficiency, gated

@@ -63,7 +63,13 @@
 //!                 the run time (0 for instantaneous fields)
 //! 36      8     stat_end_secs i64 LE, window END relative to the run time
 //! 44      8     stat_step_secs i64 LE, CT 4.11 step length in seconds
-//! 52      4     reserved (must be 0)
+//! 52      4     header_crc u32 LE — V1.4 phase C: the V1.3 E0 "reserved (must
+//!                 be 0)" slot became a CRC-32 integrity word over the header
+//!                 bytes AROUND it (offsets 0..52 plus the level coordinates),
+//!                 computed by the writer and verified by `open_field`. See
+//!                 "Header integrity" below for the exact region, the legacy
+//!                 zero sentinel that keeps warm boots with pre-CRC stores
+//!                 compatible, and why the polynomial is IEEE CRC-32.
 //! 56      4*n   level coords, f32 LE, in CANONICAL ORDER:
 //!                 - isobaric levels descending by pressure (1000, 925, ... hPa)
 //!                 - every other level type ascending (height_above_ground,
@@ -71,6 +77,53 @@
 //! data    4*nx*ny per level, f32 LE, slab li at byte 56+4n + li*nx*ny*4,
 //!         row-major [j][i] in STORED scan order (j follows the scan flag)
 //! ```
+//!
+//! ## Header integrity + structural validation (V1.4 phase C)
+//!
+//! The field header carries the strides the query hot path trusts blindly, so
+//! post-ingest bit rot in it is a SILENT WRONG ANSWER (risk register #9):
+//! `MmapField::value` computes every plane offset from `nx`/`ny`/level count,
+//! and the vertical kernels interpolate on the stored level coordinates. Three
+//! layers now guard that surface, ALL of them at the once-per-file open
+//! (`open_field`), never on the query hot path:
+//!
+//! 1. **CRC-32 over the header** (bytes `[0, 52)` concatenated with the level
+//!    coordinates `[56, 56 + 4*n)`; the four bytes AT 52 hold the digest itself
+//!    and are excluded from their own region). Computed by [`encode_header`]
+//!    when the file is written, verified by [`decode_header`] when it is
+//!    opened; a mismatch makes `open_field` report `"header crc mismatch"`,
+//!    which the pipeline already turns into a loud per-field skip
+//!    (note + ingest-error counter, rest of the run keeps serving).
+//!    The polynomial is the reflected IEEE CRC-32 (the same one zlib and GRIB2
+//!    section 7 use — `wx-ingest::codecs` verifies message bodies with
+//!    `zlib_rs::crc32`), implemented here as a const-computed table so
+//!    `wx-core` gains NO new crate edge (spec §10 keeps this crate lean);
+//!    [`crates/wx-ingest/tests/header_crc_parity.rs`] pins it against
+//!    `zlib_rs::crc32::crc32` bit-for-bit.
+//! 2. **Structural sanity**: `nx >= 1`, `ny >= 1`, at least one level, and
+//!    level coordinates that are finite, duplicate-free and strictly monotonic
+//!    (either direction — canonical order is descending for isobaric,
+//!    ascending for everything else).
+//! 3. **Exact file length** via overflow-safe arithmetic
+//!    ([`expected_size_checked`]). Pre-phase C the check was only `len < want`,
+//!    so a header whose geometry claimed LESS data than the file held passed
+//!    silently, and absurd `nx`/`ny` could wrap the size computation to a small
+//!    number and then panic inside the mmap slice indexing of `value()`.
+//!
+//! ### Warm-boot compatibility (why a missing CRC is ACCEPTED)
+//!
+//! Stores written before this phase have ZERO in the CRC slot, because that is
+//! what the V1.3 E0 writer left there. Zero therefore means "no CRC present",
+//! not "checksum of zero": such a header is VALID and gets indexed, and the
+//! module counter [`crc_counters_snapshot`] records how many legacy headers
+//! were seen so operators can see how much of the store is still unprotected.
+//! A genuine digest of exactly 0 is stored as 1 (see [`crc_slot_value`]), which
+//! keeps the sentinel unambiguous. `BIN_VERSION` deliberately stays 2: the
+//! pipeline's field-file pre-check keys off `bin_version_of_path != BIN_VERSION`
+//! and DELETES any foreign-version run dir, so bumping the version would have
+//! turned a harmless warm boot into a full re-decode of every model. Legacy
+//! files keep working and gain protection the next time their forecast hour
+//! rewrites them.
 //!
 //! ### Version history
 //!
@@ -86,6 +139,12 @@
 //!   loud STORAGE-FORMAT RECOVERY the grid.bin upgrade trap uses (delete the run
 //!   dir, forget the model's ingest records, re-decode from source), so an old
 //!   store can NEVER answer from lost metadata. See docs/DECISIONS.md V1.3-E0.
+//! * **v2 + header CRC** (V1.4 phase C, SAME version number 2): the trailing
+//!   reserved u32 at offset 52 became the integrity word described above.
+//!   Deliberately NOT a version bump — see the compatibility section. Readers
+//!   accept both shapes (zero slot = legacy, unsealed); writers always emit the
+//!   sealed one, so every forecast hour rewritten after the upgrade gains
+//!   protection without any re-ingest.
 //!
 //! ## mmap lifetime (spec §5)
 //!
@@ -101,6 +160,7 @@ use memmap2::Mmap;
 use std::io::Write;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use crate::grid::GridDef;
 
 /// Magic bytes of every .bin file ("WXPTBIN1").
 pub const BIN_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x42, 0x49, 0x4E, 0x31];
@@ -116,6 +176,168 @@ pub const BIN_FIXED_HEADER: usize = 56;
 
 /// One stored level coordinate (f32 LE bytes).
 pub const BIN_LEVEL_BYTES: usize = 4;
+
+// ---------------------------------------------------------------------------
+// header integrity: CRC-32 over the header bytes (V1.4 phase C)
+// ---------------------------------------------------------------------------
+
+/// Byte offset of the header integrity word inside the fixed header. This is
+/// the slot the V1.3 E0 layout defined as "reserved (must be 0)"; nothing else
+/// about the layout moved, which is what makes the compatibility story below
+/// possible at all.
+pub const BIN_CRC_OFFSET: usize = 52;
+
+/// Stored value meaning "this header predates header integrity" (a pre-CRC
+/// writer left zeros here). A real digest is never stored as 0 — see
+/// [`crc_slot_value`].
+pub const BIN_CRC_ABSENT: u32 = 0;
+
+/// Reflected IEEE 802.3 polynomial (the CRC-32 zlib, PKZIP and GRIB2 section 7
+/// use — NOT Castagnoli's CRC-32C, which is what "CRC32c" usually denotes but
+/// which no dependency here provides). Handled as a const-computed table so
+/// `wx-core` gains no new crate edge (spec §10 keeps this crate lean);
+/// `crates/wx-ingest/tests/header_crc_parity.rs` pins this implementation
+/// bit-for-bit against `zlib_rs::crc32::crc32`, which `wx-ingest::codecs`
+/// already trusts for message-body checksums.
+const CRC32_POLY_REV: u32 = 0xEDB8_8320;
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table: [u32; 256] = [0; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut k = 0usize;
+        while k < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ CRC32_POLY_REV;
+            } else {
+                crc = crc >> 1;
+            }
+            k += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    return table;
+}
+
+static CRC32_TABLE: [u32; 256] = crc32_table();
+
+/// Raw state-continuing fold step (state is the INTERNAL register: pass
+/// `!prev_external` in, xor the result to get the next external value). Kept
+/// public because the header region is DISCONTINUOUS (it skips the four
+/// integrity bytes at 52), which a one-shot helper cannot express.
+pub fn crc32_fold(state: u32, bytes: &[u8]) -> u32 {
+    let mut crc = state;
+    let mut k = 0usize;
+    while k < bytes.len() {
+        let idx = ((crc ^ (bytes[k] as u32)) & 0xFF) as usize;
+        crc = CRC32_TABLE[idx] ^ (crc >> 8);
+        k += 1;
+    }
+    return crc;
+}
+
+/// Standard one-shot reflected CRC-32 (init/final inversion as in zlib):
+/// bit-identical to Python's `zlib.crc32(data)` and to `zlib_rs::crc32::crc32(0, data)`.
+pub fn crc32_ieee(bytes: &[u8]) -> u32 {
+    return crc32_fold(0xFFFF_FFFF, bytes) ^ 0xFFFF_FFFF;
+}
+
+/// Integrity digest of a complete serialized header (exactly
+/// `BIN_FIXED_HEADER + nlevels * BIN_LEVEL_BYTES` bytes, i.e. what
+/// [`encode_header`] returns). The covered region is the fixed header EXCLUDING
+/// the four integrity bytes plus the level coordinates: `[0, 52) ++ [56, end)`.
+/// Both halves are folded continuously, so the digest covers them exactly as if
+/// the slot did not exist.
+pub fn header_crc(head: &[u8]) -> u32 {
+    // TOTAL on short input (a header shorter than the fixed block cannot be
+    // sealed; callers gate on the truncation check first): clamp both slice
+    // bounds so a degenerate length can never panic inside the range index.
+    let mid = BIN_CRC_OFFSET.min(head.len());
+    let inner = crc32_fold(0xFFFF_FFFF, &head[0 .. mid]);
+    let start = BIN_FIXED_HEADER.min(head.len());
+    let inner = crc32_fold(inner, &head[start .. head.len()]);
+    return inner ^ 0xFFFF_FFFF;
+}
+
+/// The value that goes INTO the integrity slot for a given raw digest. Zero is
+/// reserved as the "no CRC present" sentinel, so a genuine digest of exactly
+/// zero is stored as 1 instead (one-in-4-billion, resolved deterministically
+/// rather than by hoping).
+pub fn crc_slot_value(raw: u32) -> u32 {
+    if raw == BIN_CRC_ABSENT {
+        return 1;
+    }
+    return raw;
+}
+
+// Counters for the integrity states seen at open time (relaxed atomics, same
+// policy as the durability counters below: OUTSIDE the query hot path, read as
+// deltas by tests and eventually by /metrics).
+static CRC_VERIFIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static CRC_LEGACY_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+pub struct CrcCounters {
+    pub verified: u64,
+    pub legacy: u64,
+}
+
+/// How many headers were CRC-verified vs. accepted as pre-CRC legacy. A warm
+/// boot of an old store reports `legacy > 0, verified == 0`; after a few ingest
+/// rounds `verified` should dominate. This is the "valid-with-WARNING" half of
+/// the compatibility contract.
+pub fn crc_counters_snapshot() -> CrcCounters {
+    return CrcCounters {
+        verified: CRC_VERIFIED_TOTAL.load(Ordering::Relaxed),
+        legacy: CRC_LEGACY_TOTAL.load(Ordering::Relaxed),
+    };
+}
+
+/// Zero the integrity counters (test helper; production never calls it).
+pub fn crc_counters_reset() {
+    CRC_VERIFIED_TOTAL.store(0, Ordering::Relaxed);
+    CRC_LEGACY_TOTAL.store(0, Ordering::Relaxed);
+}
+
+/// Record one legacy (unsealed) header accepted at open — also called by
+/// `wx-ingest`'s grid.bin reader, which shares this counter so a single metric
+/// shows how much of the whole store still lacks protection.
+pub fn count_crc_legacy() {
+    let _c = CRC_LEGACY_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record one header whose digest was checked and matched.
+pub fn count_crc_verified() {
+    let _c = CRC_VERIFIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// field-header vs grid-definition cross-validation (V1.4 phase C)
+// ---------------------------------------------------------------------------
+
+/// Compare a field header's GEOMETRY against the run's grid definition and
+/// name the first disagreement, or None when they agree. This is the check the
+/// format could never make on its own: `value()` computes every plane offset
+/// from `nx`/`ny`, while the bilinear kernel walks the SAME memory using the
+/// GRID's extent, so a header whose strides disagree with the grid silently
+/// reads the wrong rows (a swapped `720x600` vs `600x720` pair even preserves
+/// the file length, defeating the length check). Build-time only — the index
+/// calls it once per field (`wx-ingest::index::field_geometry_reason`), never
+/// the query hot path.
+pub fn header_geometry_reason(hdr: &BinHeader, gd: &GridDef) -> Option<&'static str> {
+    if hdr.nx != gd.nx() {
+        return Some("header nx disagrees with grid definition");
+    }
+    if hdr.ny != gd.ny() {
+        return Some("header ny disagrees with grid definition");
+    }
+    if hdr.scan_ns != gd.scan_ns() {
+        return Some("header scan flag disagrees with grid scanning mode");
+    }
+    return None;
+}
 
 // ---------------------------------------------------------------------------
 // statistical-process metadata (V1.3 phase E0)
@@ -220,6 +442,24 @@ pub enum HeaderError {
     /// stat_kind / stat_processed byte out of range, or a reserved byte that
     /// is not zero (V1.3 E0).
     BadStat,
+    /// V1.4 phase C: the stored integrity word disagrees with the digest of the
+    /// header bytes around it — post-ingest bit rot, a torn rewrite, or a file
+    /// whose header came from a DIFFERENT field. The four slot bytes themselves
+    /// are excluded from the region, so this fires for corruption anywhere else
+    /// in the header (including the level coordinates and the stat window).
+    BadCrc,
+    /// V1.4 phase C: `nx` or `ny` is zero. Every plane offset in `value()` is a
+    /// product of them, so a zero extent means the header cannot describe any
+    /// real data set (`plane_bytes` would slice an empty-to-nothing range and
+    /// the query path would read whatever follows).
+    BadGeometry,
+    /// V1.4 phase C: the level coordinate block is unusable — no levels at all,
+    /// a non-finite value, or a list that is not strictly monotonic (canonical
+    /// order is DESCENDING for isobaric levels and ASCENDING for every other
+    /// level type; duplicates are impossible because the merge dedups on the
+    /// f32 key). The vertical kernel brackets on this list, so a scrambled or
+    /// NaN entry interpolates between the wrong pressures.
+    BadLevels,
 }
 
 // ---------------------------------------------------------------------------
@@ -297,13 +537,23 @@ pub fn encode_header(hdr: &BinHeader) -> Vec<u8> {
     push_le_i64(&mut out, hdr.stat.begin_secs);
     push_le_i64(&mut out, hdr.stat.end_secs);
     push_le_i64(&mut out, hdr.stat.step_secs);
-    out.push(0); // reserved u32 (validated ZERO on read)
+    out.push(0); // integrity slot (V1.4 phase C): sealed once the levels exist
     out.push(0);
     out.push(0);
     out.push(0);
     for k in 0 .. hdr.levels.len() {
         push_le_f32(&mut out, hdr.levels[k]);
     }
+    // Seal the header (V1.4 phase C). The digest covers the fixed header EXCEPT
+    // its own four bytes plus the level coordinates, so it can only be computed
+    // after the level block has been appended. Writers always seal; the only way
+    // to meet an unsealed (all-zero-slot) header here is a file written before
+    // phase C, which decode_header accepts with a legacy counter bump.
+    let seal = crc_slot_value(header_crc(&out));
+    out[BIN_CRC_OFFSET] = (seal & 0xFF) as u8;
+    out[BIN_CRC_OFFSET + 1] = ((seal >> 8) & 0xFF) as u8;
+    out[BIN_CRC_OFFSET + 2] = ((seal >> 16) & 0xFF) as u8;
+    out[BIN_CRC_OFFSET + 3] = ((seal >> 24) & 0xFF) as u8;
     return out;
 }
 
@@ -340,16 +590,60 @@ pub fn decode_header(b: &[u8]) -> Result<BinHeader, HeaderError> {
     if b[25] != 0 || b[26] != 0 || b[27] != 0 {
         return Err(HeaderError::BadStat);
     }
-    if b[52] != 0 || b[53] != 0 || b[54] != 0 || b[55] != 0 {
-        return Err(HeaderError::BadStat);
-    }
+    // V1.4 phase C: bytes 52..56 used to be validated as "reserved, must be
+    // zero"; they are the integrity word now. A non-zero slot is VERIFIED below
+    // (after the structural checks, so a rot that already has a precise name —
+    // bad version, bad flags, bad stat byte — keeps reporting THAT), and a
+    // zero slot means "written before header integrity existed" and is accepted
+    // while being counted, per the compatibility contract in the module docs.
     if b.len() < BIN_FIXED_HEADER + nlevels * BIN_LEVEL_BYTES {
         return Err(HeaderError::Truncated);
+    }
+    // Extent sanity: `value()` derives every plane offset from these products.
+    if le_u32(b, 12) == 0 || le_u32(b, 16) == 0 {
+        return Err(HeaderError::BadGeometry);
+    }
+    if nlevels == 0 {
+        return Err(HeaderError::BadLevels);
     }
     let mut levels: Vec<f32> = Vec::<f32>::new();
     for k in 0 .. nlevels {
         let off = BIN_FIXED_HEADER + k * BIN_LEVEL_BYTES;
         levels.push(bits_to_f32(le_u32(b, off)));
+    }
+    // Level-block sanity (see HeaderError::BadLevels). Cheap: one pass over at
+    // most 65535 floats, at open time only.
+    let mut k = 0usize;
+    let mut dir: i8 = 0; // +1 ascending, -1 descending, 0 not yet decided
+    while k < levels.len() {
+        if !levels[k].is_finite() {
+            return Err(HeaderError::BadLevels);
+        }
+        if k > 0 {
+            let prev = levels[k - 1] as f64;
+            let cur = levels[k] as f64;
+            if cur == prev {
+                return Err(HeaderError::BadLevels); // duplicate level coordinate
+            }
+            let want: i8 = if cur > prev { 1 } else { -1 };
+            if dir == 0 {
+                dir = want;
+            } else if dir != want {
+                return Err(HeaderError::BadLevels); // not strictly monotonic
+            }
+        }
+        k += 1;
+    }
+    let head_end = BIN_FIXED_HEADER + nlevels * BIN_LEVEL_BYTES;
+    let stored = le_u32(b, BIN_CRC_OFFSET);
+    if stored == BIN_CRC_ABSENT {
+        count_crc_legacy();
+    } else {
+        let want = crc_slot_value(header_crc(&b[0 .. head_end]));
+        if stored != want {
+            return Err(HeaderError::BadCrc);
+        }
+        count_crc_verified();
     }
     Ok(BinHeader {
         nx: le_u32(b, 12),
@@ -367,10 +661,29 @@ pub fn decode_header(b: &[u8]) -> Result<BinHeader, HeaderError> {
     })
 }
 
-/// Expected total file size for a header.
+/// Expected total file size for a header, OVERFLOW-SAFE (V1.4 phase C): None
+/// when the declared geometry cannot even be sized (`nx * ny * nlevels * 4`
+/// does not fit in `usize`). A corrupt header used to be able to wrap this
+/// product around, which made the length check pass for a header claiming a
+/// huge extent and then panic inside `value()`'s mmap slice indexing — under
+/// `panic = "abort"` that is a daemon killed by eight bad bytes.
+pub fn expected_size_checked(hdr: &BinHeader) -> Option<usize> {
+    let per_plane = (hdr.nx as usize).checked_mul(hdr.ny as usize)?;
+    let nl = hdr.levels.len();
+    let levels_bytes = nl.checked_mul(BIN_LEVEL_BYTES)?;
+    let data = per_plane.checked_mul(nl)?.checked_mul(4)?;
+    let head = BIN_FIXED_HEADER.checked_add(levels_bytes)?;
+    return head.checked_add(data);
+}
+
+/// Expected total file size for a header. Kept for API compatibility with the
+/// store/metrics callers; absurd geometry saturates to `usize::MAX` instead of
+/// wrapping (validation uses [`expected_size_checked`]).
 pub fn expected_size(hdr: &BinHeader) -> usize {
-    BIN_FIXED_HEADER + hdr.levels.len() * BIN_LEVEL_BYTES
-        + hdr.levels.len() * (hdr.nx as usize) * (hdr.ny as usize) * 4
+    match expected_size_checked(hdr) {
+        None => { return usize::MAX; }
+        Some(v) => { return v; }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -743,6 +1056,14 @@ pub struct MmapField {
 /// `pipeline::ingest_run_dir` to run the storage-format recovery (delete the
 /// run dir, forget the model's records, re-decode from source) instead of
 /// indexing a store whose statistical metadata this build cannot read.
+///
+/// Every OTHER structural failure string (`"bad header"`, `"header crc mismatch"`,
+/// `"bad header geometry"`, `"bad header level coords"`, `"header geometry out of
+/// range"`, `"truncated data"`, `"field length disagrees with header"`) means the
+/// pipeline SKIPS THAT FIELD LOUDLY — note plus one ingest-error counter, rest of
+/// the run keeps serving — which is exactly the handling V1.4 phase C wants for
+/// post-ingest corruption: a field whose header cannot be believed must never be
+/// indexed, because answering from it is a silent wrong value, not an error.
 pub fn open_field(path: String) -> Result<MmapField, &'static str> {
     let f = std::fs::File::open(path);
     match f {
@@ -755,11 +1076,37 @@ pub fn open_field(path: String) -> Result<MmapField, &'static str> {
                     let hdr_res = decode_header(&region);
                     match hdr_res {
                         Err(HeaderError::BadVersion) => { return Err("bad bin version"); }
+                        // V1.4 phase C: DISTINCT strings for the integrity and
+                        // sanity outcomes so an operator's note names the CLASS of
+                        // corruption. The pipeline's handling is the same for every
+                        // one of them: loud skip of this field ONLY (note + error
+                        // counter), never a silent wrong answer.
+                        Err(HeaderError::BadCrc) => { return Err("header crc mismatch"); }
+                        Err(HeaderError::BadGeometry) => { return Err("bad header geometry"); }
+                        Err(HeaderError::BadLevels) => { return Err("bad header level coords"); }
                         Err(_) => { return Err("bad header"); }
                         Ok(hdr) => {
-                            let want = expected_size(&hdr);
-                            if region.len() < want {
-                                return Err("truncated data");
+                            // V1.4 phase C validation, all at THIS once-per-file
+                            // open (never the query hot path):
+                            //   * overflow-safe sizing, so an absurd nx/ny pair
+                            //     is rejected instead of wrapping the length
+                            //     computation and panicking inside `value()`;
+                            //   * EXACT length agreement, closing the pre-phase-C
+                            //     hole where a header claiming LESS data than the
+                            //     file held passed silently (the header's own
+                            //     level count + strides must account for every
+                            //     byte that was written).
+                            let want_r = expected_size_checked(&hdr);
+                            match want_r {
+                                None => { return Err("header geometry out of range"); }
+                                Some(want) => {
+                                    if region.len() < want {
+                                        return Err("truncated data");
+                                    }
+                                    if region.len() > want {
+                                        return Err("field length disagrees with header");
+                                    }
+                                }
                             }
                             let doff = BIN_FIXED_HEADER + hdr.levels.len() * BIN_LEVEL_BYTES;
                             return Ok(MmapField {

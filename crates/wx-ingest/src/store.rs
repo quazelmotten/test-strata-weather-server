@@ -23,15 +23,33 @@
 //!           recomputed bit-identically from ny at read time — hence not
 //!           stored; la1/la2 ride along for reporting/validation only.)
 //! ```
+//!
+//! OPTIONAL INTEGRITY TRAILER (V1.4 phase C): exactly 4 more bytes, a little-
+//! endian CRC-32 (IEEE/zlib polynomial, `wx_core::storage::crc32_ieee`) over ALL
+//! preceding bytes. Presence is decided by LENGTH, which needs no version bump
+//! and is bidirectionally compatible: a reader built before the trailer sees a
+//! longer-than-minimum blob it has always accepted (the guards below are `<`
+//! checks), and this reader accepts the exact-length pre-trailer blob as
+//! legacy-valid and counts it (`wx_core::storage::count_crc_legacy`). A blob of
+//! exactly base+4 whose digest disagrees cannot be trusted: decode_grid reports
+//! the failure, and the pipeline's existing grid recovery deletes the run dir
+//! and re-decodes from source instead of projecting onto garbage.
+//!
 //! Precomputed projection constants are NOT stored: the reader rebuilds them
-//! via GridLambert::new (+ set_user_axes when inline_axes is set), keeping one
-//! source of truth for both the projection and the wind-rotation angle.
+//! via GridLambert::try_new (+ set_user_axes when inline_axes is set), keeping
+//! one source of truth for both the projection and the wind-rotation angle.
+//! Since V1.4 phase C that construction is FALLIBLE and its error is reported:
+//! a template-3.30 blob with La1 on a cone pole used to hit the crate's only
+//! input-dependent `unwrap()` and, under `panic = "abort"`, take the whole
+//! daemon down at warm boot. Now the run is skipped LOUDLY like any other
+//! undecodable grid.
 
-use wx_core::grid::{GridDef, GridRegular, GridLambert, GridGaussian};
+use wx_core::grid::{GridDef, GridRegular, GridLambert, GridGaussian, GridError};
 use wx_core::tables::valid_civil_date;
 use wx_core::storage::{write_bin_atomic_stream, open_field, BinHeader, StatMeta, fsync_path,
                        PlaneSource, count_rename, count_bytes_written, le_u32, bits_to_f32,
-                       unique_tmp_path, TouchedDirs};
+                       unique_tmp_path, TouchedDirs, crc32_ieee, count_crc_verified,
+                       count_crc_legacy};
 use std::io::Write;
 
 pub const GRID_MAGIC: [u8; 8] = [0x57, 0x58, 0x50, 0x54, 0x47, 0x52, 0x49, 0x44]; // WXPTGRID1
@@ -131,7 +149,49 @@ pub fn encode_grid(grid: &GridDef) -> Vec<u8> {
             out.push(if g.winds_grid { 1 } else { 0 });
         }
     }
+    // Integrity trailer (V1.4 phase C): CRC-32 over everything above. Unlike
+    // the FIELD header there is no zero-sentinel problem here — presence is
+    // decided by the file length — so the raw digest goes in as-is.
+    let digest = crc32_ieee(&out);
+    push_le_u32(&mut out, digest);
     return out;
+}
+
+/// Size of the grid.bin integrity trailer (V1.4 phase C).
+pub const GRID_CRC_BYTES: usize = 4;
+
+// Exact serialized payload length per grid kind WITHOUT the trailer; the
+// truncation guards below and the trailer detection share these numbers so a
+// layout change cannot silently move the digest.
+const GRID_BASE_REGULAR: usize = 12 + 1 + 8 + 32 + 2;
+const GRID_BASE_LAMBERT: usize = 12 + 1 + 8 + 64 + 4 + 16 + 1;
+const GRID_BASE_GAUSSIAN: usize = 12 + 1 + 8 + 32 + 3;
+
+/// Validate the OPTIONAL grid.bin trailer against a blob whose payload occupies
+/// exactly `base` bytes. Three shapes, all defined:
+///   * `len == base`     : pre-trailer (legacy) grid.bin — accepted, counted.
+///   * `len == base + 4` : sealed — the digest MUST match or the blob is
+///     refused (the caller's existing grid-recovery path then re-decodes that
+///     run from source, which is the whole point: a wrong projection silently
+///     shifts every value on the globe).
+///   * `len > base + 4`  : more bytes than a trailer. The reader has ALWAYS
+///     tolerated trailing bytes (the guards are `<` checks), so it still does,
+///     unverified, rather than turning an unrelated writer quirk into an
+///     outage; a shortening rewrite can never produce this shape.
+fn check_grid_trailer(b: &[u8], base: usize) -> Result<(), String> {
+    if b.len() == base {
+        count_crc_legacy();
+        return Ok(());
+    }
+    if b.len() == base + GRID_CRC_BYTES {
+        let want = le_u32_at(b, base);
+        if crc32_ieee(&b[0 .. base]) != want {
+            return Err("grid.bin integrity word disagrees with its bytes (header crc mismatch)".to_string());
+        }
+        count_crc_verified();
+        return Ok(());
+    }
+    return Ok(());
 }
 
 pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
@@ -149,8 +209,12 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
     let kind = b[12];
     match kind {
         0 => {
-            if b.len() < 12 + 1 + 8 + 32 + 2 {
+            if b.len() < GRID_BASE_REGULAR {
                 return Err("truncated regular grid".to_string());
+            }
+            match check_grid_trailer(b, GRID_BASE_REGULAR) {
+                Err(e) => { return Err(e); }
+                Ok(_) => {}
             }
             let nx = le_u32_at(b, 13);
             let ny = le_u32_at(b, 17);
@@ -178,8 +242,12 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
             // said 72 for the f64 block (9 slots); encode_grid writes 8 (la1,
             // lo1,lov,lad,latin1,latin2,dx,dy) -> warm-boot rebuild silently
             // dropped every LCC run.
-            if b.len() < 12 + 1 + 8 + 64 + 4 + 16 + 1 {
+            if b.len() < GRID_BASE_LAMBERT {
                 return Err("truncated lambert grid".to_string());
+            }
+            match check_grid_trailer(b, GRID_BASE_LAMBERT) {
+                Err(e) => { return Err(e); }
+                Ok(_) => {}
             }
             let nx = le_u32_at(b, 13);
             let ny = le_u32_at(b, 17);
@@ -198,18 +266,51 @@ pub fn decode_grid(b: &[u8]) -> Result<GridDef, String> {
             let ua_major = le_f64_at(b, 89);
             let ua_minor = le_f64_at(b, 97);
             let inline_axes = b[105];
-            let g = GridLambert::new(nx, ny, la1, lo1, lov, lad, latin1, latin2,
-                                     dx_m, dy_m, proj_flag, scan, earth_shape, winds != 0);
-            let mut gg = g;
+            // V1.4 phase C TYPED REJECTION. A template-3.30 blob whose La1 lies
+            // on a cone pole (or whose angles/distances are non-finite, or whose
+            // dx/dy are zero) has NO usable projection. Pre-phase-C this hit
+            // grid.rs's only input-dependent `unwrap()`, and under the release
+            // profile's `panic = "abort"` (spec §8) ONE rotten grid.bin byte
+            // killed the whole daemon at warm boot. Now decode_grid reports the
+            // reason as a value and the pipeline runs its EXISTING loud grid
+            // recovery (note + error counter + delete the run dir + forget the
+            // model's records so the next round re-decodes from source): one run
+            // is skipped, every other run keeps answering, nothing aborts.
+            let built = GridLambert::try_new(nx, ny, la1, lo1, lov, lad, latin1,
+                                             latin2, dx_m, dy_m, proj_flag, scan,
+                                             earth_shape, winds != 0);
+            let mut gg = match built {
+                Ok(v) => { v }
+                Err(ge) => {
+                    let why = match ge {
+                        GridError::DegenerateAnchor => {
+                            "no projection anchor: La1 lies on a cone pole"
+                        }
+                        GridError::NonFiniteConstants => {
+                            "projection constants are not finite (non-finite angles or zero cell size)"
+                        }
+                    };
+                    return Err(format!("lambert grid rejected: {0} [nx={1} ny={2} la1={3} lo1={4} lov={5} latin1={6} latin2={7} dx_m={8} dy_m={9}]",
+                        why, nx, ny, la1, lo1, lov, latin1, latin2, dx_m, dy_m));
+                }
+            };
             if inline_axes != 0 {
                 gg.set_user_axes(ua_major, ua_minor);
+                if !gg.anchors_ok() {
+                    return Err(format!("lambert grid rejected: inline user-defined earth axes ({0}/{1} m) leave no finite projection",
+                        ua_major, ua_minor));
+                }
             }
             return Ok(GridDef::Lambert(gg));
         }
         2 => {
             // gaussian (V1.3 E4b): magic(8)+ver(4)+kind(1)+nx/ny(8)+4 f64+3 flags
-            if b.len() < 12 + 1 + 8 + 32 + 3 {
+            if b.len() < GRID_BASE_GAUSSIAN {
                 return Err("truncated gaussian grid".to_string());
+            }
+            match check_grid_trailer(b, GRID_BASE_GAUSSIAN) {
+                Err(e) => { return Err(e); }
+                Ok(_) => {}
             }
             let nx = le_u32_at(b, 13);
             let ny = le_u32_at(b, 17);

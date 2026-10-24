@@ -311,16 +311,28 @@ fn corrupt_stat_bytes_and_foreign_versions_are_refused() {
         }
         Ok(_) => { panic!(); }
     }
-    // ... and the trailing reserved u32 at 52..56
+    // ... and the integrity word at 52..56 (V1.4 phase C: this WAS the trailing
+    // reserved u32, validated zero back then). A foreign value there is still
+    // REFUSED — detection did not regress — it just reports the sharper code now
+    // that the slot participates in the digest check.
     let mut b5 = good.to_vec();
     b5[55] = 7;
     match decode_header(&b5) {
         Err(e) => {
             match e {
-                HeaderError::BadStat => {}
-                _ => { panic!(); }
+                HeaderError::BadCrc => {}
+                _ => { println!("foreign integrity slot reported {0:?}", e); panic!(); }
             }
         }
         Ok(_) => { panic!(); }
+    }
+    // WARM-BOOT COMPATIBILITY HALF: an ALL-ZERO slot means "written before
+    // header integrity existed" and must still parse, or every store built by
+    // the previous HEAD would be deleted by the pipeline's version trap.
+    let mut b6 = good.to_vec();
+    b6[52] = 0; b6[53] = 0; b6[54] = 0; b6[55] = 0;
+    match decode_header(&b6) {
+        Ok(_h) => {}
+        Err(e) => { println!("legacy unsealed header refused: {0:?}", e); panic!(); }
     }
 }
