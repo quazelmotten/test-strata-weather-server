@@ -3733,3 +3733,111 @@ bytes (`normalize_qs` fast path) and one relaxed store per FILE publish
   pair instead of silently redefining an existing gauge's formula (§19.2).
 * %-decode narrow by design; encoded timestamps remain 400 (§19.3, README
   §9).
+
+## 20. V1.4 phase W — PDT 4.8 statistical windows stored truth-shifted (2026-10-24)
+
+**The defect (AUDIT_1.3 P2).** `parse_stat_block` derived the statistical time
+range as `begin = fc_secs`, `end = fc_secs + len` UNIFORMLY for every kind. The
+section-4 period field this decoder reads as `fc_secs` IS the PDT's END of the
+overall statistical interval relative to the reference time, so for an
+ACCUMULATION the stored window was shifted forward by its own length: the
+fh-6 APCP of `tests/fixtures/stat_small.grib2` (run 2026-10-19 12Z) carried
+[18Z, 00Z] while wgrib2 calls that very message "0-6 hour acc(6 hour fcst)",
+i.e. [12Z, 18Z]. Query VALUES stayed correct — the §6.3 guard keys off exact
+forecast hours — so this was latent metadata wrongness: the §4.2-required
+time range in each `.bin` header, in the index entries, and in manifest.json
+`stat_ranges` all lay about one length for every accumulation at fh > 0.
+
+**Octet-level proof before changing anything.** Mutating individual section-4
+octets of the fixture copies and re-reading them with `tools/wgrib2` v3.1.3:
+
+| mutation (fh-6 APCP message) | wgrib2 inventory |
+|---|---|
+| none | `APCP:surface:0-6 hour acc(6 hour fcst)` |
+| period field 6 h → 12 h / 3 h / 0 | `0-6 hour acc(12 hour fcst)` / `(3 hour fcst)` / `anl` |
+| range length 6 → 3 / 12 | `0-3 hour acc` / `0-12 hour acc` |
+| range unit hour → minute | `0-6 min acc` |
+| CT 4.11 1 → 2 | `6-12 hour acc fcst` |
+| 7-byte stat valid-time block (hour, day) | unchanged |
+
+The "(N hour fcst)" suffix tracks the period octets and nothing else: those
+octets are the interval end. For CT 4.11 == 1 the printed range is anchored on
+that end ([end − len, end], shown as `0-len` whenever the end sits at or before
+`len`), while CT 4.11 == 2 renders it FORWARD from the end (`fc..fc+len`), which
+is how the fixture's average and the real HRRR 5–6 h WIND maximum read.
+
+**The rule now implemented (`wx-ingest/src/grib2.rs::parse_stat_block`).**
+Kind-dependent, exactly as the audit prescribes:
+
+* `StatKind::Accumulation`: `end = <interval end>` (= `fc_secs`),
+  `begin = end − len`; when that reaches before the run time the window
+  CLAMPS to the run time (`begin = 0`), which is precisely the `0-N hour acc
+  anl` product wgrib2 prints for an fh-0 accumulation — an accumulation can
+  never include data older than the run.
+* Average / Maximum / Minimum / Other: forward window `[fc, fc + len]`,
+  unchanged from before (fixture average "3-6 hour ave fcst"; production
+  `realdata_gate.rs` WIND-max pin `begin=18000 end=21600`).
+* Range length and step keep their OWN CT 4.4 unit indicators (`rus`/`sus`
+  from the indicator octets): the 30-minute window of `frac_small.grib2`
+  decodes in MINUTES, nothing assumes hours.
+* For `fc > len` (no fixture carries this shape; production sub-window
+  accumulations do) the rule yields `[end − len, end]`, the WMO/NCEP
+  convention, rather than wgrib2-v3.1.3's fixture-shape rendering.
+
+**No storage change.** Same `.bin` v2 header fields (offsets 28/36/44, i64 LE
+seconds past the run), same manifest keys, same index fields — only VALUES
+differ. No version bump here (another phase may bump later); a warm start
+reads whatever the header says, so old files keep answering with their shifted
+window until they are re-ingested. Writer goldens are unaffected (their stat
+metadata is synthetic and hardcoded in `scripts/gen_writer_golden.py`).
+
+**Stored windows before → after** (run 2026-10-19T12Z unless noted):
+
+| message | wgrib2-documented | before | after |
+|---|---|---|---|
+| stat_small APCP surf fh0, len 6 h | `0-6 hour acc anl` | 12:00Z→18:00Z | 12:00Z→18:00Z (clamps) |
+| stat_small APCP surf fh6, len 6 h | `0-6 hour acc(6 hour fcst)` | **18:00Z→00:00Z** | **12:00Z→18:00Z** |
+| stat_small TMP@2 m ave fc3 h, len 3 h | `3-6 hour ave fcst` | 15:00Z→18:00Z | 15:00Z→18:00Z |
+| stat_small_jpeg (same three messages) | ditto | ditto | ditto |
+| mixstat(_rev) TMP@2 m acc fh6, len 6 h | `0-6 hour acc(6 hour fcst)` | **18:00Z→00:00Z** | **12:00Z→18:00Z** |
+| collide_small APCP fh0 len 6 h / len 3 h | `0-6` / `0-3 hour acc anl` | 12:00Z→18:00Z / 12:00Z→15:00Z | both unchanged (fc=0 clamps) |
+| frac_small APCP surf fc30 min, len 30 min (minute units) | `0-30 min acc(30 min fcst)` | **12:30Z→13:00Z** | **12:00Z→12:30Z** |
+| real HRRR WIND max 5–6 h (gitignored slice) | maximum over 5–6 h | 17:00Z→18:00Z (18000/21600) | unchanged (max ⇒ forward rule) |
+
+**What was pinned wrong, and every test retargeted** (red-first per pin: each
+corrected assertion failed against the pre-fix decoder, then passed):
+
+* `wx-ingest/tests/stat_pdt.rs::stat_small_messages` — msg1 window
+  `begin==6*3600 / end==12*3600` → `begin==0 / end==6*3600`.
+* `wx-ingest/tests/stat_pdt.rs::jpeg_twin_keeps_pdt48_metadata_and_values` —
+  twin `mb[1].stat.begin_secs == 6*3600` → `== 0`.
+* `wx-ingest/tests/stat_durability.rs::warm_boot_without_manifest_keeps_the_accumulation_guard`
+  — fh 21600 slot `(21600, 43200)` → `(0, 21600)`.
+* `wx-ingest/tests/restart.rs::restart_no_reingest_and_content_change_redelivers`
+  — manifest `fh_secs:21600 begin 18Z end 00Z` → `begin 12Z end 18Z`; warm
+  index `apcp_r6 (21600, 43200)` → `(0, 21600)`.
+* `wx-ingest/tests/fractional_fh.rs::frac_fixture_decodes_minute_units_as_seconds`
+  — m5 `(1800, 3600)` → `(0, 1800)`.
+* `wx-ingest/tests/fractional_fh.rs::fractional_hours_storage_and_manifest` —
+  manifest `stat_ranges` `[12:30Z, 13:00Z]` → `[12:00Z, 12:30Z]`; warm index
+  `apcp_range (1800, 3600)` → `(0, 1800)`.
+* `wx-ingest/tests/mixed_stat_stack.rs`, `wx-server/tests/frac_http.rs` —
+  header/prose comments only ("window [6,12] h", "spans 12:30Z->13:00Z"); no
+  value assertions moved.
+
+**Guards proven unchanged.** Same tokens, same statuses, same payloads: exact-fh
+accumulation hits still answer (`stat_point_checks`, `frac_http` q7 = 80),
+interpolation across stat slots still refuses with `stat_time_guard` 422 and
+the SAME bracket/offender/kind payload tuples (`mixed_stat_stack` d.0/d.1/d.2/d.3,
+`kernels.rs::time_guard_stat_and_none`, `point_http::error_status_table`),
+collision rejection still first-in-message-order-wins with the winner's window
+in the manifest (`stat_collision` 18Z-present/15Z-absent pins untouched), and
+`checksum_parity` / `packing_twins` / writer goldens stay byte-identical. The
+422 message TEXT embeds FORECAST HOURS, never a stored window, so no error
+string needed updating.
+
+**Follow-up this phase did NOT own:** README §4 still calls the old behavior a
+"diff caution" ("we store begin = fc_secs, end = fc_secs + len uniformly",
+lines ~260–267) and its manifest sample (~line 403) shows the shifted
+12:30Z→13:00Z window; both need a docs pass by whoever owns README. No test
+reads those lines.

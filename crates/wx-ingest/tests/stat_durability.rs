@@ -268,7 +268,13 @@ fn warm_boot_without_manifest_keeps_the_accumulation_guard() {
                     }
                     if sl.fh_secs == 21600 {
                         assert!(sl.stat_has_range);
-                        assert!(sl.stat_begin_secs == 21600 && sl.stat_end_secs == 43200);
+                        // AUDIT_1.3 P2: the fh-6 accumulation covers 0-6 h of
+                        // the run (wgrib2 "0-6 hour acc(6 hour fcst)"), so the
+                        // header window restored from the .bin is [0, 21600].
+                        // Pre-fix E0-era bytes carried the shifted [21600,
+                        // 43200]; the guard never noticed because it keys off
+                        // the exact forecast hour.
+                        assert!(sl.stat_begin_secs == 0 && sl.stat_end_secs == 21600);
                     }
                 }
             }

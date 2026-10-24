@@ -271,8 +271,10 @@ fn fractional_hours_over_http() {
             assert!(has(&r5.1, "no_run_covers"));
 
             // ---- accumulation guard on a FRACTIONAL statistical range -----
-            // APCP@surface spans 12:30Z->13:00Z at fc 30 min: asking for 12:45Z
-            // must be refused (422), asking for the exact valid time answers 80.
+            // APCP@surface carries the 0-30 min window that ENDS at fc 30 min
+            // (valid 12:30Z; AUDIT_1.3 P2 — the decoder used to store the
+            // shifted 12:30Z->13:00Z): asking for 12:45Z must be refused
+            // (422), asking for the exact valid time answers 80.
             let q6 = "/v1/point?model=frac&param=APCP&level=surface&lat=9&lon=351.5&valid=2026-10-19T12:45:00Z";
             let r6 = rt.block_on(fetch(svc.clone(), q6.to_string()));
             assert!(r6.0 == 422);

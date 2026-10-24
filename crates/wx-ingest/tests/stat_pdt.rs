@@ -25,7 +25,11 @@ fn stat_small_messages() {
         Ok((msgs, st)) => {
             assert!(msgs.len() == 3);
             assert!(st.messages_total == 3);
-            // msg0: APCP surface, 0-6 h accumulation, fc hour 0
+            // msg0: APCP surface, 0-6 h accumulation, fc hour 0. An
+            // accumulation window runs [end - len, end] and the PDT period
+            // field (fc) IS that end; here fc < len so the window clamps to
+            // the run time exactly as wgrib2 renders it ("0-6 hour acc anl" —
+            // an accumulation never reaches before t0). AUDIT_1.3 P2.
             let m0 = &msgs[0];
             match m0.param_name {
                 Some(s) => { assert!(s == "APCP"); }
@@ -39,7 +43,14 @@ fn stat_small_messages() {
             assert!(m0.fc_secs == 0);
             assert!(m0.stat.begin_secs == 0);
             assert!(m0.stat.end_secs == 6 * 3600);
-            // msg1: same field, 6-12 h accumulation at fc hour 6
+            // msg1: same field, the 0-6 h accumulation whose interval ENDS at
+            // forecast hour 6. wgrib2 readback (tests/fixtures/expected.json)
+            // calls this message "0-6 hour acc(6 hour fcst)", i.e. offsets
+            // [0, 6] from the run time: for an accumulation the stored window
+            // is [fc - len, fc], NOT the length-shifted [fc, fc + len] the
+            // pre-fix decoder wrote (AUDIT_1.3 P2 — values stayed right
+            // because the §6.3 guard keys off exact forecast hours, but the
+            // §4.2 range metadata was wrong by exactly one length).
             let m1 = &msgs[1];
             match m1.param_name {
                 Some(s) => { assert!(s == "APCP"); }
@@ -47,9 +58,12 @@ fn stat_small_messages() {
             }
             assert!(m1.stat.kind == StatKind::Accumulation);
             assert!(m1.fc_secs == 6 * 3600);
-            assert!(m1.stat.begin_secs == 6 * 3600);
-            assert!(m1.stat.end_secs == 12 * 3600);
-            // msg2: TMP 2 m AGL, 3-6 h average at fc hour 3
+            assert!(m1.stat.begin_secs == 0);
+            assert!(m1.stat.end_secs == 6 * 3600);
+            // msg2: TMP 2 m AGL, 3-6 h average at fc hour 3. Averages and
+            // max/min keep the FORWARD window [fc, fc + len]: wgrib2 prints
+            // this one "3-6 hour ave fcst", and the real HRRR 5-6 h WIND
+            // maximum pin in realdata_gate.rs rides the same rule.
             let m2 = &msgs[2];
             match m2.param_name {
                 Some(s) => { assert!(s == "TMP"); }
@@ -142,7 +156,9 @@ fn jpeg_twin_keeps_pdt48_metadata_and_values() {
                     assert!(mb[0].stat.kind == StatKind::Accumulation);
                     assert!(mb[0].stat.end_secs == 6 * 3600);
                     assert!(mb[1].stat.kind == StatKind::Accumulation);
-                    assert!(mb[1].stat.begin_secs == 6 * 3600);
+                    // same corrected window through the J2K repack: 0-6 h,
+                    // ending at fc hour 6 (wgrib2 "0-6 hour acc(6 hour fcst)")
+                    assert!(mb[1].stat.begin_secs == 0);
                     assert!(mb[2].stat.kind == StatKind::Average);
                 }
             }

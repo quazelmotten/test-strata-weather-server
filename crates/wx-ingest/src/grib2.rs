@@ -136,8 +136,12 @@ pub enum StatKind {
 
 /// Statistical-processing info (spec §4.2 PDT 4.8 requirement). For PDT 4.0
 /// this is `Instantaneous` with zero ranges. Begin/end/step are seconds
-/// relative to the run time. `ct4_11` keeps the raw Code Table 4.11 interval
-/// code of the first time-range block for round-tripping/diagnostics.
+/// relative to the run time: an ACCUMULATION window ENDS at the message's
+/// interval end (its forecast time) and clamps at the run time when shorter,
+/// while averages/max/min run FORWARD from it — see `parse_stat_block`
+/// (AUDIT_1.3 P2 corrected this; the shifted form used to be stored for every
+/// kind). `ct4_11` keeps the raw Code Table 4.11 interval code of the first
+/// time-range block for round-tripping/diagnostics.
 #[derive(Clone, Debug)]
 pub struct StatInfo {
     pub kind: StatKind,
@@ -779,7 +783,10 @@ pub fn pow10(e: i32) -> f64 {
 /// PDT 4.8 stat block (layout validated empirically against wgrib2 readback,
 /// see docs/DECISIONS.md): [29..35] valid fmtd time, [36] n ranges,
 /// [37..40] opaque, then 12-byte blocks: CT4.6 period flag, CT4.11 interval
-/// code, range unit, u4 range length, step unit, u4 step length.
+/// code, range unit, u4 range length, step unit, u4 step length. `fc_secs` is
+/// the section-4 period field, which for template 4.8 IS the END of the
+/// overall statistical interval relative to the reference time; the window is
+/// derived from it per kind below (AUDIT_1.3 P2).
 fn parse_stat_block(p: &[u8], fc_secs: i64) -> Result<StatInfo, GribErr> {
     if p.len() < 53 {
         return Err(GribErr::Truncated);
@@ -810,11 +817,41 @@ fn parse_stat_block(p: &[u8], fc_secs: i64) -> Result<StatInfo, GribErr> {
         3 => { StatKind::Minimum }
         _ => { StatKind::Other }
     };
+    // AUDIT_1.3 P2 THE STATISTICAL WINDOW IS ANCHORED ON THE INTERVAL END.
+    // The section-4 period field the caller passes in as `fc_secs` IS the PDT
+    // octet pair that carries the END of the overall statistical interval
+    // relative to the reference time — verified by OCTET-LEVEL probing against
+    // tools/wgrib2 v3.1.3, which renders it as "(N hour fcst)" and moves that
+    // text whenever these octets move. So:
+    //   * ACCUMULATION: the plane covers the interval that ENDS there,
+    //     [end - len, end]. A window reaching before the run time clamps to
+    //     the run time, which is exactly the "0-N hour acc anl" product
+    //     wgrib2 shows for an fh-0 accumulation (an accumulation can never
+    //     include data older than the run).
+    //   * AVERAGE / MAXIMUM / MINIMUM / OTHER: the statistic runs FORWARD from
+    //     that instant, [fc, fc + len] — what wgrib2 prints for the fixture's
+    //     average ("3-6 hour ave fcst") and what the real HRRR 5-6 h WIND
+    //     maximum pin in realdata_gate.rs requires.
+    // Pre-fix the decoder stored [fc, fc + len] UNIFORMLY, i.e. an accumulation
+    // window shifted forward by its own length (fh-6 APCP: 18Z-00Z instead of
+    // 12Z-18Z). Values stayed right because the §6.3 guard keys off exact
+    // forecast hours; only the §4.2 time-range metadata was wrong.
+    // The length keeps its OWN CT 4.4 unit indicator (`rus`), and so does the
+    // step (`sus`): nothing here assumes hours.
+    let len_secs = (rlen as i64) * rus;
+    let (begin_secs, end_secs) = match kind {
+        StatKind::Accumulation => {
+            let mut b = fc_secs - len_secs;
+            if b < 0 { b = 0; }
+            (b, b + len_secs)
+        }
+        _ => { (fc_secs, fc_secs + len_secs) }
+    };
     Ok(StatInfo {
         kind: kind,
         ct4_11: ct411 as i16,
-        begin_secs: fc_secs,
-        end_secs: fc_secs + (rlen as i64) * rus,
+        begin_secs: begin_secs,
+        end_secs: end_secs,
         step_secs: (slen as i64) * sus,
     })
 }

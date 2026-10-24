@@ -20,7 +20,10 @@
 //     accumulations, see frac_small APCP in fractional_fh.rs).
 //
 // FIXTURES (scripts/gen_grib2.py): mixstat_small.grib2 = TMP@2m AGL fh
-// 0 INSTANTANEOUS, fh 6 ACCUMULATION [6,12] h, fh 12 + fh 18
+// 0 INSTANTANEOUS, fh 6 ACCUMULATION with the 0-6 h window that ENDS at
+// that forecast hour (wgrib2 "0-6 hour acc(6 hour fcst)"; AUDIT_1.3 P2
+// corrected the decoder, which used to store the length-shifted [6,12] h),
+// fh 12 + fh 18
 // INSTANTANEOUS, values analytic and linear in the forecast hour:
 //     value = 250 + j*nx + i + fc_hour
 // so the node (20 N, 240 E) reads 250 / 256 / 262 / 268 and mid fh 15

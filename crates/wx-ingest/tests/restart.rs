@@ -142,10 +142,15 @@ fn restart_no_reingest_and_content_change_redelivers() {
     // with each forecast hour (`stat_ranges` keyed by exact fh_secs), rendered as
     // absolute ISO-8601 UTC instants. The 3-hour TMP average proves the same
     // machinery covers non-accumulation statistics.
+    // AUDIT_1.3 P2: an accumulation window ENDS at its forecast time, so the
+    // fh-6 APCP carries the SAME 0-6 h window wgrib2 prints for it
+    // ("0-6 hour acc(6 hour fcst)"), not the length-shifted 18Z-00Z the pre-fix
+    // decoder stored. The fh-0 accumulation clamps to the run time; averages
+    // keep their forward [fc, fc + len] window.
     let stat_run = join_path(&join_path(&data, "stat"), "2026101912");
     let man = read_bytes(&join_path(&stat_run, "manifest.json"));
     assert!(bytes_contains(&man, "\"fh_secs\":0,\"begin\":\"2026-10-19T12:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\",\"step_secs\":0".as_bytes()));
-    assert!(bytes_contains(&man, "\"fh_secs\":21600,\"begin\":\"2026-10-19T18:00:00Z\",\"end\":\"2026-10-20T00:00:00Z\",\"step_secs\":0".as_bytes()));
+    assert!(bytes_contains(&man, "\"fh_secs\":21600,\"begin\":\"2026-10-19T12:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\",\"step_secs\":0".as_bytes()));
     assert!(bytes_contains(&man, "\"fh_secs\":10800,\"begin\":\"2026-10-19T15:00:00Z\",\"end\":\"2026-10-19T18:00:00Z\"".as_bytes()));
 
     // ---- simulated restart ---------------------------------------------
@@ -222,8 +227,12 @@ fn restart_no_reingest_and_content_change_redelivers() {
                 }
             }
             assert!(found);
+            // offsets from the run time, exactly as written: the fh-6
+            // accumulation's window is 0-6 h (ends AT its forecast hour),
+            // the fh-0 one clamps to the run time, and the 3-h average runs
+            // forward from fc (AUDIT_1.3 P2).
             assert!(apcp_r0.0 && apcp_r0.1 == 0 && apcp_r0.2 == 21600);
-            assert!(apcp_r6.0 && apcp_r6.1 == 21600 && apcp_r6.2 == 43200);
+            assert!(apcp_r6.0 && apcp_r6.1 == 0 && apcp_r6.2 == 21600);
             assert!(tmp_r3.0 && tmp_r3.1 == 10800 && tmp_r3.2 == 21600);
         }
     }

@@ -258,8 +258,12 @@ fn frac_fixture_decodes_minute_units_as_seconds() {
                 None => { panic!(); }
             }
             assert!(m5.stat.kind == StatKind::Accumulation);
-            assert!(m5.stat.begin_secs == 1800);
-            assert!(m5.stat.end_secs == 3600);
+            // AUDIT_1.3 P2: the window ENDS at the forecast time, so this
+            // message carries 0-30 min — what wgrib2 prints for it ("0-30 min
+            // acc(30 min fcst)") — with the MINUTE unit indicator honored, not
+            // the shifted [30 min, 60 min] the pre-fix decoder stored.
+            assert!(m5.stat.begin_secs == 0);
+            assert!(m5.stat.end_secs == 1800);
             assert!(m5.fc_secs == 1800);
             // wgrib2-probed node (lat 9.0, lon 351.5 -> j=2, i=3, k=45):
             // APCP = 5 + 45 + 30 = 80; run A fc 30min = 325; run B fc 30min = 575
@@ -340,7 +344,7 @@ fn fractional_hours_storage_and_manifest() {
     assert!(bytes_contains(&man, "\"param\":\"TMP\"".as_bytes()));
     assert!(bytes_contains(&man, "\"forecast_hours\":[0,0.5,1]".as_bytes()));
     assert!(bytes_contains(&man, "\"stat_processed\":true".as_bytes()));
-    assert!(bytes_contains(&man, "\"stat_ranges\":[{\"fh_secs\":1800,\"begin\":\"2026-10-19T12:30:00Z\",\"end\":\"2026-10-19T13:00:00Z\",\"step_secs\":0}]".as_bytes()));
+    assert!(bytes_contains(&man, "\"stat_ranges\":[{\"fh_secs\":1800,\"begin\":\"2026-10-19T12:00:00Z\",\"end\":\"2026-10-19T12:30:00Z\",\"step_secs\":0}]".as_bytes()));
     // unprocessed fields carry an empty range array, not a bogus one
     assert!(bytes_contains(&man, "\"stat_ranges\":[]".as_bytes()));
 
@@ -374,7 +378,8 @@ fn fractional_hours_storage_and_manifest() {
                 }
             }
             assert!(tmp_slots == 3);
-            assert!(apcp_range.1 == 1800 && apcp_range.2 == 3600);
+            // 0-30 min window (ends at fc), restored from the field header
+            assert!(apcp_range.1 == 0 && apcp_range.2 == 1800);
         }
     }
     rm_tree(&root);
