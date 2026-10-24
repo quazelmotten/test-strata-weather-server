@@ -3970,3 +3970,82 @@ the realdata_probes paragraph (lines ~928–931) and the tooling paragraph
 (~965–967) should note the IPOLATES build now EXISTS (recipe
 /tmp/opencode/ipolates/repro.sh) so "this wgrib2 build has no IPOLATES" only
 applies to the stock `tools/wgrib2` in-repo binary.
+
+## 22. V1.4 phase C+C2 — header-integrity CRCs + index geometry cross-validation (2026-10-24; written retroactively by phase D)
+
+Phase C shipped commit `6e0359e` ("index-build geometry cross-validation
+(activated on ingest publish too), typed LCC degeneracy error, header CRC32 via
+reserved slot + grid.bin trailer, warm-compat preserved") WITHOUT its own
+decision record; this section backfills the substance from the commit itself
+and the module docs in `wx-core/src/storage.rs`, per the repo convention that
+every nontrivial format decision gets a written rationale.
+
+**Field-header CRC-32 in the reserved slot.** The V1.3 E0 layout carried
+"reserved (must be 0)" u32 at offset 52. Phase C repurposed exactly that slot
+(`BIN_CRC_OFFSET = 52`) as an integrity word: reflected IEEE CRC-32 (poly
+`0xEDB8_8320` — the zlib/PKZIP/GRIB2-section-7 polynomial, NOT Castagnoli's
+CRC-32C; `header_crc_parity.rs::known_answers_pin_the_ieee_polynomial_not_castagnoli`
+and bit-for-bit parity vs `zlib_rs::crc32`). Digest region: header bytes
+`[0, 52)` concatenated with the level coordinates `[56, 56 + nlevels·4)` — a
+state-CONTINUING two-part fold that simply skips the four CRC bytes, so the
+word covers everything around it. A mismatch makes `open_field` refuse with
+`"header crc mismatch"` (loud skip-and-count, never a wrong number).
+
+**The legacy sentinel and why `BIN_VERSION` DELIBERATELY stays 2.** Pre-C
+stores have ZERO in the slot (that is what the E0 writer left there), so zero
+means "unsealed, legacy" and warms fine — counted via `crc_counters_snapshot`
+so operators can see how much of a store predates sealing (`header_integrity.
+rs::legacy_unsealed_header_stills_warms_boot_and_is_counted_as_verified`). A
+genuine digest of exactly 0 is stored as 1 (`crc_slot_value`), keeping the
+sentinel unambiguous forever (`zero_digest_cannot_masquerade_as_the_absent_
+sentinel_forever`). Writers ALWAYS seal. The version number deliberately does
+NOT move: the pipeline's field-file pre-check keys off
+`bin_version_of_path != BIN_VERSION` and DELETES any foreign-version run dir
+(the storage-format recovery trap), so bumping 2→3 would have turned every
+harmless warm boot into a full re-decode of every model — a correctness-neutral
+reformat masquerading as an upgrade. Accepted asymmetry: a PRE-C binary reading
+a post-C sealed file refuses it with `HeaderError::BadStat` (non-zero reserved
+byte), which lands in the same loud-recovery machinery rather than mis-parsing.
+`writer_golden_v2.bin` was regenerated with the sealed header at the SAME 488
+bytes — the CRC fits the format without moving anything.
+
+**grid.bin trailer.** Sealed grid blobs append a 4-byte CRC over the serialized
+body; discrimination against legacy unsealed blobs is BY LENGTH (the exact
+legacy length decodes unverified), so `GRID_VERSION` also STAYS 3. Stripping
+the trailer must decode as legacy — that IS the warm-boot contract
+(`grid_bin_crc.rs::stripping_the_trailer_decodes_as_legacy_which_is_the_warm_
+boot_contract`); a flipped byte inside a sealed blob is refused as integrity;
+truncated blobs fail closed with NAMED truncation errors; hostile lambert
+blobs are rejected by name instead of panicking. Longer-than-sealed trailing
+slack is tolerated-but-unverified, as documented (`trailing_slack_now_
+disagrees_instead_of_passing_silently` pins the flip side for field files).
+
+**Geometry cross-validation at EVERY index build — warm load AND ingest
+publish.** Each field-file header is checked against its run's grid geometry
+(extent/scan flag vs the grid def). Outcomes are class-named, never silent: a
+header whose extent disagrees is skipped PER SLOT while the rest of the run
+keeps serving; a rotted scan-mode flag is named and dropped per slot; a grid
+that cannot be projected withholds EXACTLY its own run and nothing else. Cost
+of the clean case is pinned to ZERO: the validated snapshot comes back as the
+SAME `Arc` (no clone, no alloc) —
+`geometry_xval_ingest.rs::a_clean_snapshot_comes_back_as_the_same_arc_and_costs_nothing`.
+C2 activated the same predicate on the ingest-publish path, not just warm load,
+closing the window where a freshly written mismatched pair could serve before
+any restart looked at it.
+
+**Degenerate LCC became a typed error.** The conformal-cone constructor could
+still panic on input-dependent degenerate shapes (La1==La2 with dx/dy nonsense,
+poles as standard parallels) — the crate's LAST input-dependent unwrap. It now
+returns a typed `GridError`; the infallible-constructor sites POISON (mark the
+model unhealthy, loud note) instead of aborting under `panic=abort`, and
+poisoning does not move the domain of a healthy grid
+(`geometry_xval.rs::degenerate_lambert_construction_reports_a_value_not_a_
+panic`, `infallible_constructor_poisons_instead_of_aborting`,
+`poisoning_does_not_move_the_domain_of_a_healthy_grid`; warm-boot end-to-end:
+`warm_boot_over_a_pole_lcc_gridbin_recovers_loudly_instead_of_aborting`).
+
+**Tests added:** `wx-core/tests/geometry_xval.rs`, `wx-core/tests/header_
+integrity.rs`, `wx-ingest/tests/geometry_xval_ingest.rs`,
+`wx-ingest/tests/grid_bin_crc.rs`, `wx-ingest/tests/header_crc_parity.rs`;
+`storage_roundtrip.rs`/`writer_golden.rs` extended, `scripts/gen_writer_
+golden.py` updated to emit the sealed golden.

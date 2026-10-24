@@ -46,27 +46,58 @@ one without reading logs.
 | 7 | provisional wind-pair enforcement fired (V1.3 phase E3b): a model configuring only ONE of UGRD/VGRD decoded a GRID-relative wind field after boot (its dir was empty/unstable at startup, so code 4 could not decide); `[ingest].wind_pair_enforce = false` opts out |
 | 8 | the HTTP server itself returned an error |
 
+**Graceful shutdown (V1.4 phase A).** SIGTERM and SIGINT are HANDLED (before
+A their default disposition killed the process mid-response): the listener
+stops accepting NEW connections, in-flight requests drain, then the process
+exits **0** — the "(or stopped cleanly)" row above, log lines "SIGTERM received; draining
+in-flight connections (no new connections accepted)" then "server stopped",
+pinned by
+`shutdown_drain.rs` (`sigterm_drains_connections_and_exits_zero`,
+`sigint_drains_connections_and_exits_zero`). There is no configured drain
+timeout; an escalated signal during the drain takes the default hard-kill.
+A systemd EXAMPLE unit with the `Restart=always` rationale under
+`panic = "abort"` ships in `deploy/` (pre-created `data_dir`, advisory-lock
+note, exact privilege claim).
 
-Gate, as measured in the V1.2 phase-D acceptance sweep (this machine):
 
-* `cargo test --workspace` → **rc=0, 153 tests passed across 68 test binaries, 0
-  failed**, TWICE back-to-back (both runs identical counts).
-* `cargo clippy --workspace -- -D warnings` → **rc=0**, zero lint diagnostics
-  (the only stderr line is cargo's future-incompat note about the vendored
-  `bitflags` 0.4.0/0.7.0 deps, not a lint). This is the documented gate scope
-  (workspace lib+bin targets). A wider `--all-targets` run is NOT clean: it reports
-  pre-existing lint debt in test/bench code only (count recorded in docs/DECISIONS.md
-  phase D) — stated, not hidden.
-* `bash scripts/gen_fixtures.sh` → rc=0, idempotent (all 25 fixture md5s identical
-  across consecutive runs), 8 packing-twin assertions green incl. the DRT 5.2 `_c2`
-  twins; the DRT 5.200 run-length fixtures are asserted by `runlength_5200.rs`.
+Gate, as measured for V1.4 on this machine (2026-10-24):
+
+* `cargo test --workspace` → **rc=0, 329 passed / 0 failed / 0 ignored across
+  112 test binaries + 3 doc-test targets**; warm wall 2 m 28 s (the
+  `[profile.test] opt-level = 3` change of V1.4 phase 0; the pre-fix debug cost
+  was ~57 min — AUDIT_1.3 P2).
+* `cargo clippy --all-targets -- -D warnings` → **rc=0, ZERO diagnostics** on
+  the FULL surface (lib+bin+test+bench). The V1.2-D caveat that "a wider
+  `--all-targets` run is NOT clean" is CLOSED: the remaining lint debt was
+  burned in V1.3 E6 and every V1.4 phase kept it at zero.
 * `bash scripts/smoke.sh` → **SMOKE PASS**, all 17 `probes.tsv` ground-truth
-  probes replayed with 0 failures.
-* `bash scripts/loadtest.sh 15` → §8 targets MET (see §7.2).
-* `python3 scripts/validate_rotation.py` → rc=0, 42 expected-angle rows, both earth
-  shapes.
-* `bash scripts/ingestbench.sh` (realistic dataset) → 6 files ingested, 481 live
-  value probes OK, write amplification 1.0000x (see §7.4).
+  probes replayed with 0 failures; release-build average point-query latency
+  **25.7 µs** across its 422 correctness probes.
+* Corruption sweep (`crates/wx-ingest/tests/corruption_sweep.rs`, phase B1) →
+  **3720 seeded bit-flip trials over 31 fixtures + 186 tail-truncation cuts,
+  ZERO panics** (measured at B1; the sweep enumerates `tests/fixtures` at run
+  time, 120 trials per fixture, so today it replays 3840 trials over 32
+  families incl. the phase-X IPOLATES golden). Pre-fix abort classes: unchecked
+  section-5/7 slice indexing, and a forged 176 GB allocation request through
+  the JPEG2000 backend.
+* Live-notify discovery smoke (`crates/wx-ingest/tests/notify_live_smoke.rs`,
+  phase N) → file drop → queryable in **0.29–0.31 s** through the REAL inotify
+  subscription with `scan_interval_secs` pinned to 3600 (inside the window the
+  scan fallback provably cannot fire); sidecar marker → queryable in exactly
+  ONE round (~0.29 s).
+* Carried from earlier sweeps, not re-run this cycle (V1.4 leaves the paths they
+  measure pinned by the gates above): `bash scripts/gen_fixtures.sh` → rc=0,
+  idempotent (per-fixture md5s identical across consecutive runs; last counted
+  at V1.2-D when the set was 25 — today gen_fixtures regenerates 31 fixtures,
+  and the 32nd committed `.grib2`, `hrrr_ipolates_earth.grib2`, is the external
+  IPOLATES golden, which gen_fixtures does NOT regenerate), 8 packing-twin
+  assertions green incl. the DRT 5.2 `_c2` twins; the DRT 5.200 run-length
+  fixtures are asserted by `runlength_5200.rs`. `bash scripts/loadtest.sh 15` →
+  §7.2 targets MET. `python3 scripts/validate_rotation.py` → rc=0, 42
+  expected-angle rows, both earth shapes (ANGLE-only supporting evidence since
+  V1.4 phase X — the value truth for rotation moved to the committed IPOLATES
+  golden, §8 row 3). `bash scripts/ingestbench.sh` (realistic dataset) → 6
+  files ingested, 481 live value probes OK, write amplification 1.0000x (§7.4).
 
 ## 2. Configuration
 
@@ -93,7 +124,12 @@ after normalization (canonicalize when the path exists, else lexical absolutizat
 
 Per model: `name`, `ingest_dir`, `file_glob` (glob is a FILTER ONLY — all
 metadata comes from GRIB sections 1/4, never filenames), and `[[models.params]]`
-entries. Param names map to GRIB2 (discipline, category, number) through a
+entries. Model NAMES must match `[A-Za-z0-9_-]+` exactly (V1.4 phase B2): a
+name becomes ONE flat directory level under `data_dir`, so `/`, `.` and
+whitespace (traversal like `../evil`, tooling-breakers) are refused at startup
+naming the offending name; residual: validation cannot see a case-INSENSITIVE
+filesystem where `Gfs` and `gfs` still collide (§9). Param names map to GRIB2
+(discipline, category, number) through a
 built-in table covering `TMP HGT UGRD VGRD RH SPFH DPT PRMSL MSLMA PRES VVEL
 APCP GUST CAPE CIN`; anything else may use raw
 `discipline/category/number` keys — such an out-of-table entry may carry an
@@ -138,7 +174,11 @@ semantics, full rationale in docs/DECISIONS.md:
 * When BOTH components are configured on a grid-relative grid, U/V are rotated
   to earth-relative AT INGEST using the conformal angle derived from the
   projection's own validated cone geometry (per grid point) and stored earth-relative,
-  so query semantics are uniform across models (§4.4).
+  so query semantics are uniform across models (§4.4). Since V1.4 phase X the
+  decomposition is the PROPER rotation (det +1; the projection-plane reading is
+  scan-independent, matching `wgrib2 -new_grid_winds earth` against an IPOLATES
+  golden); the pre-X matrix was a reflection mislabelled as a rotation — P0
+  defect narrative in §12 and docs/DECISIONS.md §21.
 
 ## 3. HTTP API
 
@@ -148,18 +188,36 @@ Pa) — never converted.
 ### `GET /v1/point`
 
 ```sh
+# canonical form: bare colons/commas (curl style)
 curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP&level=isobaric:837.5&lat=41.25&lon=-95.93&valid=2026-10-19T19:30:00Z'
+# percent-encoded form — answers BYTE-IDENTICALLY (uniform %-decode, V1.4 phase A):
+curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP&level=isobaric%3A837.5&lat=41.25&lon=-95.93&valid=2026-10-19T19%3A30%3A00Z'
+curl 'http://127.0.0.1:8080/v1/point?model=gfs&param=TMP%2CHGT&level=surface&lat=41.25&lon=-95.93&valid=2026-10-19T19%3A30%3A00Z'
 ```
 
-**Raw-first wire format + targeted %-decode (V1.3 phase E6).** The server
-reads the RAW query string; the canonical form uses bare colons and commas
-(curl style). Exactly two escapes ARE additionally accepted, and ONLY inside
-`level` and `param` VALUES: `%3A`/`%3a` → `:` and `%2C`/`%2c` → `,` (encoded
-requests yield byte-identical responses — `point_http.rs` pins upper-hex,
-lower-hex, and mixed forms against their bare counterparts). Everything else
-passes through as literal bytes: `+` never decodes to a space, unknown or
-malformed `%` sequences survive verbatim (`param=TMP%zz` is an
-unknown-parameter 404, not a decode error), and no other key accepts escapes.
+**Raw-first wire format + UNIFORM single-pass %-decode (V1.4 phase A;
+supersedes the V1.3 E6 "exactly two escapes inside level/param only" rule).**
+The canonical form remains BARE colons/commas (curl style), but ONE
+percent-decode pass now runs over EVERY query value before the key/value walk,
+so standard clients that encode `:` everywhere are first-class — a fully
+encoded timestamp (`valid=2026-10-19T18%3A00%3A00Z`) answered 400 `bad_time`
+pre-A and answers 200 now. The contract (pinned end-to-end by `client_compat.rs`
++ `point_http.rs`): any complete escape decodes (`%XY`, hex digits either case:
+`%3A`→`:`, `%2c`→`,`, `%20`→space, multi-byte UTF-8 like `%E2%82%AC`); `%%`
+yields a literal `%` and decoding happens ONCE, so wire `%253A` reads as the
+TEXT `%3A`, never a colon; `+` stays a literal `+` ALWAYS (deliberate deviation:
+form-encoding "+ = space" is HTML-specific, would make a literal '+'
+unrepresentable and silently mutate values that resolve as `unknown_param`
+today — clients wanting a space send `%20`); any OTHER `%` (`%zz`, trailing
+`%`) is the typed 400 token `bad_percent_escape` instead of a confusing
+404-class answer, and escapes that do not reassemble into valid UTF-8 take the
+same 400. Keys stay byte-literal; `&`/first-`=` split on RAW bytes, so a wire
+`%26`/`%3D` cannot fake a separator. Encoded and bare requests produce
+BYTE-IDENTICAL responses (upper-hex, lower-hex and mixed forms pinned against
+their bare counterparts). The strict ISO calendar validator is NOT loosened: a
+decoded Feb-31 still answers 400 `bad_time`. Hot path unchanged: a query with
+no `%` at all borrows the raw string and allocates nothing (`normalize_qs`
+Borrowed fast path).
 
 ```json
 {"model":"gfs","run":"2026-10-19T12:00:00Z","valid":"2026-10-19T19:30:00Z",
@@ -207,6 +265,14 @@ OMITTED and the body is byte-identical to V1.1.
 | `run` | no | pin a specific run; default = most recent run covering `valid` |
 | `time_interp` | no | `linear` (default) / `none` (exact fh required) |
 
+**Pinned-run and multi-param semantics (V1.4 phase A).** `run=` must EXIST and
+COVER `valid`: an absent or non-covering pinned run answers 404 `no_run_covers`
+with NO fallback to another run
+(`client_compat.rs::pinned_run_absent_or_noncovering_answers_404_no_fallback`).
+In a multi-param request the FIRST failing param decides the whole response —
+one error body, never a partial success
+(`multi_param_first_failing_param_decides_the_whole_request`).
+
 **Fractional forecast hours in responses.** Time arithmetic runs on integer
 seconds past the run reference time, and the reported bracket converts back to
 HOURS per spec §7, so a half-hour slot renders as a decimal: a query landing
@@ -220,13 +286,18 @@ run that covers it answers. End-to-end coverage: `frac_http.rs`
 Documented rendering deviations from the spec example: exact level/time matches
 render `"method":"exact"` or the key with `null` instead of omitting it; masked
 values render `"value":null,"reason":"missing_data","interpolation":null`;
-numbers print ≤6 trimmed decimals (integers without `.0`).
+numbers print ≤6 trimmed decimals (integers without `.0`). Echo safety (V1.4
+phase A): every hand-built JSON echo of client-supplied text (model names,
+config units strings, error messages quoting values) is properly escaped —
+quotes, backslashes, control bytes — so hostile input still yields parseable
+JSON (`client_compat.rs::backslash_and_quote_echoes_parse_as_valid_json`,
+`models_config_quote_backslash_units_renders_valid_json`).
 
 Errors: `{"error":"<token>","message":"..."}` with
 
 | Status | Tokens |
 |---|---|
-| 400 | `missing_required` `unknown_query_param` `bad_lat` `bad_lon` `bad_level` `bad_time` `bad_time_interp` `empty_value` |
+| 400 | `missing_required` `unknown_query_param` `bad_lat` `bad_lon` `bad_level` `bad_time` `bad_time_interp` `empty_value` `bad_percent_escape` (V1.4 phase A: malformed `%`-escape anywhere in a value — `%zz`, trailing `%`, non-UTF-8 reassembly) |
 | 404 | `unknown_model` `unknown_param` `no_run_covers` `unknown_endpoint` |
 | 422 | `level_out_of_range` `stat_time_guard` (template 4.8 field needs exact fh) `time_exact_only` (`time_interp=none` w/o exact fh) `out_of_domain` (outside grid node rectangle) |
 
@@ -262,11 +333,19 @@ travels with the FORECAST HOUR and is exposed in `manifest.json` per field as
 `stat_ranges` (§4 below). `/v1/inventory` deliberately exposes only the coarser
 `stat_processed`/`stat_kind` flags plus the forecast-hour list — the guard
 behaviour (`stat_time_guard` 422) is what the API needs; the exact window is
-operational detail available on disk. Diff manifest JSON against wgrib2 text with
-care: wgrib2 prints an accumulation as `[fc-len, fc]` while we store
-`begin = fc_secs`, `end = fc_secs + len` uniformly (docs/DECISIONS.md, phase 3).
+operational detail available on disk. Since V1.4 phase W the stored windows
+MATCH wgrib2's documented ranges: an ACCUMULATION stores `[end − len, end]`,
+clamped at the run start (an accumulation can never include pre-run data) —
+exactly wgrib2's `0-6 hour acc` semantics — while averages/max/min keep the
+FORWARD window `[fc, fc + len]` (wgrib2 prints those as `... fcst`). Before W
+accumulations were stored shifted FORWARD uniformly (`begin = fc_secs`,
+`end = fc_secs + len`), so manifest JSONs written by a pre-W binary disagree
+with wgrib2 on accumulation windows ONLY; query VALUES were always right
+because the §6.3 guard keys off exact forecast hours. Pre-W stores keep their
+shifted windows until re-ingested (docs/DECISIONS.md §20).
 
-Metrics (Prometheus): `wxpoint_queries_total{status="2xx|4xx|5xx"}`,
+Metrics (Prometheus): `wxpoint_queries_total{status="2xx|4xx|5xx"}` (CLASS-level
+labels by design, not exact codes — see §9),
 `wxpoint_query_latency_us_{bucket,count,sum}` (µs histogram, cumulative buckets),
 `wxpoint_ingest_errors_total`, `wxpoint_ingested_files_total`,
 `wxpoint_skipped_messages_total` (V1.1 phase 3 counter: structurally unusable
@@ -351,8 +430,17 @@ data_dir/
   +32 per field file): u8 `stat_kind` at byte 23 (0 instantaneous, 1 accumulation,
   2 average, 3 maximum, 4 minimum, 5 other), u8 `stat_processed` at byte 24, reserved zero
   at 25–27, i64 LE `begin_secs` / `end_secs` / `step_secs` at offsets 28 / 36 / 44
-  (seconds past the RUN time; 0 when there is no range), reserved zero at 52–55.
-  The strict reader refuses kind > 5, processed > 1 or non-zero reserved bytes
+  (seconds past the RUN time; 0 when there is no range), then a u32 LE
+  `header_crc` at 52–55 (V1.4 phase C: reflected IEEE CRC-32 over header bytes
+  `[0, 52)` PLUS the level coordinates `[56, 56 + nlevels·4)`; ZERO means
+  legacy UNSEALED and warms fine, counted by a dedicated counter; a genuine
+  digest of exactly 0 is stored as 1 so the sentinel stays unambiguous;
+  **`BIN_VERSION` DELIBERATELY stays 2** — the storage-recovery trap DELETES
+  version-mismatched run dirs, so a bump would have forced a full re-decode of
+  every store for a correctness-neutral reformat; docs/DECISIONS.md §22). A
+  sealed file whose CRC disagrees is refused as `"header crc mismatch"` (loud
+  skip-and-count, never a wrong number). The strict reader refuses kind > 5,
+  processed > 1 or non-zero bytes at the reserved slots 25–27
   (`HeaderError::BadStat`) instead of guessing. Then nlevels × f32 level values
   (pressure-sorted) starting at offset 56, then raw little-endian f32 planes laid
   out `[level][y][x]`. f32 because GRIB packing precision is already below f32;
@@ -370,7 +458,12 @@ data_dir/
   (V1.3 phase E4b, GRIB template 3.40): nx,ny,lon1,la1,la2,dlon,scan,earth_shape,
   winds — the P_ny-root row-latitude table is DERIVED data recomputed bit-exactly
   from ny at read time (`gaussian_latitudes`) and deliberately NOT serialized).
-  Precomputed projection constants are rebuilt at read time, not stored. The
+  Precomputed projection constants are rebuilt at read time, not stored. Sealed
+  grid blobs additionally carry a 4-byte CRC trailer (V1.4 phase C),
+  discriminated from legacy unsealed blobs BY LENGTH — stripping the trailer
+  must decode as legacy, which IS the warm-boot contract; `GRID_VERSION`
+  therefore also stays 3 (`grid_bin_crc.rs`; hostile lambert blobs are rejected
+  by name, not by panicking — §22 there). The
   bump 1→2 exists because the Lambert block gained those axes: a store written
   before V1.1 phase 4 cannot represent a file that declared its own spheroid, so
   refusing beats silently re-projecting it on a guessed earth. The bump 2→3
@@ -399,9 +492,13 @@ data_dir/
 * `manifest.json` is human-facing inventory; the index is authoritative. Per
   field it records `units`, `stat_processed`, `stat_kind`, `levels`, decimal
   `forecast_hours` (informational only — the filename is the exact key) and
-  `stat_ranges`, one entry per statistically processed forecast hour:
-  `{"fh_secs":1800,"begin":"2026-10-19T12:30:00Z","end":"2026-10-19T13:00:00Z",
-  "step_secs":0}`. Two accumulations of ONE parameter have DIFFERENT windows,
+  `stat_ranges`, one entry per statistically processed forecast hour — e.g.
+  the 30-minute ACCUMULATION of `frac_small.grib2` (run 12Z) records
+  `{"fh_secs":1800,"begin":"2026-10-19T12:00:00Z","end":"2026-10-19T12:30:00Z",
+  "step_secs":0}`: since V1.4 phase W accumulation windows are `[end − len,
+  end]` clamped at the run start, while averages/max/min keep the forward
+  `[fc, fc + len]` (§3 note above; docs/DECISIONS.md §20). Two accumulations
+  of ONE parameter have DIFFERENT windows,
   which is why the range travels with the forecast hour rather than the field.
   SINCE V1.3 PHASE E0 THIS FILE IS PURELY OPERATIONAL INVENTORY: a warm start
   reads the guard AND the per-fh windows back from each field file's own header
@@ -412,7 +509,12 @@ data_dir/
   `corrupt_manifest_boot_is_loud_counted_and_still_answers_right`). A FAILED
   manifest write likewise blocks the source file's ingested-record, so the
   next scan round retries until inventory catches up
-  (`manifest_write_failure_blocks_state_record_and_retries_next_round`).
+  (`manifest_write_failure_blocks_state_record_and_retries_next_round`). A
+  PERSISTENT manifest-write failure is BOUNDED (V1.4 phase B2): after 3
+  consecutive failed rounds for one content the source file's record is marked
+  REC_OK anyway, with one counted error and a loud note — safe because the
+  accumulation guard lives in the `.bin` headers, never in this file
+  (`manifest_fail_bound.rs::persistent_manifest_failure_is_bounded_and_records_ok_after_three_rounds`).
 * Retention: runs beyond `retention_runs` are removed from the in-memory index
   first, then deleted on disk; stale mmap handles stay valid until their last
   `Arc` reference drops (Linux unlink-while-mapped), so in-flight queries never
@@ -442,7 +544,35 @@ data_dir/
   escalation of five consecutive unreadable rounds and self-clears once the file
   is readable again; saves are DIRTY-GATED and batched (once per decode chunk +
   round end), so a crash loses at most one unfinished chunk's records — those
-  re-ingest idempotently.
+  re-ingest idempotently. V1.4 phase B2 STATE OPS: an UNPARSABLE `files.json`
+  no longer kills boot — it is renamed aside to `files.json.corrupt.<UTC-stamp>`
+  (bytes preserved for forensics, parser complaint kept verbatim in the
+  warning), boot continues with EMPTY state plus one loud note naming both
+  paths, costing exactly one idempotent re-ingest; well-formed LEGACY docs keep
+  the E3b version-gate discard path untouched (`corrupt_state_quarantine.rs`).
+  A state file that cannot be READ at all (permissions/EIO — corrupt-but-
+  readable is the branch above) takes the "no state yet" path: boot proceeds
+  empty, but the file is neither quarantined nor named (§9 residual). BEFORE
+  loading state, `Pipeline::open` takes an ADVISORY single-instance `flock(2)`
+  on `<data_dir>/state/.wxpoint.lock`: a second PROCESS pointed at the same
+  data_dir is refused at startup (two writers would race state saves, retention
+  deletions and atomic renames); the lock is REF-COUNTED PER PROCESS, so
+  several pipelines inside ONE process may share a data_dir deliberately
+  (`data_dir_guard.rs`). Unwritable or non-directory `data_dir` fails FAST at
+  open — the exit-3 path (§1) — instead of limping half-ingested.
+* **Geometry cross-validation at EVERY index build — warm load AND ingest
+  publish (V1.4 phases C/C2).** Each field-file header is checked against its
+  run's grid geometry (extent, scan flag vs the grid definition). Outcomes are
+  class-named and surgical, never silent and never collateral: a header whose
+  extent disagrees is skipped PER SLOT while the rest of the run keeps serving;
+  a rotted scan-mode flag is named and dropped per slot; a grid that cannot be
+  projected withholds EXACTLY its own run and nothing else. The clean case
+  costs NOTHING: the validated snapshot comes back as the SAME `Arc`, zero
+  clone zero alloc (`geometry_xval.rs`, `geometry_xval_ingest.rs`;
+  docs/DECISIONS.md §22). Degenerate LCC constructions now surface as a typed
+  `GridError` — the crate's last input-dependent unwrap — and infallible sites
+  POISON (loud, model marked unhealthy) instead of aborting under
+  `panic = "abort"`.
 
 ## 5. Interpolation semantics (exactly as implemented)
 
@@ -457,7 +587,11 @@ return f64.
    GAUSSIAN template 3.40 since V1.3 E4b: i exactly like regular lat/lon
    incl. seam wrap, j by binary search in the precomputed P_ny-root row table
    with LINEAR interpolation in j between neighbouring rows — spec §6.1 works
-   in grid-index space, identical rule to the other grids). Exactly
+   in grid-index space, identical rule to the other grids; V1.4 phase R: the
+   regular/gaussian lon-delta uses `rem_euclid`, so columns EAST of the
+   antimeridian on a NON-wrapping grid whose longitudes cross it resolve to
+   their true column instead of answering 422 `out_of_domain` — global
+   `lon1 = 0` grids are provably unchanged). Exactly
    on a node (within 1e-9 grid units) returns that node's value exactly, no
    blending. Outside the node rectangle (incl. the last half-cell at
    non-wrapping edges) → 422 `out_of_domain`; never extrapolated. On gaussian
@@ -510,7 +644,11 @@ return f64.
    with the same guard (naming the first processed hour) instead of silently
    trying older runs. `time_interp=none` outranks the guard (422
    `time_exact_only`). A valid time outside every run's stored hours → 404
-   `no_run_covers`.
+   `no_run_covers`. Separately, since V1.4 phase W the STORED WINDOW metadata
+   of accumulations is `[end − len, end]` clamped at the run start while
+   averages/max/min keep the forward `[fc, fc + len]`; that moved stored and
+   manifest windows only, never query answers, because the guard above keys off
+   exact forecast hours (docs/DECISIONS.md §20).
 
 ## 6. Ingest pipeline
 
@@ -876,18 +1014,20 @@ materially; the §8 margin (≤10 µs bucket vs 50 µs target) stands without an
 ## 8. Correctness map (spec §9 items 1..9)
 
 Every spec-mandated verification, as a named test with its truth source and
-tolerance. All green in the V1.2 phase-D sweep (`cargo test --workspace`: 153 tests,
-0 failed, twice back-to-back; `scripts/smoke.sh`: SMOKE PASS, 17 probes replayed,
-0 failures).
+tolerance. All green in the V1.4 gate run (this machine, 2026-10-24):
+`cargo test --workspace` 329 passed / 0 failed / 0 ignored across 112 test
+binaries + 3 doc-test targets (warm wall 2 m 28 s); `cargo clippy --all-targets
+-- -D warnings` zero diagnostics; `scripts/smoke.sh` SMOKE PASS, 17 probes
+replayed, 0 failures, avg point-query 25.7 µs over its 422 correctness probes.
 
 | # | Spec requirement | Test(s) | Truth source | Tolerance |
 |---|---|---|---|---|
 | 1 | Exact grid points match `wgrib2 -lon` / `grib_get_data` on real files | `gfs_wgrib2_point_checks`, `hrrr_nearest_node_matches_wgrib2` (nearest-node for LCC nodes), `perf_gfs_hour_ingest_and_query`; smoke `probes.tsv` replay + `point_endpoint_truth_table` | **wgrib2-generated synthetic fixtures** (see the note under this table): wgrib2 `-lon` output captured into the tests; `tests/perfdata/probes.tsv` generated with the perf dataset by `gen_perfdata.sh`/`validate_perf.py` | exact for values chosen exact-in-f32; otherwise ≤1 ulp of f32 |
-| 2 | LCC lat/lon → (i,j) matches wgrib2/pyproj at corners, centre, ≥20 random points | `lcc_matches_wgrib2_ll2ij`, `lcc_corner_center_coverage`, `lcc_inverse_roundtrip`, `oblate_projection_matches_wgrib2_ll2ij` | wgrib2 `-ll2ij` on `hrrr_small.grib2` (CT 3.2 = 6 sphere) and `hrrr_ellip_small.grib2` (CT 3.2 = 3 inline WGS 84 axes); pyproj cross-check via `scripts/validate_rotation.py` | ≤1e-4 grid units |
-| 3 | Rotated HRRR U/V match `wgrib2 -new_grid_winds earth` | `rotation_matches_pyproj_within_1e_6_deg`, `rotation_equals_convergence_relation_of_own_projection`, `rotation_shape_axes_are_distinct_earths`, `hrrr_rotation_invariants`, `oblate_rotation_and_inverse_roundtrip_at_nodes` | **golden blocked here** (IPOLATES Fortran-only, see §9); replaced by independent pyproj conformal angles for BOTH earth shapes: `scripts/validate_rotation.py` → `tests/fixtures/rotation_expected.csv` (42 rows), plus the identity β = 90 + n·(λ−LoV) relation of our own cone math | ≤1e-6 deg (observed worst **4.80469e-11 deg** this sweep); identity relation ≤1e-12 deg |
+| 2 | LCC lat/lon → (i,j) matches wgrib2/pyproj at corners, centre, ≥20 random points | `lcc_matches_wgrib2_ll2ij`, `lcc_corner_center_coverage`, `lcc_inverse_roundtrip`, `oblate_projection_matches_wgrib2_ll2ij`; since V1.4 phase T additionally pinned FULLY OFFLINE (no `tools/wgrib2` needed): `lcc_projection.rs::lcc_corner_and_center_nodes_match_pyproj_truth_1e_4` (embedded pyproj truth rows: corners, centre, random) + negative-lon-form and self-round-trip pins | wgrib2 `-ll2ij` on `hrrr_small.grib2` (CT 3.2 = 6 sphere) and `hrrr_ellip_small.grib2` (CT 3.2 = 3 inline WGS 84 axes); pyproj truth EMBEDDED in the offline pins, plus cross-check via `scripts/validate_rotation.py` | ≤1e-4 grid units (offline pins observed worst **1.9e-8**) |
+| 3 | Rotated HRRR U/V match `wgrib2 -new_grid_winds earth` | **PROVEN against an EXTERNAL golden (V1.4 phase X):** `rotation_vs_ipolates.rs::hrrr_rotation_matches_ipolates_golden_synthetic` (ALL nodes of both records, node-for-node vs the committed golden) and `..._golden_real_bytes` (REAL HRRR CONUS, 1,905,141 nodes; skips cleanly while gitignored `tests/realdata/hrrr_real_{uv,earth}.grib2` are absent); flag audit `wind_component_flags.rs` (Code Table 3.3 bit 0x08 per message vs stock `wgrib2 -V` + raw-octet anchor). SUPPORTING evidence retained (ANGLE-only, necessary-but-insufficient — see §12): `rotation_matches_pyproj_within_1e_6_deg` (≤4.8e-11 deg), convergence-relation and distinct-earth-shape checks, plus the retargeted internal invariants `hrrr_rotation_invariants` (compose-with-inverse round trip + magnitude preservation, cross-cited to the golden) | **committed external golden** `tests/fixtures/hrrr_ipolates_earth.grib2` (+ `.PROVENANCE.txt`): identity-resolution neighbor regrid by a LOCALLY BUILT wgrib2 v3.1.3+IPOLATES (`scripts/build_wgrib2_ipolates.sh`), golden decoded AS-IS by our own §9.1-pinned decoder (its flag byte says the values are already earth-relative) | floor = the golden's own g2clib complex-packing repack quantum: synthetic worst rel **4.6869e-5** / angle residual **3.553e-3 deg**; real bytes worst \|du\|,\|dv\| ≤ **3.125e-2 m/s**, strong-wind (\|w\|≥5 m/s) direction ≤ **0.488 deg**; the pre-fix reflection failed these SAME assertions at **120.80 deg / 179.97 deg** (docs/DECISIONS.md §21) |
 | 4 | Bilinear / vertical / time reproduce analytic fields exactly | `affine_exact_interior`, `exact_node_bitexact`, `bilinear_kernel_affine_nan`, `vertical_gap_bracket`, `time_guard_stat_and_none`, `empty_field_never_brackets`, `e2e_roundtrip_through_index`, `fractional_hours_storage_and_manifest`, `fractional_hours_queries_and_run_selection` | synthetic grids whose fields are affine in x,y,p,t (answers known analytically) | bit-exact (no blending on exact nodes; bracket selection identical to the reference implementation in `alloc_free_kernels.rs` / `alloc_free_select.rs` randomized sweeps) |
-| 5 | GFS seam at lon 359.9 / −0.1 / 0.0 interpolates across 359.75→0 | `seam_blend_values`, `horiz_nodes_wrap_indices`, `gfs_seam_through_http`; smoke probe `lat=0.125&lon=359.9` (+ negative-lon probe) | analytic values on a wrapping regular grid + wgrib2-derived perf probes | bit-exact / f32 rounding |
-| 6 | Poles and domain edges defined and tested | `poles_global_grid` (lat ±90 on a global regular grid: exact node row, no wrap artefacts), `out_of_domain_edges` (west/east/south edges incl. "a hair outside"), smoke HRRR edge probe (`lat=59.0` → 422) | defined semantics (node rectangle, never extrapolate) on synthetic grids; real-file caveat in §9 | n/a — behaviour is defined, asserted exactly |
+| 5 | GFS seam at lon 359.9 / −0.1 / 0.0 interpolates across 359.75→0 | `seam_blend_values`, `horiz_nodes_wrap_indices`, `gfs_seam_through_http`; since V1.4 phases R/T the seam also runs through HTTP WITHOUT `tests/perfdata`: `seam_small_http.rs::gfs_seam_blend_pair_norm_and_stacks_through_http`, `gfs_seam_exact_node_at_lon_zero_spec_expected`, `gfs_beyond_the_last_east_node_column_stays_out_of_domain` (over the small gfs fixture; R's `rem_euclid` fix was found by T's probing); smoke probe `lat=0.125&lon=359.9` (+ negative-lon probe) | analytic values on a wrapping regular grid + wgrib2-derived perf probes | bit-exact / f32 rounding |
+| 6 | Poles and domain edges defined and tested | `poles_global_grid` (lat ±90 on a global regular grid: exact node row, no wrap artefacts), `out_of_domain_edges` (west/east/south edges incl. "a hair outside"), smoke HRRR edge probe (`lat=59.0` → 422); since V1.4 phase T OFFLINE LCC-domain pins on HRRR-like geometry: `lcc_out_of_domain.rs` — four edges reject-a-hair-outside/accept-a-hair-inside, last-half-cell rule, corner diagonals, eps band at the declared NW corner, poles out-of-domain, both lon conventions around the domain | defined semantics (node rectangle, never extrapolate) on synthetic grids; real-file caveat in §9 | n/a — behaviour is defined, asserted exactly |
 | 7 | Masked points return `null`, never a blended number | `nan_neighbor_missing_data`, `masked_points_are_nan_for_every_codec`, `bilinear_kernel_affine_nan` | fixture bitmap masking every 97th node, re-checked through all seven packings | must be exactly `null` + `missing_data` (NaN positions preserved per codec) |
 | 8 | Time interpolation of accumulations is rejected | `stat_small_messages`, `stat_point_checks`, `jpeg_twin_keeps_pdt48_metadata_and_values`, `time_guard_stat_and_none`, `error_status_table` (422 `stat_time_guard`), `fractional_hours_over_http` guard cases | PDT 4.8 fixtures `stat_small.grib2` (+ JPEG twin) validated against wgrib2 readback/checksums | n/a — status/token equality |
 | 9 | Ingest under hammering queries: no error, no partial data | `concurrent_publishers_and_readers_never_tear`, `ingest_churn_vs_queries_http`, `retention_evicts_after_publish_stale_snapshot_still_reads` | invariant assertions over live publish/evict churn (zero 5xx, zero torn JSON bodies, settled-state batch proves transient 422s disappear) | n/a — invariants; the transient-422 window CLOSED at file granularity in V1.2-B (`fin[5] == 0` pinned) |
@@ -914,7 +1054,15 @@ HGT/TMP probes through the full ingest+index path against recorded
 `wgrib2 -lon` values, plus the 212-byte degenerate APCP and HRRR node
 probes); without it they skip cleanly, so CI stays offline. Recorded probes
 and the full diagnosis: docs/DECISIONS.md §15 (E4a), §16 (E4b grid
-acceptance) and §17 (E4c hybrid acceptance table).
+acceptance) and §17 (E4c hybrid acceptance table). One gap to state plainly:
+the REAL-BYTES half of the §8 row-3 rotation gate (V1.4 phase X) needs
+`tests/realdata/hrrr_real_uv.grib2` + `hrrr_real_earth.grib2`, and
+`fetch_real_sample.sh` does NOT produce them — they come from the IPOLATES
+repro flow (`.idx`+HTTP-range extraction of UGRD/VGRD f000 bytes, then the
+identity-resolution regrid recorded in
+`tests/fixtures/hrrr_ipolates_earth.PROVENANCE.txt`; the generating binary can
+be rebuilt with `scripts/build_wgrib2_ipolates.sh`). Without those two files
+the real-bytes gate skips cleanly and only the committed synthetic golden runs.
 
 **Consolidated live acceptance harness (V1.3 phase E5, MANUAL/NETWORK, never
 CI):** `scripts/realdata_acceptance.sh` wires everything end to end in one
@@ -926,8 +1074,12 @@ every fetched slice; server shutdown is trapped, any failed pin exits
 non-zero. The probes validate against expectations derived INDEPENDENTLY of
 our Rust path: real HRRR wind rotation (section-3 component flag byte read
 from bytes; raw grid-relative U/V printed by `wgrib2 -lon`; cone angle
-measured by pyproj via the E-era `validate_rotation.py` chain since this
-wgrib2 build has no IPOLATES `-wind`), real same-run time interpolation
+measured by pyproj via the E-era `validate_rotation.py` chain — the stock
+`tools/wgrib2-full` this harness calls still has no IPOLATES, so the harness
+cannot print earth-relative values itself; the golden-class VALUE comparison
+lives in the committed `rotation_vs_ipolates` gates (§8 row 3), whose
+generating binary can be rebuilt with `scripts/build_wgrib2_ipolates.sh`),
+real same-run time interpolation
 blends of 2 m TMP across fh {0,6,12}, and production PDT 4.8 metadata +
 guards straight off operational bytes (`/v1/inventory` stat flags, 422
 `stat_time_guard`). What stays in CI: everything network-free — the synthetic
@@ -964,7 +1116,12 @@ production-scale realistic GFS-like dataset, 6 files x 148 records, validated
 against wgrib2), `scripts/gen_fixtures.sh` + `scripts/regen_expected.sh`
 (small fixtures incl. all packing twins, idempotent), `scripts/validate_rotation.py`
 (expected-angle table), `scripts/validate_rotation_wgrib2.sh` (stub that runs the
-IPOLATES golden where it is available), and `scripts/fetch_real_sample.sh`
+IPOLATES golden where a matching binary exists) and
+`scripts/build_wgrib2_ipolates.sh` (OPTIONAL, V1.4 phase X: headless recipe —
+network + `apt-get download`, no root — that rebuilds the wgrib2+IPOLATES
+golden GENERATOR and regenerates the §9.3 golden under `REGEN=1`; nothing in
+CI or the test suite needs it because the golden is committed), and
+`scripts/fetch_real_sample.sh`
 (MANUAL ONLY: `.idx`-guided HTTP-Range slices of live NOMADS GFS/HRRR products
 into gitignored `tests/realdata/`, verified for GRIB magic + trailing `7777`
 and checksummed; idempotent — existing complete files are kept, not refetched;
@@ -1080,14 +1237,25 @@ live in §10 and docs/DECISIONS.md.
     (`wxpoint_skip_coordlists_total` / `wxpoint_skip_grid_total` /
     `wxpoint_skip_pdt_total`), making product-line coverage gaps visible on
     `/metrics` without reading logs (docs/DECISIONS.md §15).
-* **§9.3 wind-rotation golden is environment-blocked here.** `wgrib2 -new_grid_winds
-  earth` refuses on this machine ("IPOLATES package is not installed") and no
-  Fortran/transpiler toolchain exists to rebuild it with IPOLATES. The spec's
-  golden is replaced by the dual-earth-shape pyproj cross-check described in §8
-  row 3 (worst observed delta 4.8e-11 deg against a 1e-6 deg tolerance);
-  `scripts/validate_rotation_wgrib2.sh` prints how to run the real golden on a
-  machine whose wgrib2 links IPOLATES. Full rationale: docs/DECISIONS.md (phase
-  4 "Remaining §9.3 deviation").
+* **§9.3 wind-rotation golden: RESOLVED (V1.4 phase X; replaces the old
+  "environment-blocked" bullet).** The blocked premise turned out to be
+  surmountable without root: a wgrib2 v3.1.3 build linked against IPOLATES
+  (USE_IPOLATES=3, double-precision ip2lib_d) was produced here by extracting
+  gfortran debs into a merged fakeroot, and its `-new_grid_winds earth` output
+  became the committed golden `tests/fixtures/hrrr_ipolates_earth.grib2`
+  (+ `.PROVENANCE.txt`). §8 row 3 is now PROVEN against that external truth —
+  and in the process the golden exposed a P0 rotation defect (docs/DECISIONS.md
+  §21, changelog §12). Honest residuals that REMAIN: (i) the REAL-BYTES half of
+  the gate activates only when `tests/realdata/hrrr_real_{uv,earth}.grib2` are
+  installed by the repro flow — `fetch_real_sample.sh` does NOT create them, so
+  out of the box only the synthetic-fixture half runs; (ii) IPOLATES supports
+  LAMBERT ON THE SPHERE ONLY (it rejects oblate inline-axis grids outright), so
+  the `hrrr_ellip_small` family can NEVER be validated through this particular
+  tool — those angles stay pinned via pyproj; (iii) regenerating the golden
+  needs network + apt downloads (`scripts/build_wgrib2_ipolates.sh`), which is
+  fine because regeneration is optional, not a test dependency; (iv) the golden
+  file itself was re-packed by g2clib complex1 auto-scaling, so comparisons
+  carry its repack quantum (floors printed in §8 row 3), not bit-exactness.
 * **Poison quarantine (V1.2 phase B; CONTENT errors only since V1.3 phase E3a).**
    A file whose decode FAILS ON CONTENT is recorded in the
    persistent ingest state WITH its content hash (`kind=FAILED`), so an identical
@@ -1119,6 +1287,46 @@ live in §10 and docs/DECISIONS.md.
    idempotently (merge dedup + atomic renames). A failed save keeps the store
    dirty, logs loudly and counts one error WITHOUT blocking ingestion; the next
    opportunity retries (`state_batching.rs`, `restart_midchunk.rs`).
+* **The single-instance lock is ADVISORY (V1.4 phase B2).** `flock(2)` on
+   `<data_dir>/state/.wxpoint.lock` refuses a second PROCESS on the same host
+   (and dies with its fd, so a crash leaves nothing to clean up), but flock
+   semantics on NFS-mounted data dirs depend on mount options and the lock
+   daemon — do NOT run two instances against one shared-NFS data_dir and treat
+   the lock as coordination; it exists to stop accidental double-deploys of the
+   unit (`data_dir_guard.rs`, deploy/README.md).
+* **notify is an old release series (workspace pins `^3.0` → 3.0.1).** The
+   LIVE subscription is proven working (phase N: drop → queryable 0.29–0.31 s,
+   ≤200 ms debounce per watch, watcher-start asserted because zero handles
+   would mean silent degradation), but fossil-series caveats stay real: event
+   queues arrive CLUSTERED and can overflow under bursty delivery, and network
+   mounts may deliver NO events at all — discovery then degrades to
+   `scan_interval_secs` EXACTLY as designed, which is why the periodic full
+   scan remains the authoritative fallback (spec §4.1) rather than an
+   optimization.
+* **Model names: charset is enforced, case-collision is not.** `[A-Za-z0-9_-]+`
+   kills traversal and tooling-breakers (§2), but two models differing only in
+   CASE (`Gfs` vs `gfs`) get separate directories on a case-sensitive mount and
+   ONE shared tree on a case-insensitive one, where they would fight over
+   retention and state. Config validation cannot portably know the mount's
+   rules; keep model names distinct beyond mere case.
+* **Metric status labels are CLASS-level.** `wxpoint_queries_total{status=…}`
+   counts 2xx/4xx/5xx, not exact codes: separating e.g. 404 from 422 rates
+   needs the logs. Deliberate flat-label choice (per-token label cardinality
+   was rejected); latency detail lives in the µs histogram, not per-status.
+* **Sub-window accumulation shape has no fixture (V1.4 phase W).** The
+   corrected rule for `fc > len` accumulations (window `[end − len, end]`,
+   the WMO/NCEP convention — think a 1-hour window ending at fh 6) is
+   implemented, but every local fixture either clamps at fh 0 or uses forward
+   windows, and the live HRRR WIND-max pin exercises the FORWARD branch. The
+   sub-window path therefore rests on the octet-level wgrib2 proof in
+   docs/DECISIONS.md §20 plus parse-level tests, not an end-to-end fixture.
+* **Third-party codec internals still parse untrusted bytes (V1.4 phase B1
+   residual).** Our bounds pre-checks cap what the JPEG2000/PNG/AEC backends
+   (hayro, zlib-rs + our chunk layer, rust-aec) are handed, and the seeded
+   corruption sweep (3720 bit-flips + 186 truncations, zero panics) found no
+   residual abort — but that is EMPIRICAL coverage, not a proof about code we
+   do not own. Any late abort outside our guards is absorbed by process
+   supervision (deploy/), not prevented by construction.
 * **Retention skip (V1.2 phase C).** A candidate whose SECTION-1 reference time is
    older than the newest `retention_runs` runs is NOT decoded: it is PEEKED (sections
    1 only), noted once per (path, content hash) and counted in
@@ -1144,12 +1352,20 @@ live in §10 and docs/DECISIONS.md.
    ingest thread AND the startup preflight infinitely). A hard
    `WALK_MAX_PATHS = 1_000_000` cap bounds even worse shapes per round, noted
    once; the next scan round resumes (`symlink_walk.rs`).
-* **A missing `grid.bin` is loud but non-destructive (V1.3 phase E3b).** A run
-   dir whose grid file is absent/unreadable gets ONE "MISSING GRID" note per
-   rebuild + one `errors` increment and stays OUT of the index until its source
-   re-delivers; unlike the CORRUPT-grid upgrade trap it is NOT auto-deleted —
-   nothing is wrong to repair, something is merely absent, and deleting could
-   race a producer mid-write at boot (`missing_gridbin.rs`).
+* **A lost `grid.bin` AUTO-HEALS within two scan rounds (V1.4 phase B2;
+  supersedes E3b's "until its source re-delivers" promise, which never held in
+  a static ingest dir).** When a run dir fails to load because `grid.bin` is
+  missing/unreadable, the model's `(model, path)` state records under that
+  ingest dir are FORGOTTEN so the next round re-decodes from source (the same
+  idempotent machinery as the storage-format recovery traps), and an
+  EXISTING-but-unreadable husk is removed FIRST so the cold writer (which
+  emits `grid.bin` only when stat says absent) is not blocked forever. The
+  rewrite is byte-identical (`encode_grid` is pure), the run tree itself is
+  KEPT (field `.bin` headers are durable and validated at open), and the heal
+  is logged LOUDLY (`gridbin_autoheal.rs::missing_grid_bin_heals_within_two_rounds_and_rewrites_it_byte_identical`).
+  Residual: if the SOURCE files were pruned upstream there is nothing to
+  re-decode from and the run stays gone — loudly, same rule as every other
+  recovery trap.
 * **Exit codes** (`crates/wx-server/src/main.rs`) — honest assertion ledger,
    updated V1.3 phase E6 (the old "asserted nowhere" sentence was stale):
    `0` normal shutdown; `2` usage error (no `--config`, no `WXPOINT_CONFIG`) —
@@ -1162,9 +1378,13 @@ live in §10 and docs/DECISIONS.md.
    not be bound — ASSERTED since E6 (`an_unbindable_address_exits_six`); `7`
    PROVISIONAL post-boot wind enforcement fired — ASSERTED both halves
    (rc==7 with default enforce, plus rc==124 timeout-negative control with
-   `wind_pair_enforce=false`, violation note required in both). STILL WIRED
-   BUT UNTESTED (hard to force from a black-box spawn): `3` pipeline-init
-   failure, `5` tokio-runtime init, `8` HTTP server error.
+   `wind_pair_enforce=false`, violation note required in both). `3`
+   pipeline-init failure: since V1.4 phase B2 the INIT PATH ITSELF is pinned
+   at the `Pipeline::open` boundary — unwritable/non-directory `data_dir` and
+   a refused single-instance flock all fail fast with named errors
+   (`data_dir_guard.rs`) — though a full spawn-to-rc3 black-box harness is
+   still absent. STILL WIRED BUT UNTESTED end-to-end: rc 3 via process spawn,
+   `5` tokio-runtime init, `8` HTTP server error.
 * **Residual publish window (per-file granularity).** Because visibility flips once
   per SOURCE FILE, a scan round that consumes several files can momentarily expose
   one forecast hour without the next (normal: products DO arrive hour by hour) or
@@ -1218,17 +1438,11 @@ live in §10 and docs/DECISIONS.md.
   a pinned `GFS_YMD`, and live NOMADS data ROLLED OVER between sessions once
   (docs/DECISIONS.md §18 drift lesson) — refetch with explicit `GFS_YMD`/`GFS_HH`
   when the default day ages out.
-* **Percent-decoding is deliberately narrow (V1.3 phase E6).** Only `%3A`/`%3a`
-  and `%2C`/`%2c` inside `level` and `param` VALUES decode (§3). Every other
-  encoding stays literal BYTES: `%2B` is not `+`, `%20` is not a space, and a
-  fully-URL-encoded timestamp (`valid=2026-10-19T18%3A00%3A00Z`) answers 400
-  `bad_time` — curl's default sends bare colons, only aggressive encoders hit
-  this, and the escape hatch is documented rather than silently widened because
-  decoding `+` (form encoding) would change existing 404-class behaviour.
 * **Real-data gate cost when enabled.** With `tests/realdata/` populated the
   slice-decode gates re-decode live GFS/HRRR bytes, which is compute-heavy;
   since the `[profile.test] opt-level = 3` change a warm `cargo test` run
-  measures 2 m 21 s (was ~57 min at opt-level 0, AUDIT_1.3 P2). The first
+  measures 2 m 21 s (was ~57 min at opt-level 0, AUDIT_1.3 P2; the final V1.4
+  tree with phases A–X added measures 2 m 28 s, §1). The first
   run after the bump pays a one-time O3 rebuild of the dependency tree
   (~24 s). CI without those files skips them cleanly in seconds
   either way. `cargo test --release` remains valid but is no longer necessary
@@ -1339,7 +1553,8 @@ changes over V1.2:
   always staleness, never latency) and the TRUE latency pair
   `wxpoint_ingest_publish_latency_seconds` / `_max` added (file mtime →
   publish completion, wall-vs-wall, last + lifetime max); targeted
-  `%3A`/`%2C` decoding inside level/param values (§3, §9); exit-code ledger
+  `%3A`/`%2C` decoding inside level/param values (§3, §9; superseded by V1.4
+  phase A's uniform decode — §12); exit-code ledger
   completed with rc==4 and rc==6 black-box assertions; the clippy
   all-targets surface went from 229 abort-truncated (~623 full-surface
   mid-flight) to ZERO diagnostics on both gate forms with all affected test
@@ -1349,3 +1564,90 @@ V1.2-era changes (per-file publish granularity, chunked decode pipeline,
 retention-aware skipping, once-only operator logs) are summarized in §7.4
 and in §9/§10's supersession notes, with full detail in docs/DECISIONS.md's
 V1.2 sections.
+
+---
+
+## 12. Release notes (V1.4) — 2026-10-24
+
+An audit-driven hardening wave (AUDIT_1.3) plus one P0 found only by external
+truth. One line per merged phase (hashes from `git log --oneline`); decision
+records: docs/DECISIONS.md §20 (W), §21 (X), §22 (C+C2, backfilled by phase D
+because C shipped without one) — the remaining phases carry their full reasoning
+in the red-first test-file headers and commit messages. Gate numbers for the
+whole wave are in §1.
+
+* **`8403ebd` phase 0** — `[profile.test] opt-level = 3`: warm suite wall
+  ~57 min → 2 m 21 s (realdata gates were decoding at opt-level 0); `b30d156`
+  keeps the AUDIT file local per the audit-file convention.
+* **`9adc53a` phase A** — uniform single-pass percent-decoding of EVERY query
+  value (supersedes E6's two-escape carve-out; fully encoded timestamps were
+  locked out at 400): `+` stays literal BY DESIGN, `%%` yields a literal `%`,
+  decoding happens exactly once, malformed escapes become the typed 400 token
+  `bad_percent_escape`; hand-built JSON echoes of client strings are now all
+  properly escaped; SIGTERM/SIGINT drain to exit 0 ("server stopped");
+  pinned-run and multi-param semantics pinned (`client_compat.rs`).
+* **`5794787` phase B1** — decoder bounds pre-checks (section-5/7 scalar
+  trust: get_bits-class slice indexing, bitmap length, PNG IHDR upfront
+  allocation, run-length mvl, complex group-walk) + `MAX_GRID_POINTS = 1<<26`
+  ceiling; the anti-abort net `corruption_sweep.rs`: 3720 seeded bit-flips
+  over 31 fixtures + 186 tail-truncation cuts, ZERO panics (pre-fix classes
+  included a forged 176 GB allocation through the JPEG2000 backend).
+* **`22e80b5` phase B2** — `grid.bin` AUTO-HEAL within ≤2 scan rounds (the E3b
+  "wait for re-delivery" promise never held: the source kept its OK record);
+  corrupt `files.json` QUARANTINED to `files.json.corrupt.<stamp>` with boot
+  continuing empty (was: exit-3 death loop until a human ran `rm`);
+  unwritable/non-dir `data_dir` fails fast at open (exit-3 path); advisory
+  single-instance flock with per-process refcount; model names
+  `[A-Za-z0-9_-]+`; persistent manifest failure bounded at 3 rounds then
+  REC_OK + error + note; publish-latency gauge pin.
+* **`b49d006` phase T** — OFFLINE LCC domain tests (four edges half-cell rule,
+  corner diagonals, pole rejection, both lon conventions) + corner/center
+  pyproj truth pins, worst 1.9e-8 grid units vs the 1e-4 bar; additive only —
+  and T's probing FOUND the defect R fixes.
+* **`020e4c2` phase R** — regular/gaussian lon-delta via `rem_euclid`: columns
+  EAST of the antimeridian on non-wrapping grids crossing it no longer answer
+  422 `out_of_domain`; global `lon1 = 0` grids provably unchanged; seam
+  through HTTP now exercised WITHOUT `tests/perfdata` (`seam_small_http.rs`).
+* **`d4271f8` phase W** — PDT 4.8 statistical windows stored TRUTH-SHIFTED:
+  accumulations carry `[end − len, end]` clamped at the run start (the fh-6
+  APCP window 18Z→00Z became wgrib2's documented 12Z→18Z); averages/max/min
+  keep the forward window; octet-level wgrib2 proof precedes the fix; query
+  VALUES never moved because the guard keys off exact forecast hours (§20).
+* **`6e0359e` phase C+C2** — field-header CRC32 written into the reserved slot
+  at offset 52 (zero digest slot = legacy-unsealed, accepted and counted;
+  BIN_VERSION DELIBERATELY stays 2 because the recovery trap DELETES
+  version-mismatched dirs — a bump meant re-decoding every store); grid.bin
+  CRC trailer discriminated by length; geometry cross-validation at BOTH warm
+  load and ingest publish (clean case swaps the SAME Arc, zero alloc); typed
+  `GridError` for degenerate LCC — the crate's last input-dependent unwrap
+  (§22).
+* **`c94f1dc` phase N** — live-notify discovery smoke through the REAL inotify
+  subscription with the scan fallback pinned out at 3600 s: drop → queryable
+  0.29–0.31 s; sidecar marker → exactly one round (~0.29 s). Proves the
+  watcher path that every other test simulated by hand.
+* **`36360c0` phase X — THE P0.** `rotate_winds_to_earth` applied M1, a
+  REFLECTION (det −1) whose docstring called it "an orthonormal rotation":
+  never identity at LoV, and on S→N-scanned grids — every REAL HRRR file —
+  it mirrored winds up to 179.97° from truth while preserving magnitude,
+  so every wrong answer was a plausible wind speed in a mirrored direction.
+  Framed honestly: the existing angle pins were NECESSARY BUT INSUFFICIENT —
+  they validated β to 4.8e-11 deg and NOTHING downstream of it, and the
+  self-referential invariants (magnitude, involution — true of any reflection,
+  M1² = I — own-analytic blends) were structurally blind because they pinned
+  our matrix against itself. What caught it was an EXTERNAL golden: a locally
+  built wgrib2 v3.1.3+IPOLATES (no root; recipe now
+  `scripts/build_wgrib2_ipolates.sh`) whose `-new_grid_winds earth` output is
+  the PROPER rotation M2 (det +1, scan-independent plane-frame reading). The
+  golden is committed (`hrrr_ipolates_earth.grib2` + provenance sidecar) and
+  gates §9.3 PROVEN: synthetic worst rel 4.6869e-5 / 3.553e-3 deg (= the
+  golden's own repack quantum), real-bytes gate |du|,|dv| ≤ 3.125e-2 m/s and
+  strong-wind direction ≤ 0.488 deg over 1,905,141 real CONUS nodes when the
+  gitignored goldens are installed (§8 row 3, §21). Lesson recorded as policy:
+  invariants derived from our own transform cannot certify the transform
+  itself; §9.3-class goldens must be produced OUTSIDE the code path they
+  validate.
+
+Phase D (this commit) is documentation-only: §1 gate refresh, §8 truth-table
+upgrades (rows 2/3/5/6), the resolved-limitation sweep above, ops prose for
+A/B1/B2/C/C2/N (drain, flock, auto-heal, quarantine, xval), `deploy/` example
+unit, and the IPOLATES build recipe. No src/test files changed.

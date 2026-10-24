@@ -7,6 +7,13 @@ data_dir = "/var/lib/wxpoint"
 [ingest]
 scan_interval_secs = 30
 retention_runs = 4
+# Built-in grid ceiling (V1.4 phase B1): a message whose section-3 extent
+# exceeds MAX_GRID_POINTS = 1<<26 points (67,108,864) gets a typed reject the
+# content-hash quarantine machinery absorbs instead of an abort under the
+# release profile's panic=abort. Two orders of magnitude above the largest
+# shipping NCEP product (HRRR 3 km CONUS = 1,904,901), so no real producer
+# hits it. CONFIG PLUMBING IS DEFERRED ON PURPOSE: it is a compile-time
+# constant today (crates/wx-ingest/src/grib2.rs), NOT a key you can set here.
 # File-stability window: a candidate is eligible once its (size,mtime) has
 # stayed unchanged for >= stable_window_secs (default 10). Set 0 to require
 # only one re-observation on the next scan round.

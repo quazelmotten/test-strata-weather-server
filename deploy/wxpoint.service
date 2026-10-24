@@ -1,0 +1,40 @@
+# EXAMPLE unit file only — copy, adjust paths, then:
+#   systemctl daemon-reload && systemctl enable --now wxpoint
+# Rationale for every choice lives in deploy/README.md next to this file.
+# The service needs NO root: an unprivileged user suffices as long as it can
+# READ [ingest] model ingest_dirs and READ-WRITE [server].data_dir.
+
+[Unit]
+Description=wxpoint gridded weather point-query server
+Documentation=file:/usr/share/doc/wxpoint/README.md
+Wants=network-online.target
+After=network-online.target
+# Restart=always below is deliberate (panic=abort), so bound the loop: config
+# errors exit 1/2/4 deterministically and must not spin the CPU forever.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=wxpoint
+Group=wxpoint
+ExecStart=/usr/local/bin/wxpoint --config /etc/wxpoint/config.toml
+# SIGTERM (default KillSignal) is HANDLED since V1.4 phase A: the listener
+# stops accepting, in-flight requests drain, exit code 0. Give the drain a
+# hard backstop anyway:
+TimeoutStopSec=30
+Restart=always
+RestartSec=2
+# Pre-create data_dir with correct ownership BEFORE first boot: an unwritable
+# data_dir is a startup Err (exit 3 path) BY DESIGN (V1.4 phase B2), and
+# Restart=always would otherwise loop against it. StateDirectory gives us
+# /var/lib/wxpoint owned by wxpoint:wxpoint, matching the example config.
+StateDirectory=wxpoint
+# ConfigurationDirectory gives /etc/wxpoint; keep config.toml mode 0640 or
+# tighter if ingest paths are sensitive.
+ConfigurationDirectory=wxpoint
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
