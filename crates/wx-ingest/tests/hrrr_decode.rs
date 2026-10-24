@@ -138,16 +138,27 @@ fn hrrr_c3_twin_matches_simple() {
 #[test]
 fn hrrr_rotation_invariants() {
     // spec §9.3: rotated HRRR U/V must satisfy the physical invariants of the
-    // LCC rotation (validated independently of wgrib2 which lacks -new_grid
-    // in this nolib build): orthonormal map, magnitude preserved, reflection
-    // involution, and exact earth alignment on the LoV meridian.
+    // LCC rotation. V1.4 phase X rewrote the step from the reflection matrix
+    // [[sinB,cosB],[cosB,-sinB]] to the PROPER rotation M2 =
+    // [[sinB,-cosB],[cosB,sinB]] pinned by the wgrib2/IPOLATES golden
+    // (tests/fixtures/hrrr_ipolates_earth.grib2, see
+    // crates/wx-ingest/tests/rotation_vs_ipolates.rs). The old involution
+    // ("rotate twice == identity") was a property OF THE REFLECTION and is
+    // dead for proper rotations: what holds now is magnitude preservation,
+    // composition with the INVERSE angle recovers the grid components, and
+    // identity exactly at LoV.
     let r = decode_file(fixture_path("hrrr_small.grib2"), ParamFilter::All);
     match r {
         Err(_) => { panic!(); }
         Ok((msgs, _st)) => {
             let gd = &msgs[2].grid;
+            // V1.4 phase X: pair the REAL components (UGRD fh0 == msgs[2],
+            // VGRD fh0 == msgs[4]); the old code mixed msgs[2]/msgs[3] which
+            // are BOTH UGRD messages — harmless for the magnitude/involution
+            // properties it checked, but it made any value-level cross-pin
+            // against the earth-wind golden impossible.
             let u = &msgs[2].data;
-            let v = &msgs[3].data;
+            let v = &msgs[4].data;
             let pair = rotate_winds_to_earth(gd, u, v);
             let ue = pair.0;
             let vn = pair.1;
@@ -164,7 +175,9 @@ fn hrrr_rotation_invariants() {
             }
             // Independent validation (spec §9.3): for LCC grids the bearing of
             // +i must equal Snyder's convergence relation beta = 90 + n*(lon-LoV)
-            // (rows scan southward here, so +j ~ south). n from latin1/latin2.
+            // (n from latin1/latin2). The stored V axis is the projection-plane
+            // +y axis on EVERY scan mode (V1.4 phase X): this fixture scans N->S,
+            // which only reverses row ORDER and never reinterprets the vector.
             let d2r: f64 = 0.017453292519943296;
             let la1c: f64 = 26.5 * d2r;
             let la2c: f64 = 35.0 * d2r;
@@ -197,19 +210,27 @@ fn hrrr_rotation_invariants() {
                                 // the old finite-difference method).
                                 assert!(abs_diff(beta_w, 90.0 + gamma) <= 1e-9);
                                 // full rotation against the ANALYTIC beta at the
-                                // nearest node: catches formula/sign errors of any
-                                // kind (errors there are O(1e4), tolerance 5e-2 rel).
+                                // nearest node, using the M2 matrix the external
+                                // golden pins (errors of any sign/formula kind are
+                                // O(1e4), tolerance 5e-2 rel).
                                 let br = (90.0 + gamma) * d2r;
                                 let kk = ((dj + 0.5) as usize) * HNX + ((di + 0.5) as usize);
                                 let ug = u[kk] as f64;
                                 let vg = v[kk] as f64;
-                                let want_ue = ug * br.sin() + vg * br.cos();
-                                let want_vn = ug * br.cos() - vg * br.sin();
+                                let want_ue = ug * br.sin() - vg * br.cos();
+                                let want_vn = ug * br.cos() + vg * br.sin();
                                 let au = if ug < 0.0 { -ug } else { ug };
                                 let av = if vg < 0.0 { -vg } else { vg };
                                 let sc = if au > av { au } else { av };
                                 assert!(abs_diff(ue[kk] as f64, want_ue) <= 5e-2 * sc + 1.0);
                                 assert!(abs_diff(vn[kk] as f64, want_vn) <= 5e-2 * sc + 1.0);
+                                // cross-pin vs the IPOLATES golden: node k=(0,0)
+                                // fc 0 decodes from the golden as U=5580.1226
+                                // V=9071.116 (repack quantum ~1 unit).
+                                if kk == 0 {
+                                    assert!(abs_diff(ue[0] as f64, 5580.1226) <= 1.0);
+                                    assert!(abs_diff(vn[0] as f64, 9071.116) <= 1.0);
+                                }
                             }
                         }
                     }
@@ -217,12 +238,25 @@ fn hrrr_rotation_invariants() {
                 GridDef::Regular(_rg) => { panic!(); }
                 GridDef::Gaussian(_gg) => { panic!(); }
             }
-            // involution: rotating twice returns the grid components exactly
-            // (the change-of-basis matrix is symmetric orthogonal).
-            let pair2 = rotate_winds_to_earth(gd, &ue[0..ue.len()], &vn[0..vn.len()]);
+            // inverse composition: applying the SAME angle with the opposite
+            // handedness (M2 transpose) recovers the grid components exactly --
+            // the algebraic anchor that replaces the reflection-era involution
+            // pin, which proper rotations do NOT satisfy (double-applying M2
+            // rotates by 2*(beta - 90 deg), not 0).
             for k in 0 .. ue.len() {
-                assert!(abs_diff(pair2.0[k] as f64, u[k] as f64) <= 1e-2);
-                assert!(abs_diff(pair2.1[k] as f64, v[k] as f64) <= 1e-2);
+                let i = (k % HNX) as f64;
+                let j = (k / HNX) as f64;
+                let br = match gd {
+                    GridDef::Lambert(gl2) => { gl2.rot_angle_deg(i, j) * d2r }
+                    _ => { panic!(); }
+                };
+                let s = br.sin();
+                let c = br.cos();
+                // (u_g, v_g) = M2^T (u_e, v_n) = [[s, c], [-c, s]] (u_e, v_n)
+                let gu = ue[k] as f64 * s + vn[k] as f64 * c;
+                let gv = -ue[k] as f64 * c + vn[k] as f64 * s;
+                assert!(abs_diff(gu, u[k] as f64) <= 1e-2);
+                assert!(abs_diff(gv, v[k] as f64) <= 1e-2);
             }
         }
     }

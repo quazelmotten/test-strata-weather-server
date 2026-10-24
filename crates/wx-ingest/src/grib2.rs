@@ -2073,14 +2073,36 @@ pub fn decode_files_parallel(paths: Vec<String>, filter: ParamFilter) -> Vec<Res
 
 /// Rotate grid-relative components to earth-relative using the LCC rotation
 /// angle beta = bearing of the grid +i direction from true north (wx-core
-/// `GridLambert.rot_angle_deg`). Grid u is along +i, v along +j. With
-/// g_i = sin(beta) e_E + cos(beta) e_N and g_j = cos(beta) e_E - sin(beta) e_N
-/// (rows scan southward in GFS/HRRR convention):
-///     u_east  = u_g * sin(beta) + v_g * cos(beta)
-///     v_north = u_g * cos(beta) - v_g * sin(beta)
-/// This is an orthonormal rotation: magnitudes are preserved exactly up to
-/// float rounding. Regular lat/lon grids are returned unchanged (wgrib2
-/// treats their winds as earth-relative; documented decision).
+/// `GridLambert.rot_angle_deg`). THE V AXIS IS THE PROJECTION-PLANE +y AXIS,
+/// NOT THE STORAGE ROW-TRAVERSAL DIRECTION: template 3.30 defines the grid +j
+/// axis by Dy in PLANE coordinates, and the scanning-mode byte only chooses
+/// the ORDER rows are enumerated in (bit 0x40 set => rows stored S->N, i.e.
+/// storage j maps to plane +y; clear => N->S, storage j maps to plane -y with
+/// the FIRST stored row still anchored at La1). A stored vector component is
+/// always read along the plane axes, so the earth-frame decomposition is
+/// SCAN-INDEPENDENT -- exactly what wgrib2/IPOLATES do (`ipolatev.F90` +
+/// `gdswzd_lambert_conf_mod.f90`: ue = CROT*ug + SROT*vg with the documented
+/// grid<-earth convention UGRID = CROT*UEARTH - SROT*VEARTH, VGRID =
+/// SROT*UEARTH + CROT*VEARTH, CROT/SROT = cos/sin(AN*(lon-LoV))). In terms of
+/// beta (= 90 deg + AN*(lon-LoV), hence sin beta = CROT, cos beta = -SROT):
+///     u_east  = u_g * sin(beta) - v_g * cos(beta)
+///     v_north = u_g * cos(beta) + v_g * sin(beta)
+/// This matrix M2 = [[sin b, -cos b], [cos b, sin b]] is a PROPER ROTATION
+/// (det +1, the rotation by the convergence angle beta - 90 deg): magnitudes
+/// are preserved exactly up to float rounding, and it degenerates to IDENTITY
+/// on the central meridian (beta = 90 deg), where no rotation is needed.
+///
+/// HISTORY (V1.4 phase X defect fix, docs/DECISIONS.md section 21): this step
+/// used to compute [[sin b, cos b], [cos b, -sin b]] after hard-coding
+/// "+j = south" for every Lambert grid. That matrix has det -1: it is a
+/// REFLECTION (mirror about the +i axis), not a rotation -- the old docstring
+/// called it an orthonormal rotation, which is wrong -- and it never reduced
+/// to identity at LoV. On S->N-scanned grids (every REAL HRRR file,
+/// scan_mode 0x40) it additionally mirrored V-heavy vectors outright. Pinned
+/// against the wgrib2 v3.1.3+IPOLATES golden tests/fixtures/hrrr_ipolates_
+/// earth.grib2 (see tests/rotation_vs_ipolates.rs). Regular lat/lon grids are
+/// returned unchanged (wgrib2 treats their winds as earth-relative; documented
+/// decision).
 pub fn rotate_winds_to_earth(g: &GridDef, u_in: &[f32], v_in: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut ue = Vec::<f32>::new();
     let mut vn = Vec::<f32>::new();
@@ -2110,12 +2132,38 @@ pub fn rotate_winds_to_earth(g: &GridDef, u_in: &[f32], v_in: &[f32]) -> (Vec<f3
                 let c = beta.cos();
                 let ug = u_in[k];
                 let vg = v_in[k];
-                ue.push(ug * s as f32 + vg * c as f32);
-                vn.push(ug * c as f32 - vg * s as f32);
+                ue.push(ug * s as f32 - vg * c as f32);
+                vn.push(ug * c as f32 + vg * s as f32);
             }
             return (ue, vn);
         }
     }
+}
+
+/// Legacy (pre-V1.4-phase-X) reflection matrix, kept ONLY as the reference
+/// implementation the external golden test uses to reproduce the historical
+/// mismatch: ue = ug*sin(b) + vg*cos(b); vn = ug*cos(b) - vg*sin(b). Det -1.
+pub fn rotate_winds_reflection_legacy(g: &GridDef, u_in: &[f32], v_in: &[f32])
+    -> (Vec<f32>, Vec<f32>) {
+    let mut ue = Vec::<f32>::new();
+    let mut vn = Vec::<f32>::new();
+    match g {
+        GridDef::Lambert(gl) => {
+            let nxi = (gl.nx) as usize;
+            for k in 0..u_in.len() {
+                let beta = gl.rot_angle_deg((k % nxi) as f64, (k / nxi) as f64) * D2R;
+                let s = beta.sin();
+                let c = beta.cos();
+                ue.push(u_in[k] * s as f32 + v_in[k] * c as f32);
+                vn.push(u_in[k] * c as f32 - v_in[k] * s as f32);
+            }
+        }
+        _ => {
+            for x in u_in { ue.push(*x); }
+            for x in v_in { vn.push(*x); }
+        }
+    }
+    return (ue, vn);
 }
 
 /// Config validation helper (spec §4.4 rule): a model whose grid carries

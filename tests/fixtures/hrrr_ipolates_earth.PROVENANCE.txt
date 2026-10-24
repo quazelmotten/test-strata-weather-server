@@ -1,0 +1,48 @@
+hrrr_ipolates_earth.grib2 -- EARTH-RELATIVE wind golden (spec 9.3)
+====================================================================
+
+Produced 2026-10-24 by Agent G with a locally built wgrib2 v3.1.3 10/2023
+linked against IPOLATES (USE_IPOLATES=3, double-precision ip2lib_d path);
+binary /tmp/opencode/ipolates/wgrib2-ipolates, full recipe in
+/tmp/opencode/ipolates/repro.sh.
+
+Input: this repo's committed synthetic fixture tests/fixtures/hrrr_small.grib2
+(Lambert 61 x 41, scan_mode 0x00 N->S, UGRD/VGRD 10 m AGL carry Code Table 3.3
+bit 0x08 set -- grid-relative components).  Messages were reordered so each
+UGRD is immediately followed by its VGRD pair (New_grid.c pairs adjacent
+messages as one vector):
+
+    wgrib2 hrrr_small.grib2 -d 3 -grib_out m3.grib2   # UGRD fh 0
+    wgrib2 hrrr_small.grib2 -d 5 -grib_out m5.grib2   # VGRD fh 0
+    wgrib2 hrrr_small.grib2 -d 4 -grib_out m4.grib2   # UGRD fh 3
+    wgrib2 hrrr_small.grib2 -d 6 -grib_out m6.grib2   # VGRD fh 3
+    cat m3.grib2 m5.grib2 m4.grib2 m6.grib2 > uv_in.grib2
+
+    wgrib2-ipolates uv_in.grib2 -new_grid_winds earth \
+        -new_grid_interpolation neighbor \
+        -new_grid lambert:229.53:26.5:35.0:26.5 233.44:61:3000. \
+                  21.11389:41:-3000. hrrr_ipolates_earth.grib2
+
+Identity-resolution Lambert -> identical-Lambert regrid with NEIGHBOR
+interpolation: every output node takes the value of the SAME input node
+(no interpolation smearing), only the vector rotation is applied.
+
+Properties of the golden file (audit, same date):
+  * message order UGRD f0, VGRD f0, UGRD f3, VGRD f3;
+  * section 3 is byte-identical to the source EXCEPT octet 47 (flag table 3.3)
+    flips 0x38 -> 0x30 (bit 0x08 CLEARED: the stored components are now
+    EARTH-relative, which is exactly what stock `wgrib2 -V` displays as
+    "winds(N/S)") and the CT-3.20 pole-convention byte at octet 64
+    (0x01 -> 0x00, written by g2clib, no effect on node placement);
+  * scan_mode byte unchanged (0x00), so storage order and node indices match
+    the source file one for one -- comparisons are node-for-node;
+  * values re-packed by g2clib complex packing with auto scaling: measured
+    repack noise floor 4.7e-5 relative (see docs/DECISIONS.md section 21).
+
+The companion real-bytes goldens (NOT committed here; installed separately
+under tests/realdata/) were made the same way from live NOMADS HRRR CONUS
+f000 UGRD/VGRD 10 m bytes (scan_mode 0x40, S->N):
+    wgrib2-ipolates hrrr_real_uv.grib2 -new_grid_winds earth \
+        -new_grid_interpolation neighbor \
+        -new_grid lambert:262.5:38.5:38.5:38.5 237.280472:1799:3000. \
+                  21.138123:1059:3000. hrrr_real_earth.grib2

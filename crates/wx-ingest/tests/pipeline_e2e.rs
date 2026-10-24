@@ -400,8 +400,17 @@ fn e2e_roundtrip_through_index() {
                                                     let lhs = eu2.value * eu2.value + ev2.value * ev2.value;
                                                     let rhs = 5260.0 * 5260.0 + 9260.0 * 9260.0;
                                                     assert!(abs_diff(lhs, rhs) <= 1e-4 * rhs);
-                                                    // rotation actually happened (not identity)
-                                                    assert!(eu2.value < 5260.0 && eu2.value > 4000.0);
+                                                    // rotation actually happened (not identity).
+                                                    // V1.4 phase X direction pin: the corrected PROPER
+                                                    // rotation (M2, wgrib2/IPOLATES semantics) sends
+                                                    // earth-u ABOVE the grid-u of 5260 at this corner
+                                                    // (lon > LoV => cos beta < 0 => the -v*cos(beta)
+                                                    // term ADDS). The IPOLATES golden decodes U =
+                                                    // 5580.1226 here (tests/fixtures/hrrr_ipolates_
+                                                    // earth.grib2, fc 0 node (0,0)); the old
+                                                    // reflection matrix produced 4935.x and pointed
+                                                    // the other way.
+                                                    assert!(eu2.value > 5260.0 && eu2.value < 6000.0);
                                                 }
                                             }
                                         }
