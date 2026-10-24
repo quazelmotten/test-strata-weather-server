@@ -31,8 +31,33 @@ use wx_core::storage::{BinHeader, HeaderError, StatMeta, BIN_CRC_OFFSET, BIN_FIX
                        header_crc, open_field, write_bin_atomic};
 use std::fs::File;
 use std::io::Write;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 
 const DIR: &str = "/tmp/opencode/wxpt-header-integrity";
+
+// V1.4 phase C3: file-scoped serialization gate. Two genuinely shared
+// resources make parallel execution unsound HERE (nowhere else — the query
+// hot path stays lock-free by construction):
+//   (1) the crate-wide CRC counters that open_field bumps on EVERY open:
+//       a sibling test's open landing between this file's reset() and its
+//       snapshot() breaks `verified == 0`. Caught live by the fresh-clone
+//       acceptance drill (2026-10-24): first run FAILED
+//       legacy_unsealed_header_still_warms_boot_and_is_counted, rerun
+//       passed — a scheduling flake, not a phantom.
+//   (2) the single shared scratch directory (DIR) every test writes into.
+// Whole-file serialization costs these microsecond-scale tests nothing.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    let g = Mutex::lock(&SERIAL);
+    match g {
+        Ok(x) => { return x; }
+        // A sibling panicking while holding the gate must not cascade the
+        // failure into every remaining test of this binary.
+        Err(p) => { return p.into_inner(); }
+    }
+}
 
 fn hdr(nx: u32, ny: u32, levels: &[f32]) -> BinHeader {
     return BinHeader {
@@ -103,6 +128,7 @@ fn write_good_file(name: &str) -> (String, Vec<u8>) {
 
 #[test]
 fn sealed_headers_round_trip_and_are_counted_as_verified() {
+    let _s = serial();
     crc_counters_reset();
     let (path, bytes) = write_good_file("sealed.bin");
     let c0 = crc_counters_snapshot();
@@ -129,6 +155,7 @@ fn sealed_headers_round_trip_and_are_counted_as_verified() {
 
 #[test]
 fn rot_anywhere_in_the_header_is_a_loud_field_skip() {
+    let _s = serial();
     let (_p0, good) = write_good_file("rot-base.bin");
     // (offset, what lives there): every one of these is a SILENT wrong answer
     // if trusted, and none of them changes the file length except the nx/ny
@@ -181,6 +208,7 @@ fn rot_anywhere_in_the_header_is_a_loud_field_skip() {
 
 #[test]
 fn legacy_unsealed_header_still_warms_boot_and_is_counted() {
+    let _s = serial();
     let (_p0, good) = write_good_file("legacy-base.bin");
     let mut b = good.to_vec();
     b[BIN_CRC_OFFSET] = 0; b[BIN_CRC_OFFSET + 1] = 0;
@@ -205,6 +233,7 @@ fn legacy_unsealed_header_still_warms_boot_and_is_counted() {
 
 #[test]
 fn zero_digest_cannot_masquerade_as_the_absent_sentinel_forever() {
+    let _s = serial();
     // `crc_slot_value` maps a raw digest of 0 onto 1 so a sealed header NEVER
     // stores the sentinel. Verification applies the same mapping, so both a
     // true-0 and a true-1 digest verify against slot value 1 — the residual
@@ -228,6 +257,7 @@ fn zero_digest_cannot_masquerade_as_the_absent_sentinel_forever() {
 
 #[test]
 fn structurally_impossible_headers_are_refused_before_any_plane_is_read() {
+    let _s = serial();
     let h = hdr(3, 2, &[1000.0, 850.0]);
     let base = encode_header(&h);
 
@@ -297,6 +327,7 @@ fn structurally_impossible_headers_are_refused_before_any_plane_is_read() {
 
 #[test]
 fn absurd_geometry_cannot_wrap_the_size_check_into_a_panic() {
+    let _s = serial();
     // u32::MAX x u32::MAX x 1 level x 4 bytes overflows usize. Before phase C
     // the product WRAPPED to a small number, the length check passed, and the
     // first query panicked inside `value()`'s mmap slice range — under
@@ -332,6 +363,7 @@ fn absurd_geometry_cannot_wrap_the_size_check_into_a_panic() {
 
 #[test]
 fn trailing_slack_now_disagrees_instead_of_passing_silently() {
+    let _s = serial();
     // Pre-phase-C the length rule was only `len < want`, so a file holding MORE
     // than its header accounts for passed. Exact agreement is what ties the
     // declared geometry to the bytes actually written (and it is what makes the
